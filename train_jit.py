@@ -1,0 +1,487 @@
+"""
+JiT (Li & He 2025) pixel-space flow matching on ImageNet, single GPU, with optional REPA alignment.
+
+Model and denoiser are JiT's own code (model_jit.py, denoiser.py); this script replaces their
+DDP training loop. Defaults follow JiT-B/16: AdamW (0.9, 0.95), no weight decay, base lr 5e-5
+scaled to the effective batch (2e-4 at 1024), constant lr after 5 warmup epochs, EMA 0.9999 / 0.9996,
+logit-normal t (-0.8, 0.8), x-prediction with v-loss.
+
+Datasets come from prepare_jit_data.py. Fast iteration on ImageNet-100 at 128px, then scale up:
+$ python train_jit.py --data_dir=/data/jit/in100_128 --out_dir=jit_b16_in100_128
+$ python train_jit.py --data_dir=/data/jit/in100_128 --out_dir=jit_b16_in100_128_repa_dino --repa_encoder=dino_vitb16
+$ python train_jit.py --data_dir=/data/jit/in1k_256 --out_dir=jit_b16_in1k_256 --epochs=200 --batch_size=128 --gradient_accumulation_steps=8
+$ python train_jit.py --out_dir=jit_b16_in100_128 --init_from=resume   # after preemption
+
+FID (no CFG, fixed seed) is tracked during training; final CFG-swept numbers come from eval_jit.py.
+With diag=True every FID eval also runs the data-efficiency diagnostics in diagnostics.py (needs the val split
+and fid.py's feature files) and writes them to wandb and {out_dir}/diagnostics/.
+"""
+
+import os
+import time
+import math
+import uuid
+import json
+from contextlib import nullcontext
+from torchinfo import summary
+
+import numpy as np
+import torch
+
+from data_jit import MemmapImages, EpochSampler, to_model_input
+from jit_common import build_denoiser, ema_state_dicts, ema_weights, generate_and_score, save_labeled_grid
+from fid import InceptionMetrics, load_ref_stats, precision_recall
+from repa import FrozenEncoder, Projector, BlockCapture, repa_loss
+import diagnostics as diag_lib
+
+# -----------------------------------------------------------------------------
+# I/O
+out_dir = 'jit_b16_in100_128'
+eval_every_epochs = 20 # FID eval
+save_every_epochs = 1 # overwrite ckpt.pt
+log_interval = 100
+eval_only = False # if True, script exits right after one FID eval (use with init_from='resume')
+init_from = 'scratch' # 'scratch' or 'resume'
+# wandb logging
+wandb_log = True
+wandb_project = 'cross_patch'
+wandb_run_name = '' # defaults to out_dir
+# data
+data_dir = '/data/jit/in100_128'
+gradient_accumulation_steps = 1
+batch_size = 1024 # micro batch; effective batch = batch_size * gradient_accumulation_steps (JiT uses 1024)
+# model
+model = 'JiT-B/16'
+attn_dropout = 0.0
+proj_dropout = 0.0
+# flow matching
+P_mean = -0.8
+P_std = 0.8
+t_eps = 5e-2
+noise_scale = 0.0 # 0 -> img_size / 256, JiT's resolution rule (1.0 at 256, 2.0 at 512)
+label_drop_prob = 0.1
+# optimizer
+epochs = 200
+warmup_epochs = 5
+blr = 5e-5 # base lr per 256 images
+lr_schedule = 'constant' # 'constant' or 'cosine'
+min_lr = 0.0
+weight_decay = 0.0
+beta1 = 0.9
+beta2 = 0.95
+grad_clip = 0.0 # JiT doesn't clip
+ema_decay1 = 0.9999
+ema_decay2 = 0.9996
+# REPA ('' disables). see repa.py for the available encoders
+repa_encoder = ''
+repa_depth = 4 # align the output of this block (1-indexed)
+repa_coeff = 0.5
+repa_proj_dim = 2048
+# FID eval during training
+fid_num_images = 10000 # must be divisible by the number of classes
+fid_cfg = 1.0
+fid_interval_min = 0.0
+fid_interval_max = 1.0
+sampling_method = 'heun'
+num_sampling_steps = 50
+gen_batch_size = 256
+# diagnostics, run at every FID eval (see diagnostics.py)
+diag = True
+diag_raw = True # 3: also FID / precision / recall of the raw (non-EMA) weights
+diag_images = 1024 # 1/4/6: fixed train and held-out images for the per-noise-level pass
+diag_t_bins = 10
+diag_freq_bands = 8
+diag_probe_blocks = '4,8,12'
+diag_probe_ts = '1.0,0.75,0.5' # noise levels for the probes (t=1 is clean)
+diag_probe_train_images = 10000
+diag_probe_val_images = 5000
+diag_spectrum_images = 2000 # generated samples for the sample-vs-real spectrum
+diag_opt_stats = True # 4: grad norms and update/weight ratios per block, every log_interval
+# system
+device = 'cuda'
+dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float32'
+compile = True # JiT compiles its blocks with @torch.compile; False disables dynamo entirely
+# -----------------------------------------------------------------------------
+config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
+exec(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'configurator.py')).read()) # overrides from command line or config file
+config = {k: globals()[k] for k in config_keys} # will be useful for logging
+# -----------------------------------------------------------------------------
+
+if not compile:
+    torch._dynamo.config.disable = True
+torch._dynamo.config.cache_size_limit = 128
+wandb_run_name = wandb_run_name or out_dir
+os.makedirs(out_dir, exist_ok=True)
+torch.manual_seed(1337)
+torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
+torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
+device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
+ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16}[dtype]
+ctx = nullcontext() if (device_type == 'cpu' or dtype == 'float32') else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+
+# data
+data = MemmapImages(data_dir)
+img_size, num_classes = data.img_size, data.num_classes
+class_names = data.class_names()
+noise_scale = noise_scale or img_size / 256
+sampler = EpochSampler(len(data), batch_size)
+effective_batch_size = batch_size * gradient_accumulation_steps
+iters_per_epoch = len(data) // effective_batch_size
+max_iters = epochs * iters_per_epoch
+lr = blr * effective_batch_size / 256
+print(f"{data_dir}: {len(data):,} images, {num_classes} classes, {img_size}px | effective batch {effective_batch_size}, "
+      f"{iters_per_epoch:,} iters/epoch, {max_iters:,} total iters, lr {lr:.2e}, noise scale {noise_scale}")
+
+def get_batch():
+    x, y = data.get(sampler.next())
+    return to_model_input(x, flip=True, device=device), torch.from_numpy(y).to(device, non_blocking=True)
+
+# model
+denoiser_args = dict(
+    model=model, img_size=img_size, num_classes=num_classes, attn_dropout=attn_dropout, proj_dropout=proj_dropout,
+    label_drop_prob=label_drop_prob, P_mean=P_mean, P_std=P_std, t_eps=t_eps, noise_scale=noise_scale,
+    ema_decay1=ema_decay1, ema_decay2=ema_decay2, sampling_method=sampling_method,
+    num_sampling_steps=num_sampling_steps, cfg=fid_cfg, interval_min=fid_interval_min, interval_max=fid_interval_max,
+)
+denoiser = build_denoiser(**denoiser_args).to(device)
+summary(denoiser)
+grid = img_size // denoiser.net.patch_size
+
+encoder, projector, capture = None, None, None
+if repa_encoder:
+    encoder = FrozenEncoder(repa_encoder).to(device)
+    projector = Projector(denoiser.net.hidden_size, encoder.embed_dim, repa_proj_dim).to(device)
+    capture = BlockCapture(denoiser.net, repa_depth)
+    print(f"REPA: block {repa_depth} -> {repa_encoder} ({encoder.embed_dim}-d, {grid}x{grid} grid), coeff {repa_coeff}")
+
+# same weight decay grouping as JiT (no decay on biases / norms)
+decay, no_decay = [], []
+trainable = list(denoiser.named_parameters()) + (list(projector.named_parameters()) if projector is not None else [])
+for name, p in trainable:
+    if not p.requires_grad:
+        continue
+    (no_decay if p.ndim == 1 or name.endswith('.bias') else decay).append(p)
+optimizer = torch.optim.AdamW(
+    [{'params': no_decay, 'weight_decay': 0.0}, {'params': decay, 'weight_decay': weight_decay}],
+    lr=lr, betas=(beta1, beta2), fused=device_type == 'cuda',
+)
+
+# init these up here, can override if init_from='resume'
+iter_num = 0
+best_fid = float('inf')
+wandb_run_id = None
+train_seconds = 0.0
+
+if init_from == 'resume':
+    print(f"Resuming training from {out_dir}")
+    checkpoint = torch.load(os.path.join(out_dir, 'ckpt.pt'), map_location=device, weights_only=False)
+    denoiser.load_state_dict(checkpoint['model'])
+    denoiser.ema_params1 = [checkpoint['model_ema1'][name].to(device) for name, _ in denoiser.named_parameters()]
+    denoiser.ema_params2 = [checkpoint['model_ema2'][name].to(device) for name, _ in denoiser.named_parameters()]
+    if projector is not None:
+        projector.load_state_dict(checkpoint['projector'])
+    optimizer.load_state_dict(checkpoint['optimizer'])
+    iter_num = checkpoint['iter_num']
+    best_fid = checkpoint['best_fid']
+    wandb_run_id = checkpoint.get('wandb_run_id')
+    train_seconds = checkpoint.get('train_seconds', 0.0)
+    sampler.epoch = iter_num // iters_per_epoch
+    checkpoint = None # free up memory
+else:
+    denoiser.ema_params1 = [p.detach().clone() for p in denoiser.parameters()]
+    denoiser.ema_params2 = [p.detach().clone() for p in denoiser.parameters()]
+
+trainable_params = [p for _, p in trainable if p.requires_grad]
+ref_stats_path = os.path.join(data_dir, 'fid_stats_jit.npz')
+if not os.path.exists(ref_stats_path):
+    ref_stats_path = os.path.join(data_dir, 'fid_stats.npz')
+ref_stats = load_ref_stats(ref_stats_path)
+metrics = InceptionMetrics(device)
+print(f"FID reference: {ref_stats_path}")
+
+def spaced(n, k):
+    # k evenly spaced indices; the memmaps are sorted by class, so this is roughly class-stratified
+    return np.linspace(0, n - 1, min(k, n)).round().astype(np.int64)
+
+if diag:
+    val_dir = os.path.join(data_dir, 'val')
+    assert os.path.exists(os.path.join(val_dir, 'meta.json')), f'diag=True needs the held-out split in {val_dir} (prepare_jit_data.py --split=val), or pass --diag=False'
+    assert os.path.exists(os.path.join(val_dir, 'val_inception.npy')), 'diag=True needs fid.py run after the val split was prepared'
+    val_data = MemmapImages(val_dir)
+    # 1/4/6: fixed batches, no flips
+    xd, yd = data.get(spaced(len(data), diag_images))
+    diag_train = (to_model_input(xd, flip=False, device=device), torch.from_numpy(yd).to(device))
+    xd, yd = val_data.get(spaced(len(val_data), diag_images))
+    diag_val = (to_model_input(xd, flip=False, device=device), torch.from_numpy(yd).to(device))
+    diag_ts = diag_lib.t_grid(diag_t_bins)
+    band_masks = diag_lib.radial_band_masks(img_size, diag_freq_bands, device)
+    # 5: probe sets (uint8 on CPU)
+    probe_blocks = tuple(int(b) for b in diag_probe_blocks.split(','))
+    probe_ts = [float(t) for t in diag_probe_ts.split(',')]
+    probe_train_x, probe_train_y = data.get(spaced(len(data), diag_probe_train_images))
+    probe_val_x, probe_val_y = val_data.get(spaced(len(val_data), diag_probe_val_images))
+    probe_train_y, probe_val_y = torch.from_numpy(probe_train_y).to(device), torch.from_numpy(probe_val_y).to(device)
+    # 2/7: Inception features of real images
+    train_bank = np.load(os.path.join(data_dir, 'train_inception.npy'), mmap_mode='r')
+    pr_idx = np.sort(np.random.default_rng(0).choice(len(train_bank), min(fid_num_images, len(train_bank)), replace=False))
+    pr_real = torch.from_numpy(train_bank[pr_idx].astype(np.float32)).to(device)
+    val_feats = torch.from_numpy(np.load(os.path.join(val_dir, 'val_inception.npy')).astype(np.float32)).to(device)
+    # 6: spectrum of real held-out images, on the same [0, 1] scale as the generated uint8 samples
+    real_spectrum = 0
+    for i in range(0, min(diag_spectrum_images, len(val_data)), 256):
+        xs, _ = val_data.get(np.arange(i, min(i + 256, diag_spectrum_images, len(val_data))))
+        real_spectrum = real_spectrum + diag_lib.band_power(torch.from_numpy(xs).to(device).permute(0, 3, 1, 2).float() / 255, band_masks)
+    real_spectrum = real_spectrum / min(diag_spectrum_images, len(val_data))
+    os.makedirs(os.path.join(out_dir, 'diagnostics'), exist_ok=True)
+    print(f"diagnostics on: {len(val_data):,} held-out images, probes on blocks {probe_blocks} at t={probe_ts}")
+
+def get_lr(it):
+    # per-iteration version of JiT's schedule: linear warmup, then constant or half-cycle cosine
+    epoch = it / iters_per_epoch
+    if epoch < warmup_epochs:
+        return lr * epoch / warmup_epochs
+    if lr_schedule == 'constant':
+        return lr
+    return min_lr + (lr - min_lr) * 0.5 * (1. + math.cos(math.pi * (epoch - warmup_epochs) / (epochs - warmup_epochs)))
+
+class SpectrumAccumulator:
+    # radially binned power of the first n generated samples
+    def __init__(self, n):
+        self.n, self.count, self.power = n, 0, 0
+
+    def __call__(self, x_uint8, labels=None):
+        if self.count < self.n:
+            x = x_uint8[:self.n - self.count]
+            self.power = self.power + diag_lib.band_power(x.float() / 255, band_masks)
+            self.count += len(x)
+
+    def result(self):
+        return self.power / self.count
+
+@torch.no_grad()
+def generate(spectrum=None):
+    return generate_and_score(
+        denoiser, metrics, ref_stats, fid_num_images, num_classes, device, ctx,
+        cfg=fid_cfg, interval=(fid_interval_min, fid_interval_max), steps=num_sampling_steps,
+        method=sampling_method, batch_size=gen_batch_size, on_batch=spectrum,
+    )
+
+@torch.no_grad()
+def evaluate(step):
+    """
+    FID / IS of the EMA weights, plus the diagnostics if enabled. Returns (fid, dict of scalars for logging, dict of images).
+    """
+    t_start = time.time()
+    log, images, record = {}, {}, {}
+    spectrum = SpectrumAccumulator(diag_spectrum_images) if diag else None
+    with ema_weights(denoiser, 1):
+        out = generate(spectrum)
+        if diag:
+            # 5. probes on the EMA weights (the model that is sampled from)
+            denoiser.eval()
+            tr = diag_lib.probe_features(denoiser.net, probe_train_x, probe_ts, probe_blocks, num_classes, ctx, device)
+            va = diag_lib.probe_features(denoiser.net, probe_val_x, probe_ts, probe_blocks, num_classes, ctx, device)
+            denoiser.train()
+            probes = diag_lib.run_probes(tr, probe_train_y, va, probe_val_y, num_classes)
+    log['val/fid'], log['val/is'] = out['fid'], out['is']
+    if not diag:
+        return out['fid'], log, images
+
+    gen_feats = out['features'].to(device)
+    # 2. precision / recall
+    log['val/precision'], log['val/recall'] = precision_recall(pr_real, gen_feats)
+    # 7. memorization
+    for k, v in diag_lib.memorization(gen_feats, train_bank, val_feats).items():
+        log[f'mem/{k}'] = v
+    # 3. raw weights
+    if diag_raw:
+        raw = generate()
+        log['val/fid_raw'], log['val/is_raw'] = raw['fid'], raw['is']
+        log['val/precision_raw'], log['val/recall_raw'] = precision_recall(pr_real, raw['features'].to(device))
+    # 5. probes
+    for (b, t), r in probes.items():
+        log[f'probe/knn_block{b:02d}_t{t:.2f}'] = r['knn']
+        log[f'probe/linear_block{b:02d}_t{t:.2f}'] = r['linear']
+    record['probes'] = {f'block{b}_t{t}': r for (b, t), r in probes.items()}
+    # 1 + 4 + 6. per-noise-level pass on the raw weights (the ones being optimized)
+    denoiser.eval()
+    passes = {split: diag_lib.noise_level_pass(denoiser.net, xb, yb, diag_ts, noise_scale, t_eps, ctx, band_masks)
+              for split, (xb, yb) in (('train', diag_train), ('val', diag_val))}
+    denoiser.train()
+    t_labels = [f'{t:.3f}' for t in diag_ts.tolist()]
+    for i, tl in enumerate(t_labels):
+        for split in ('train', 'val'):
+            log[f'noise_loss/{split}_t{tl}'] = passes[split]['v_loss'][i].item()
+            log[f'noise_xmse/{split}_t{tl}'] = passes[split]['x_mse'][i].item()
+        log[f'noise_gap/t{tl}'] = (passes['val']['v_loss'][i] - passes['train']['v_loss'][i]).item()
+    pv = passes['val']
+    for b in range(pv['attn_entropy'].shape[1]):
+        log[f'attn_entropy/block{b + 1:02d}'] = pv['attn_entropy'][:, b].mean().item()
+        log[f'gate_msa/block{b + 1:02d}'] = pv['gate_msa'][:, b].mean().item()
+        log[f'gate_mlp/block{b + 1:02d}'] = pv['gate_mlp'][:, b].mean().item()
+    band_labels = [f'band{k}' for k in range(diag_freq_bands)]
+    for k, bl in enumerate(band_labels):
+        log[f'freq_err/{bl}'] = pv['freq_rel_err'][:, k].mean().item()
+    # 6. sample vs real spectrum, log10 ratio per band (0 = matches real images)
+    spec_ratio = torch.log10(spectrum.result() / real_spectrum).cpu()
+    for k, bl in enumerate(band_labels):
+        log[f'spectrum_log_ratio/{bl}'] = spec_ratio[k].item()
+    d = os.path.join(out_dir, 'diagnostics')
+    images['freq_err'] = diag_lib.heatmap(pv['freq_rel_err'].numpy(), [f't={tl}' for tl in t_labels], band_labels,
+                                          f'held-out relative prediction error by frequency band (iter {step})', os.path.join(d, f'freq_err_{step}.png'))
+    images['attn_entropy'] = diag_lib.heatmap(pv['attn_entropy'].numpy(), [f't={tl}' for tl in t_labels], [f'b{b + 1}' for b in range(pv['attn_entropy'].shape[1])],
+                                              f'attention entropy, normalized (iter {step})', os.path.join(d, f'attn_entropy_{step}.png'), log=False)
+    record.update({'iter': step, 'scalars': log, 't': diag_ts.tolist(),
+                   'passes': {split: {k: v.tolist() for k, v in p.items()} for split, p in passes.items()}})
+    with open(os.path.join(d, f'diag_{step}.json'), 'w') as f:
+        json.dump(record, f)
+    log['diag_minutes'] = (time.time() - t_start) / 60
+    return out['fid'], log, images
+
+@torch.no_grad()
+def save_samples(step):
+    # one sample for each of 64 evenly spaced classes, fixed noise so grids are comparable over training
+    labels = torch.linspace(0, num_classes - 1, 64).long().to(device)
+    with ema_weights(denoiser, 1), torch.random.fork_rng(devices=[device] if device_type == 'cuda' else []):
+        torch.manual_seed(0)
+        denoiser.eval()
+        with ctx:
+            x = denoiser.generate(labels)
+        denoiser.train()
+    save_labeled_grid(x, [class_names[i] for i in labels.tolist()], os.path.join(out_dir, f'samples_{step}.png'))
+
+def save_checkpoint():
+    ema1, ema2 = ema_state_dicts(denoiser)
+    checkpoint = {
+        'model': denoiser.state_dict(),
+        'model_ema1': ema1,
+        'model_ema2': ema2,
+        'projector': projector.state_dict() if projector is not None else None,
+        'optimizer': optimizer.state_dict(),
+        'denoiser_args': denoiser_args,
+        'iter_num': iter_num,
+        'epoch': iter_num / iters_per_epoch,
+        'best_fid': best_fid,
+        'config': config,
+        'wandb_run_id': wandb_run_id,
+        'train_seconds': train_seconds,
+    }
+    # write then rename, so a preemption mid-save can't corrupt the only checkpoint
+    tmp_path = os.path.join(out_dir, 'ckpt.pt.tmp')
+    torch.save(checkpoint, tmp_path)
+    os.replace(tmp_path, os.path.join(out_dir, 'ckpt.pt'))
+    print(f"saved checkpoint to {out_dir} at iter {iter_num}")
+
+# logging
+if wandb_log:
+    import wandb
+    if wandb_run_id is None:
+        wandb_run_id = uuid.uuid4().hex[:8] # stored in the checkpoint so a resumed run continues the same wandb run
+    wandb.init(project=wandb_project, name=wandb_run_name, config=config, id=wandb_run_id, resume='allow')
+
+eval_iters = eval_every_epochs * iters_per_epoch
+save_iters = max(1, save_every_epochs * iters_per_epoch)
+
+# training loop
+X, Y = get_batch() # fetch the very first batch
+t0 = time.time()
+local_iter_num = 0 # number of iterations in the lifetime of this process
+while True:
+
+    # determine and set the learning rate for this iteration
+    lr_now = get_lr(iter_num)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr_now
+
+    # FID eval of EMA weights
+    if (eval_only or (iter_num > 0 and local_iter_num > 0 and (iter_num % eval_iters == 0 or iter_num == max_iters))):
+        fid, eval_log, eval_images = evaluate(iter_num)
+        save_samples(iter_num)
+        best_fid = min(best_fid, fid)
+        extra = ''.join(f", {k.split('/')[-1]} {eval_log[k]:.3f}" for k in ('val/precision', 'val/recall', 'val/fid_raw', 'mem/nn_ratio') if k in eval_log)
+        print(f"iter {iter_num} (epoch {iter_num / iters_per_epoch:.1f}): FID-{fid_num_images / 1000:g}k {fid:.2f}, IS {eval_log['val/is']:.1f} (cfg {fid_cfg}){extra}")
+        if wandb_log:
+            wandb.log({
+                "iter": iter_num,
+                "epoch": iter_num / iters_per_epoch,
+                "train_hours": train_seconds / 3600,
+                **eval_log,
+                **{f"diag_img/{k}": wandb.Image(v) for k, v in eval_images.items()},
+            }, step=iter_num)
+        t0 = time.time() # don't count eval time in the next iteration's timing
+
+    if eval_only:
+        break
+
+    if iter_num > 0 and local_iter_num > 0 and (iter_num % save_iters == 0 or iter_num == max_iters):
+        save_checkpoint()
+
+    # termination conditions
+    if iter_num >= max_iters:
+        break
+
+    # forward backward update, with optional gradient accumulation to simulate larger batch size
+    for micro_step in range(gradient_accumulation_steps):
+        with ctx:
+            loss_fm = denoiser(X, Y)
+            loss = loss_fm
+            if encoder is not None:
+                target = encoder(X, grid)
+                loss_repa = repa_loss(capture.out, target, projector)
+                loss = loss + repa_coeff * loss_repa
+            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+        # immediately fetch the next batch while the GPU works on the forward pass
+        X, Y = get_batch()
+        loss.backward()
+    # 4. optimization health: grad norms and update/weight ratios per block (only on logging iterations)
+    log_opt = diag_opt_stats and iter_num % log_interval == 0
+    if log_opt:
+        named = [(n, p) for n, p in denoiser.named_parameters() if p.requires_grad]
+        grad_norms = diag_lib.grouped_norms((n, p.grad) for n, p in named)
+        weights_before = [(n, p.detach().clone()) for n, p in named]
+    # clip the gradient
+    if grad_clip != 0.0:
+        torch.nn.utils.clip_grad_norm_(trainable_params, grad_clip)
+    optimizer.step()
+    if log_opt:
+        update_norms = diag_lib.grouped_norms((n, p.detach() - w) for (n, p), (_, w) in zip(named, weights_before))
+        weight_norms = diag_lib.grouped_norms(weights_before)
+        del weights_before
+    # flush the gradients as soon as we can, no need for this memory anymore
+    optimizer.zero_grad(set_to_none=True)
+    denoiser.update_ema()
+
+    # timing and logging
+    t1 = time.time()
+    dt = t1 - t0
+    t0 = t1
+    train_seconds += dt
+    if iter_num % log_interval == 0:
+        # get loss as float. note: this is a CPU-GPU sync point
+        lossf = loss_fm.item()
+        if not math.isfinite(lossf):
+            raise RuntimeError(f"loss is {lossf} at iter {iter_num}, stopping")
+        imgs_per_sec = effective_batch_size / dt
+        repa_str = f", repa {loss_repa.item():.4f}" if encoder is not None else ""
+        grad_str = f", grad norm {math.sqrt(sum(v ** 2 for v in grad_norms.values())):.4f}" if log_opt else ""
+        print(f"iter {iter_num}: loss {lossf:.4f}{repa_str}{grad_str}, time {dt*1000:.2f}ms, {imgs_per_sec:.0f} img/s")
+        if wandb_log:
+            log = {
+                "iter": iter_num,
+                "epoch": iter_num / iters_per_epoch,
+                "train_hours": train_seconds / 3600,
+                "train/loss": lossf,
+                "lr": lr_now,
+                "imgs_per_sec": imgs_per_sec,
+            }
+            if encoder is not None:
+                log["train/repa_loss"] = loss_repa.item()
+            if log_opt:
+                log["grad_norm/total"] = math.sqrt(sum(v ** 2 for v in grad_norms.values()))
+                log.update({f"grad_norm/{k}": v for k, v in grad_norms.items()})
+                log.update({f"update_ratio/{k}": update_norms[k] / (weight_norms[k] + 1e-12) for k in update_norms})
+            wandb.log(log, step=iter_num)
+    iter_num += 1
+    local_iter_num += 1
+
+print(f"done. best FID-{fid_num_images / 1000:g}k {best_fid:.2f}. final eval with:\n$ python eval_jit.py --ckpt={os.path.join(out_dir, 'ckpt.pt')} --data_dir={data_dir}")

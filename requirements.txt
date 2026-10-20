@@ -1,0 +1,13 @@
+torch>=2.5
+torchvision
+numpy
+pillow
+tqdm
+torchinfo
+wandb
+scipy
+pyarrow
+huggingface_hub
+einops
+torch-fidelity
+matplotlib
