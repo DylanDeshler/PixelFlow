@@ -29,9 +29,7 @@ from data_jit import MemmapImages
 from jit_common import build_denoiser, generate_and_score, save_labeled_grid
 from fid import InceptionMetrics, load_ref_stats, precision_recall
 
-# chart styling (validated categorical pair: blue / orange on the light surface)
-SURFACE, INK, INK_2, GRID = '#fcfcfb', '#0b0b0b', '#52514e', '#e4e3de'
-BLUE, ORANGE = '#2a78d6', '#eb6834'
+from plot_style import SURFACE, INK, INK_2, GRID, BLUE, ORANGE # validated categorical pair on the light surface
 
 def plot_cfg_sweep(results, cfgs, path, title):
     """

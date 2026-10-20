@@ -34,7 +34,9 @@ from jit_common import build_denoiser, resolve_arch, run_dir, ema_state_dicts, e
 from fid import InceptionMetrics, load_ref_stats, precision_recall
 from repa import FrozenEncoder, Projector, BlockCapture, repa_loss
 from masking import TokenMasker, flow_loss
+from muon import Muon, CombinedOptimizer
 import diagnostics as diag_lib
+import plot_trends
 
 # -----------------------------------------------------------------------------
 # I/O
@@ -77,12 +79,21 @@ label_drop_prob = 0.1
 # optimizer
 epochs = 200
 warmup_epochs = 5
-blr = 5e-5 # base lr per 256 images
+blr = 2e-4 # base lr per 1024 images
 lr_schedule = 'constant' # 'constant' or 'cosine'
 min_lr = 0.0
 weight_decay = 0.0
 beta1 = 0.9
 beta2 = 0.95
+optimizer_type = 'adamw' # 'adamw' (JiT) or 'muon': Muon for the 2D weight matrices inside the transformer blocks, AdamW for everything else
+muon_adjust_lr = 'match_rms_adamw' # 'match_rms_adamw' (Moonshot: update RMS matched to AdamW, Muon uses the AdamW lr and weight_decay)
+                                   # or 'original' (Keller Jordan: muon_lr / muon_weight_decay below)
+muon_lr = 0.02 # 'original' only (reference default)
+muon_weight_decay = 0.0 # 'original' only (reference default)
+muon_momentum = 0.95 # reference default, Nesterov
+muon_ns_steps = 5 # Newton-Schulz iterations, reference default
+muon_split_fused = True # orthogonalize fused weights per component: qkv -> q, k, v; SwiGLU w12 -> w1, w2; adaLN -> its 6 projections
+muon_adaln = True # adaLN modulation projections on Muon (2D hidden weights) or, if False, on AdamW (keeps their zero init gentle)
 grad_clip = 1.0
 ema_decay1 = 0.9999
 ema_decay2 = 0.9996
@@ -94,24 +105,24 @@ repa_coeff = 0.5
 repa_proj_dim = 2048
 # MAE-style token masking (masking.py): same loss, masked patches predicted from context. 0 disables
 mask_ratio = 0.0 # fraction of patches replaced by a learned mask token in a masked sample
-mask_prob = 0.5 # fraction of each batch that is masked (the rest trains unmasked, as at inference)
+mask_prob = 0.0 # fraction of each batch that is masked (the rest trains unmasked, as at inference)
 mask_weighting = 'effective_t' # 'effective_t' (masked patches weighted as t=0) or 'jit' (sampled-t weight for all patches)
 # FID eval during training
 fid_num_images = 10000 # must be divisible by the number of classes
 fid_cfg = 1.0
-fid_interval_min = 0.0
+fid_interval_min = 0.1
 fid_interval_max = 1.0
-fid_cfg_guided = 3.0 # also FID / IS (/ precision, recall with diag) and a sample grid with this CFG scale; 0 disables
-guided_interval_min = 0.0 # CFG interval for the guided eval: guidance applied only for t in [min, max]
-guided_interval_max = 1.0
+sample_cfg = 3.0 # also save a sample grid (one batch, no FID) at this CFG scale; 0 disables
+sample_interval_min = 0.1 # CFG interval for that grid: guidance applied only for t in [min, max]
+sample_interval_max = 1.0
 sampling_method = 'heun'
 num_sampling_steps = 50
 time_schedule = 'uniform' # sampling time grid: 'uniform' (JiT), 'shift' (FLUX/SD3-style, uses P_mean), 'train_quantile'
 gen_batch_size = 256
-eval_loss_images = 2048 # fixed train / held-out images for the eval train / val loss (training objective, same noise every eval)
+eval_loss_images = 4096 # fixed train / held-out images for the eval train / val loss (training objective, same noise every eval)
 # diagnostics, run at every FID eval (see diagnostics.py)
 diag = True
-diag_raw = True # 3: also FID / precision / recall of the raw (non-EMA) weights
+diag_raw = False # 3: also FID / precision / recall of the raw (non-EMA) weights (a second full FID run)
 diag_images = 1024 # 1/4/6: fixed train and held-out images for the per-noise-level pass
 diag_t_bins = 10
 diag_freq_bands = 8
@@ -121,6 +132,7 @@ diag_probe_train_images = 10000
 diag_probe_val_images = 5000
 diag_spectrum_images = 2000 # generated samples for the sample-vs-real spectrum
 diag_window_tiles = '1,2,4' # windowed-attention ablation: attention confined to k x k patch tiles ('' disables; k >= grid skipped)
+trend_plots = True # after each eval, regenerate the plot_trends.py figures in {out_dir}/trends and log them to wandb (needs diag)
 diag_opt_stats = True # 4: grad norms and update/weight ratios per block, every log_interval
 # system
 device = 'cuda'
@@ -197,7 +209,7 @@ effective_batch_size = batch_size * gradient_accumulation_steps
 iters_per_epoch = len(data) // effective_batch_size
 assert iters_per_epoch > 0, f'effective batch {effective_batch_size} is larger than the dataset ({len(data):,} images); lower batch_size / gradient_accumulation_steps'
 max_iters = epochs * iters_per_epoch
-lr = blr * effective_batch_size / 256
+lr = blr * effective_batch_size / 1024
 print(f"{data_dir}: {len(data):,} images, {num_classes} classes, {img_size}px | effective batch {effective_batch_size}, "
       f"{iters_per_epoch:,} iters/epoch, {max_iters:,} total iters, lr {lr:.2e}, noise scale {noise_scale}")
 
@@ -222,7 +234,8 @@ print(f"model {model_name}: {sum(p.numel() for p in denoiser.net.parameters()) /
       f"{(img_size // arch['patch_size']) ** 2} tokens of {arch['patch_size'] ** 2 * 3}-d patches")
 with open(os.path.join(out_dir, 'config.json'), 'w') as f:
     json.dump({**config, 'resolved': {'data_dir': data_dir, 'out_dir': out_dir, 'model_name': model_name, 'arch': arch, 'noise_scale': noise_scale,
-                                       'effective_batch_size': effective_batch_size, 'lr': lr, 'max_iters': max_iters}}, f, indent=2)
+                                       'effective_batch_size': effective_batch_size, 'lr': lr, 'max_iters': max_iters,
+                                       'iters_per_epoch': iters_per_epoch, 'train_images': len(data)}}, f, indent=2)
 grid = img_size // denoiser.net.patch_size
 
 encoder, projector, capture = None, None, None
@@ -241,14 +254,49 @@ if mask_ratio > 0:
     print(f"token masking: {mask_ratio:.0%} of patches in {mask_prob:.0%} of samples, weighting {mask_weighting}")
 trainable = list(denoiser.named_parameters()) + (list(projector.named_parameters()) if projector is not None else []) \
     + (list(masker.named_parameters()) if masker is not None else [])
+assert optimizer_type in ('adamw', 'muon'), f"optimizer_type must be 'adamw' or 'muon', got {optimizer_type}"
+# with Muon: hidden matrices of the transformer blocks (attention, MLP, adaLN projections) go to Muon; patch embedding,
+# time / class embeddings, output layer, gains, biases (and REPA projector / mask token) stay on AdamW
+def muon_split(name):
+    # number of logical matrices fused into one weight, orthogonalized separately when muon_split_fused
+    if not muon_split_fused:
+        return 1
+    if name.endswith('attn.qkv.weight'):
+        return 3
+    if name.endswith('mlp.w12.weight'):
+        return 2
+    if name.endswith('adaLN_modulation.1.weight'):
+        return 6
+    return 1
+
+muon_named = {id(p): (n, p) for n, p in denoiser.net.blocks.named_parameters()
+              if optimizer_type == 'muon' and p.ndim >= 2 and p.requires_grad and (muon_adaln or 'adaLN_modulation' not in n)}
+muon_params = {} # split -> params
 for name, p in trainable:
     if not p.requires_grad:
         continue
-    (no_decay if p.ndim == 1 or name.endswith('.bias') else decay).append(p)
-optimizer = torch.optim.AdamW(
-    [{'params': no_decay, 'weight_decay': 0.0}, {'params': decay, 'weight_decay': weight_decay}],
+    if id(p) in muon_named:
+        muon_params.setdefault(muon_split(muon_named[id(p)][0]), []).append(p)
+    else:
+        (no_decay if p.ndim == 1 or name.endswith('.bias') else decay).append(p)
+# every group stores its peak lr; the schedule scales all of them by the same factor
+adamw = torch.optim.AdamW(
+    [{'params': no_decay, 'weight_decay': 0.0, 'peak_lr': lr}, {'params': decay, 'weight_decay': weight_decay, 'peak_lr': lr}],
     lr=lr, betas=(beta1, beta2), fused=device_type == 'cuda',
 )
+if optimizer_type == 'muon':
+    assert muon_adjust_lr in ('match_rms_adamw', 'original'), f"muon_adjust_lr must be 'match_rms_adamw' or 'original', got {muon_adjust_lr}"
+    # Moonshot's scaling reuses the AdamW lr and weight decay; the original recipe has its own
+    peak_muon_lr, muon_wd = (lr, weight_decay) if muon_adjust_lr == 'match_rms_adamw' else (muon_lr, muon_weight_decay)
+    muon = Muon([{'params': ps, 'split': k, 'peak_lr': peak_muon_lr} for k, ps in sorted(muon_params.items())],
+                lr=peak_muon_lr, momentum=muon_momentum, weight_decay=muon_wd, ns_steps=muon_ns_steps, adjust_lr=muon_adjust_lr)
+    optimizer = CombinedOptimizer([muon, adamw])
+    flat = [p for ps in muon_params.values() for p in ps]
+    print(f"optimizer: Muon ({muon_adjust_lr}, lr {peak_muon_lr:.2e}, wd {muon_wd}) on {len(flat)} block matrices "
+          f"({sum(p.numel() for p in flat) / 1e6:.1f}M params; matrices per split {dict((k, len(v)) for k, v in sorted(muon_params.items()))}), "
+          f"AdamW on the rest ({sum(p.numel() for p in no_decay + decay) / 1e6:.1f}M params, lr {lr:.2e})")
+else:
+    optimizer = adamw
 
 # init these up here, can override if init_from='resume'
 iter_num = 0
@@ -374,11 +422,10 @@ class SpectrumAccumulator:
         return self.power / self.count
 
 @torch.no_grad()
-def generate(spectrum=None, guided=False):
-    cfg, interval = (fid_cfg_guided, (guided_interval_min, guided_interval_max)) if guided else (fid_cfg, (fid_interval_min, fid_interval_max))
+def generate(spectrum=None):
     return generate_and_score(
         denoiser, metrics, ref_stats, fid_num_images, num_classes, device, ctx,
-        cfg=cfg, interval=interval, steps=num_sampling_steps,
+        cfg=fid_cfg, interval=(fid_interval_min, fid_interval_max), steps=num_sampling_steps,
         method=sampling_method, batch_size=gen_batch_size, on_batch=spectrum,
     )
 
@@ -394,7 +441,6 @@ def evaluate(step):
     spectrum = SpectrumAccumulator(diag_spectrum_images) if diag else None
     with ema_weights(denoiser, 1):
         out = generate(spectrum)
-        guided = generate(guided=True) if fid_cfg_guided > 0 else None
         if diag:
             # 5. probes on the EMA weights (the model that is sampled from)
             denoiser.eval()
@@ -403,17 +449,12 @@ def evaluate(step):
             denoiser.train()
             probes = diag_lib.run_probes(tr, probe_train_y, va, probe_val_y, num_classes)
     log['val/fid'], log['val/is'] = out['fid'], out['is']
-    if guided is not None:
-        log[f'val/fid_cfg{fid_cfg_guided:g}'], log[f'val/is_cfg{fid_cfg_guided:g}'] = guided['fid'], guided['is']
     if not diag:
         return out['fid'], log, images
 
     gen_feats = out['features'].to(device)
     # 2. precision / recall
     log['val/precision'], log['val/recall'] = precision_recall(pr_real, gen_feats)
-    if guided is not None:
-        g = f'cfg{fid_cfg_guided:g}'
-        log[f'val/precision_{g}'], log[f'val/recall_{g}'] = precision_recall(pr_real, guided['features'].to(device))
     # 7. memorization
     for k, v in diag_lib.memorization(gen_feats, train_bank, val_feats).items():
         log[f'mem/{k}'] = v
@@ -486,11 +527,11 @@ def evaluate(step):
 @torch.no_grad()
 def save_samples(step):
     # one sample for each of 64 evenly spaced classes, fixed noise so grids are comparable over training and across CFG scales:
-    # samples_{step}.png at fid_cfg, samples_{step}_cfg{g}.png at fid_cfg_guided
+    # samples_{step}.png at fid_cfg, samples_{step}_cfg{g}.png at sample_cfg
     labels = torch.linspace(0, num_classes - 1, 64).long().to(device)
     settings = [(fid_cfg, (fid_interval_min, fid_interval_max), '')]
-    if fid_cfg_guided > 0:
-        settings.append((fid_cfg_guided, (guided_interval_min, guided_interval_max), f'_cfg{fid_cfg_guided:g}'))
+    if sample_cfg > 0:
+        settings.append((sample_cfg, (sample_interval_min, sample_interval_max), f'_cfg{sample_cfg:g}'))
     names = [class_names[i] for i in labels.tolist()]
     with ema_weights(denoiser, 1):
         denoiser.eval()
@@ -546,14 +587,21 @@ while True:
     # determine and set the learning rate for this iteration
     lr_now = get_lr(iter_num)
     for param_group in optimizer.param_groups:
-        param_group['lr'] = lr_now
+        param_group['lr'] = param_group['peak_lr'] * lr_now / lr
 
     # FID eval of EMA weights
     if (eval_only or (iter_num > 0 and local_iter_num > 0 and (iter_num % eval_iters == 0 or iter_num == max_iters))):
         fid, eval_log, eval_images = evaluate(iter_num)
         save_samples(iter_num)
+        trend_images = {}
+        if trend_plots and diag:
+            try: # plotting must never stop training
+                plot_trends.VERBOSE = False
+                trend_images = plot_trends.make_run_figures(out_dir)
+            except Exception as e:
+                print(f"warning: trend plots failed ({type(e).__name__}: {e}); training continues")
         best_fid = min(best_fid, fid)
-        extra = ''.join(f", {k.split('/')[-1]} {eval_log[k]:.3f}" for k in (f'val/fid_cfg{fid_cfg_guided:g}', 'val/precision', 'val/recall', 'val/fid_raw', 'mem/nn_ratio') if k in eval_log)
+        extra = ''.join(f", {k.split('/')[-1]} {eval_log[k]:.3f}" for k in ('val/precision', 'val/recall', 'val/fid_raw', 'mem/nn_ratio') if k in eval_log)
         loss_str = ', '.join(f"{k.split('/')[-1].replace('_', ' ')} {eval_log[k]:.4f}" for k in ('eval/train_loss', 'eval/val_loss') if k in eval_log)
         print(f"iter {iter_num} (epoch {iter_num / iters_per_epoch:.2f}): {loss_str}, FID-{fid_num_images / 1000:g}k {fid:.2f}, IS {eval_log['val/is']:.1f} (cfg {fid_cfg}){extra}")
         if wandb_log:
@@ -563,6 +611,7 @@ while True:
                 "train_hours": train_seconds / 3600,
                 **eval_log,
                 **{f"diag_img/{k}": wandb.Image(v) for k, v in eval_images.items()},
+                **{f"trends/{k}": wandb.Image(v) for k, v in trend_images.items()},
             }, step=iter_num)
         t0 = time.time() # don't count eval time in the next iteration's timing
 
@@ -633,6 +682,8 @@ while True:
                 "lr": lr_now,
                 "imgs_per_sec": imgs_per_sec,
             }
+            if optimizer_type == 'muon':
+                log["lr_muon"] = peak_muon_lr * lr_now / lr
             if encoder is not None:
                 log["train/repa_loss"] = loss_repa.item()
             if log_opt:
@@ -640,6 +691,18 @@ while True:
                 log.update({f"grad_norm/{k}": v for k, v in grad_norms.items()})
                 log.update({f"update_ratio/{k}": update_norms[k] / (weight_norms[k] + 1e-12) for k in update_norms})
             wandb.log(log, step=iter_num)
+        # same stats to a local file, for plot_trends.py (independent of wandb)
+        record = {'iter': iter_num, 'epoch': iter_num / iters_per_epoch, 'images': iter_num * effective_batch_size,
+                  'loss': lossf, 'lr': lr_now, 'imgs_per_sec': imgs_per_sec}
+        if encoder is not None:
+            record['repa_loss'] = loss_repa.item()
+        if optimizer_type == 'muon':
+            record['lr_muon'] = peak_muon_lr * lr_now / lr
+        if log_opt:
+            record['grad_norm'] = grad_norms
+            record['update_ratio'] = {k: update_norms[k] / (weight_norms[k] + 1e-12) for k in update_norms}
+        with open(os.path.join(out_dir, 'train_log.jsonl'), 'a') as f:
+            f.write(json.dumps(record) + '\n')
     iter_num += 1
     local_iter_num += 1
 

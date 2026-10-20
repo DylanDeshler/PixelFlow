@@ -140,6 +140,19 @@ Noise scale follows JiT's rule `img_size / 256` (`--noise_scale` overrides). The
 resolution (256 tokens), so the 128px tiers with 16px patches are outside what it tested. Calibrate `noise_scale` on the
 `in100_128` baseline before comparing methods there.
 
+## Muon
+
+`--optimizer_type=muon` (`muon.py`) uses Muon for the 2D weight matrices inside the transformer blocks and AdamW for the
+rest (patch / time / class embeddings, output layer, gains, biases, REPA projector, mask token).
+
+- `--muon_adjust_lr=match_rms_adamw` (default): Moonshot's scaling ("Muon is Scalable for LLM Training"), update x 0.2 sqrt(max(A, B)),
+  so the update RMS matches AdamW's and Muon uses the AdamW `lr` and `weight_decay` as is.
+- `--muon_adjust_lr=original`: Keller Jordan's reference, update x sqrt(max(1, A/B)) with `--muon_lr` (0.02) and `--muon_weight_decay` (0).
+- Both: momentum 0.95 with Nesterov, 5 Newton-Schulz steps in bf16, matching `torch.optim.Muon` within bf16 noise.
+- `--muon_split_fused` (default on): fused weights are orthogonalized per component: q / k / v, the two SwiGLU input projections,
+  and the 6 adaLN projections (as modded-nanogpt does for q / k / v).
+- `--muon_adaln=False` moves the zero-initialized adaLN projections to AdamW, for the ablation.
+
 ## Token masking
 
 `--mask_ratio=0.5` replaces half the patch tokens of a masked sample with a learned mask token (after the patch embedding, so
@@ -158,8 +171,9 @@ locality diagnostics (window ablation, attention distance at high noise) should 
    evaluation flags (50k images, their CFG scale/interval). It should land near the paper's 3.66.
 
 Each eval also reports the training objective on fixed train and held-out subsets (`eval/train_loss`, `eval/val_loss`, same noise
-every eval), FID / IS at CFG 3 (`--fid_cfg_guided`, 0 disables) alongside the no-CFG FID, and saves sample grids at both
-(`samples_{iter}.png`, `samples_{iter}_cfg3.png`). With diagnostics on, `diagnostics/probes_{iter}.png` shows k-NN and linear probe
+every eval), a single FID-10k of the EMA weights at CFG 1, and sample grids at CFG 1 and CFG 3 (`samples_{iter}.png`,
+`samples_{iter}_cfg3.png`; the CFG-3 grid is one 64-image batch, no FID; `--sample_cfg`, 0 disables). Use `eval_jit.py` for guided
+FIDs and CFG sweeps. With diagnostics on, `diagnostics/probes_{iter}.png` shows k-NN and linear probe
 accuracy as block x noise-level matrices.
 
 Training-time FIDs use no CFG, 10k samples and a fixed seed, so the same noise and labels are used at every eval and across runs.
@@ -174,7 +188,7 @@ and `{out_dir}/diagnostics/diag_{iter}.json`:
 | --- | --- | --- | --- |
 | 1 | loss per noise level on fixed train / held-out images (raw weights) | `noise_loss/*`, `noise_xmse/*`, `noise_gap/*` | slow high-noise (small t) bins: semantics bottleneck; slow low-noise bins: detail; per-bin gap: where it memorizes |
 | 2 | precision / recall (k=3, Inception) | `val/precision`, `val/recall` | low recall with fine precision: coverage / data-limited |
-| 3 | raw vs EMA weights | `val/*_raw` | EMA much better: noisy gradients (batch size, variance reduction, EMA horizon) |
+| 3 | raw vs EMA weights (off by default, `--diag_raw=True`: a second full FID run) | `val/*_raw` | EMA much better: noisy gradients (batch size, variance reduction, EMA horizon) |
 | 4 | grad norms, update/weight ratio per block (every `log_interval`), adaLN gates, attention entropy | `grad_norm/*`, `update_ratio/*`, `gate_*/*`, `attn_entropy/*` | blocks that barely update or are gated off; collapsed or uniform attention |
 | 4b | locality: mean attention distance of patch queries (relative to uniform attention) and attention mass on the in-context class tokens, per block; windowed-attention ablation: held-out loss increase when attention is confined to non-overlapping k x k patch tiles in every layer (`diag_window_tiles`, default 1,2,4) | `attn_dist/*`, `attn_prefix_mass/*`, `window_loss_increase/*`, heatmaps | an increase near 0 at high noise (small t) means the model isn't using context beyond the tile where global structure is decided |
 | 5 | k-NN + linear probe of mean-pooled tokens (blocks at 1/3, 2/3 and the end of the model, t=1, 0.75, 0.5, null label) | `probe/*` | whether / when semantic features emerge, and whether FID gains follow them |
@@ -188,6 +202,27 @@ rather than reading absolute values.
 
 JiT's convention is t=1 clean and t=0 pure noise. The eval runs two extra sample batches (raw weights) plus about 40k
 instrumented forward passes, so it costs roughly 2-3x a plain FID eval; `--diag_raw=False` or `--diag=False` cut that.
+
+## Training-trend figures
+
+`plot_trends.py` turns the per-eval diagnostics into trends over training (x = images seen, so runs with different batch
+sizes line up by compute), written to `{run}/trends/`:
+
+```bash
+python plot_trends.py runs/in100_128/jit-b16/base
+python plot_trends.py runs/in100_128/jit-b16/base runs/in100_128/jit-b16/mask_ratio=0.5 runs/in100_128/jit-b16_bn256/base --out=trends_compare
+```
+
+| figure | question it answers |
+| --- | --- |
+| `convergence.png` | FID (log-log), train / held-out loss, precision / recall, memorization: is progress steady, is it starting to copy? |
+| `noise_levels.png` | held-out loss per noise level vs the first eval, recent improvement per level, train/held-out gap: which noise levels still learn |
+| `detail.png` | per-band error at low and high noise, sample vs real spectrum: is fine detail improving or stuck (e.g. at the patch-bottleneck floor)? |
+| `semantics_locality.png` | probe accuracy per block, windowed-attention loss increase, attention distance: do representations and global context use grow? |
+| `optimization.png` | loss, gradient norm, update/weight ratio per parameter group (from `train_log.jsonl`): are some blocks barely learning? |
+| `compare.png` / `.csv` | the key curves and latest values across runs |
+
+`train_log.jsonl` (loss, lr, gradient norms, update ratios every `log_interval`) is written by `train_jit.py` alongside wandb.
 
 ## Noise-schedule calibration
 
