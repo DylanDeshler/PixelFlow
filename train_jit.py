@@ -106,6 +106,7 @@ guided_interval_min = 0.0 # CFG interval for the guided eval: guidance applied o
 guided_interval_max = 1.0
 sampling_method = 'heun'
 num_sampling_steps = 50
+time_schedule = 'uniform' # sampling time grid: 'uniform' (JiT), 'shift' (FLUX/SD3-style, uses P_mean), 'train_quantile'
 gen_batch_size = 256
 eval_loss_images = 2048 # fixed train / held-out images for the eval train / val loss (training objective, same noise every eval)
 # diagnostics, run at every FID eval (see diagnostics.py)
@@ -214,6 +215,8 @@ denoiser_args = dict(
 )
 denoiser = build_denoiser(**denoiser_args).to(device)
 denoiser.ema_warmup = ema_warmup
+assert time_schedule in ('uniform', 'shift', 'train_quantile'), f'unknown time_schedule {time_schedule}'
+denoiser.time_schedule = time_schedule
 summary(denoiser)
 print(f"model {model_name}: {sum(p.numel() for p in denoiser.net.parameters()) / 1e6:.1f}M params, "
       f"{(img_size // arch['patch_size']) ** 2} tokens of {arch['patch_size'] ** 2 * 3}-d patches")

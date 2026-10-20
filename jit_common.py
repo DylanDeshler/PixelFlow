@@ -51,15 +51,65 @@ def _register(name, arch):
 
 class FastDenoiser(Denoiser):
     """
-    JiT's Denoiser, but skips the unconditional forward when guidance is off (cfg == 1),
-    which halves sampling cost for the no-CFG FIDs used to track convergence. Identical outputs.
+    JiT's Denoiser with a faster sampling step, same outputs:
+      - cfg == 1, or t outside the CFG interval: only the conditional forward (the guided velocity equals it there)
+      - otherwise the conditional and unconditional forwards run as one batch of 2B instead of two sequential passes
     """
     @torch.no_grad()
     def _forward_sample(self, z, t, labels):
-        if self.cfg_scale == 1.0:
+        low, high = self.cfg_interval
+        # same interval rule as JiT's Denoiser._forward_sample
+        in_interval = (t < high) & ((low == 0) | (t > low))
+        if self.cfg_scale == 1.0 or not bool(in_interval.any()):
             x_cond = self.net(z, t.flatten(), labels)
             return (x_cond - z) / (1.0 - t).clamp_min(self.t_eps)
-        return super()._forward_sample(z, t, labels)
+        x_both = self.net(torch.cat([z, z]), torch.cat([t.flatten(), t.flatten()]),
+                          torch.cat([labels, torch.full_like(labels, self.num_classes)]))
+        x_cond, x_uncond = x_both.chunk(2)
+        v_cond = (x_cond - z) / (1.0 - t).clamp_min(self.t_eps)
+        v_uncond = (x_uncond - z) / (1.0 - t).clamp_min(self.t_eps)
+        scale = torch.where(in_interval, self.cfg_scale, 1.0)
+        return v_uncond + scale * (v_cond - v_uncond)
+
+    time_schedule = 'uniform'
+
+    def sampling_timesteps(self, device):
+        """
+        The steps+1 sampling times from 0 (noise) to 1 (clean).
+          uniform         JiT's grid, linspace(0, 1)
+          shift           FLUX / SD3-style: the uniform grid shifted by the training logit-normal mean,
+                          logit(t') = logit(t) + P_mean (SD3's shift map with s = exp(-P_mean))
+          train_quantile  quantiles of the training distribution, logit(t) = P_mean + P_std * Phi^-1(u)
+        """
+        u = torch.linspace(0.0, 1.0, self.steps + 1, device=device, dtype=torch.float64)
+        if self.time_schedule == 'uniform':
+            t = u
+        elif self.time_schedule == 'shift':
+            t = torch.sigmoid(torch.logit(u.clamp(1e-12, 1 - 1e-12)) + self.P_mean)
+        elif self.time_schedule == 'train_quantile':
+            t = torch.sigmoid(self.P_mean + self.P_std * torch.special.ndtri(u.clamp(1e-12, 1 - 1e-12)))
+        else:
+            raise ValueError(f"unknown time_schedule {self.time_schedule}")
+        t[0], t[-1] = 0.0, 1.0
+        return t.float()
+
+    @torch.no_grad()
+    def generate(self, labels):
+        # JiT's Denoiser.generate with a configurable time grid (identical to JiT's for time_schedule='uniform')
+        device = labels.device
+        bsz = labels.size(0)
+        z = self.noise_scale * torch.randn(bsz, 3, self.img_size, self.img_size, device=device)
+        timesteps = self.sampling_timesteps(device).view(-1, *([1] * z.ndim)).expand(-1, bsz, -1, -1, -1)
+        if self.method == "euler":
+            stepper = self._euler_step
+        elif self.method == "heun":
+            stepper = self._heun_step
+        else:
+            raise NotImplementedError
+        for i in range(self.steps - 1):
+            z = stepper(z, timesteps[i], timesteps[i + 1], labels)
+        # last step euler
+        return self._euler_step(z, timesteps[-2], timesteps[-1], labels)
 
     ema_warmup = False
 
@@ -179,7 +229,7 @@ _NAME_EXCLUDE = {
     'epochs', 'batch_size', 'gradient_accumulation_steps', 'eval_every_epochs', 'save_every_epochs', 'log_interval',
     'eval_only', 'init_from', 'wandb_log', 'wandb_project', 'wandb_run_name', 'fid_num_images', 'fid_cfg',
     'fid_interval_min', 'fid_interval_max', 'fid_cfg_guided', 'guided_interval_min', 'guided_interval_max',
-    'sampling_method', 'num_sampling_steps', 'gen_batch_size', 'eval_loss_images',
+    'sampling_method', 'num_sampling_steps', 'time_schedule', 'gen_batch_size', 'eval_loss_images',
     'device', 'dtype', 'compile',
 }
 _ARCH_SHORT = {'depth': 'd', 'hidden_size': 'w', 'num_heads': 'h', 'patch_size': 'p', 'bottleneck_dim': 'bn',

@@ -34,6 +34,7 @@ interval_min = 0.0
 interval_max = 1.0
 sampling_method = 'heun'
 num_sampling_steps = 50
+time_schedule = 'uniform' # 'uniform' (JiT), 'shift' (FLUX/SD3-style, uses the checkpoint's P_mean), 'train_quantile'
 gen_batch_size = 256
 ema = 1 # which EMA to sample with (JiT uses the first, decay 0.9999)
 seed = 0
@@ -65,6 +66,7 @@ else:
                          t_eps=a.t_eps, noise_scale=a.noise_scale)
 denoiser = build_denoiser(**denoiser_args).to(device)
 denoiser.load_state_dict(checkpoint[f'model_ema{ema}'])
+denoiser.time_schedule = time_schedule
 print(f"loaded EMA{ema} weights of {denoiser_args['model']} from {ckpt}")
 checkpoint = None
 
@@ -86,7 +88,7 @@ if os.path.exists(feats_path):
     idx = np.sort(np.random.default_rng(0).choice(len(train_feats), min(num_images, len(train_feats)), replace=False))
     real_feats = torch.from_numpy(train_feats[idx].astype(np.float32)).to(device)
 
-results = {'ckpt': ckpt, 'num_images': num_images, 'steps': num_sampling_steps, 'method': sampling_method,
+results = {'ckpt': ckpt, 'num_images': num_images, 'steps': num_sampling_steps, 'method': sampling_method, 'time_schedule': time_schedule,
            'interval': [interval_min, interval_max], 'fid': {}, 'is': {}, 'precision': {}, 'recall': {}}
 class SampleWriter:
     """
@@ -129,7 +131,7 @@ for cfg in [float(c) for c in cfgs.split(',')]:
     writer = None
     if save_samples:
         assert save_samples in ('png', 'npz'), "save_samples must be '', 'png' or 'npz'"
-        name = f"samples_{num_images / 1000:g}k_{sampling_method}{num_sampling_steps}_cfg{cfg}_interval{interval_min}-{interval_max}"
+        name = f"samples_{num_images / 1000:g}k_{sampling_method}{num_sampling_steps}{'' if time_schedule == 'uniform' else '_' + time_schedule}_cfg{cfg}_interval{interval_min}-{interval_max}"
         writer = SampleWriter(os.path.join(out_dir, name + ('.npz' if save_samples == 'npz' else '')), save_samples, num_images, data.img_size)
     out = generate_and_score(
         denoiser, metrics, ref_stats, num_images, data.num_classes, device, ctx,
@@ -155,7 +157,7 @@ labels = torch.linspace(0, data.num_classes - 1, 64).long().to(device)
 torch.manual_seed(seed)
 with torch.no_grad(), ctx:
     x = denoiser.generate(labels)
-tag = f"{num_images / 1000:g}k_{sampling_method}{num_sampling_steps}"
+tag = f"{num_images / 1000:g}k_{sampling_method}{num_sampling_steps}" + ('' if time_schedule == 'uniform' else f'_{time_schedule}')
 save_labeled_grid(x, [class_names[i] for i in labels.tolist()], os.path.join(out_dir, f'eval_samples_{tag}.png'))
 with open(os.path.join(out_dir, f'eval_{tag}.json'), 'w') as f:
     json.dump(results, f, indent=2)
