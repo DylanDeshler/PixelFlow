@@ -83,7 +83,7 @@ Every setting is a global in the config block at the top of `train_jit.py`. Set 
 and/or `--key=value` (applied last), without editing the script. Keys and types are checked, so typos and wrong types are errors.
 Paths are derived, not configured per run:
 
-- data: `{data_root}/{dataset}`. `data_root` defaults to `$JIT_DATA_ROOT` or `/data/jit`; tier configs only set `dataset`.
+- data: `{data_root}/{dataset}`. `data_root` defaults to `$JIT_DATA_ROOT` or `/data`; tier configs only set `dataset`.
 - run directory: `{runs_root}/{dataset}/{model}/{changes}`. `{model}` is the preset plus changed architecture fields
   (`jit-b16_d6_w384_h6`); `{changes}` lists every setting that differs from the script defaults and affects training
   (`noise_scale=0.5_repa_encoder=dino_vitb16`, or `base`). Budget, eval, logging, diagnostics and system settings are left out, so
@@ -91,7 +91,7 @@ Paths are derived, not configured per run:
   `--out_dir` / `--data_dir` still override the derived paths.
 
 ```bash
-export JIT_DATA_ROOT=/data/jit
+export JIT_DATA_ROOT=/data
 python train_jit.py config/jit_in100_128.py                                   # runs/in100_128/jit-b16/base
 python train_jit.py config/jit_in100_128.py config/model_jit_s16.py           # runs/in100_128/jit-b16_w384_h6/base
 python train_jit.py config/jit_in100_128.py --model=JiT-L/16 --depth=16 --batch_size=128   # runs/in100_128/jit-l16_d16/base
@@ -118,14 +118,14 @@ sizes every prediction target works and results stop transferring. The costs are
 `imgs_per_sec`. On ImageNet-100, check whether many epochs start to memorize the training set (FID is computed against it).
 
 ```bash
-python prepare_jit_data.py --data_dir=/data/imagenet --out_dir=/data/jit/in100_128 --img_size=128 --subset=in100
-python prepare_jit_data.py --data_dir=/data/imagenet --out_dir=/data/jit/in100_128 --img_size=128 --subset=in100 --split=val
-python fid.py --data_dir=/data/jit/in100_128          # FID stats + Inception features for train and val
+python prepare_jit_data.py --data_dir=/data/imagenet --out_dir=/data/in100_128 --img_size=128 --subset=in100
+python prepare_jit_data.py --data_dir=/data/imagenet --out_dir=/data/in100_128 --img_size=128 --subset=in100 --split=val
+python fid.py --data_dir=/data/in100_128          # FID stats + Inception features for train and val
 
 python train_jit.py config/jit_in100_128.py                                   # -> runs/in100_128/jit-b16/base
 python train_jit.py config/jit_in100_128.py --repa_encoder=dino_vitb16        # -> runs/in100_128/jit-b16/repa_encoder=dino_vitb16
 ./run_repa_targets.sh config/jit_in100_128.py         # none / DINO (IN-1k) / MAE (IN-1k) / DINOv2 (LVD-142M)
-python eval_jit.py --ckpt=runs/in100_128/jit-b16/base/ckpt.pt --data_dir=/data/jit/in100_128 --cfgs=1.0,1.5,2.0,2.5,3.0
+python eval_jit.py --ckpt=runs/in100_128/jit-b16/base/ckpt.pt --data_dir=/data/in100_128 --cfgs=1.0,1.5,2.0,2.5,3.0
 ```
 
 `eval_jit.py --save_samples=png|npz` keeps every generated image, as a PNG folder (`{index}_class{label}.png`, JiT's own format)
@@ -188,7 +188,7 @@ quantized signal (fine, count-weighted) grow with noise level. Noise scale s and
 s at P_mean mu is the same set of noise levels as 1 at mu - ln(s).
 
 ```bash
-python noise_calibration.py --data=/data/jit/in100_128 --ref_data=/data/jit/in1k_256 --ref_noise_scale=1.0 --plot=calib.png
+python noise_calibration.py --data=/data/in100_128 --ref_data=/data/in1k_256 --ref_noise_scale=1.0 --plot=calib.png
 python noise_calibration.py --data=clips.npy --quant_bits=16 --noise_scale=1.0     # other modalities: [N, C, *spatial] arrays
 ```
 

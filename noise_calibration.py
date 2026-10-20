@@ -35,8 +35,8 @@ The Gaussian model captures redundancy / resolution / spectral shape, which is w
 but not semantic structure. Treat the outputs as a starting point and confirm with a short sweep (judged on samples,
 not training loss, which isn't comparable across noise settings).
 
-$ python noise_calibration.py --data=/data/jit/in100_128
-$ python noise_calibration.py --data=/data/jit/in100_128 --ref_data=/data/jit/in1k_256 --ref_noise_scale=1.0
+$ python noise_calibration.py --data=/data/in100_128
+$ python noise_calibration.py --data=/data/in100_128 --ref_data=/data/in1k_256 --ref_noise_scale=1.0
 $ python noise_calibration.py --data=audio_clips.npy --quant_bits=16 --noise_scale=1.0   # generic [N, C, *spatial] arrays
 """
 

@@ -1,14 +1,14 @@
 """
 Builds the uint8 memmap datasets used by train_jit.py from the ImageFolder made by prepare_imagenet.py.
 
-$ python prepare_jit_data.py --data_dir=/data/imagenet --out_dir=/data/jit/in100_128 --img_size=128 --subset=in100
-$ python prepare_jit_data.py --data_dir=/data/imagenet --out_dir=/data/jit/in1k_256 --img_size=256 --subset=in1k
+$ python prepare_jit_data.py --data_dir=/data/imagenet --out_dir=/data/in100_128 --img_size=128 --subset=in100
+$ python prepare_jit_data.py --data_dir=/data/imagenet --out_dir=/data/in1k_256 --img_size=256 --subset=in1k
 
 Add the held-out split (from ImageNet val, same classes) for the training diagnostics:
-$ python prepare_jit_data.py --data_dir=/data/imagenet --out_dir=/data/jit/in100_128 --img_size=128 --subset=in100 --split=val
+$ python prepare_jit_data.py --data_dir=/data/imagenet --out_dir=/data/in100_128 --img_size=128 --subset=in100 --split=val
 
 Then compute Inception features / FID reference stats (train, and val if present):
-$ python fid.py --data_dir=/data/jit/in100_128
+$ python fid.py --data_dir=/data/in100_128
 
 For in1k at 256/512 this also downloads JiT's official reference stats (fid_stats_jit.npz), which
 train_jit.py/eval_jit.py prefer so FIDs are directly comparable with the paper.

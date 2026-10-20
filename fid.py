@@ -7,7 +7,7 @@ Inception extractor ('inception-v3-compat') and metric functions run on uint8 te
 directly, so nothing is written to disk.
 
 Reference data for a prepared dataset (see prepare_jit_data.py):
-$ python fid.py --data_dir=/data/jit/in100_128
+$ python fid.py --data_dir=/data/in100_128
 writes, over every training image (and the val split if present):
     fid_stats.npz           mu / sigma for FID
     train_inception.npy     float16 [N, 2048] pool features, for precision/recall and memorization checks

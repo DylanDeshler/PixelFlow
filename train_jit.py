@@ -51,7 +51,7 @@ wandb_log = True
 wandb_project = 'pixelflow'
 wandb_run_name = '' # defaults to the run's path under runs_root
 # data
-data_root = os.environ.get('JIT_DATA_ROOT', '/data/jit') # where prepare_jit_data.py wrote the datasets
+data_root = os.environ.get('JIT_DATA_ROOT', '/data') # where prepare_jit_data.py wrote the datasets (or set $JIT_DATA_ROOT)
 dataset = 'in100_128' # in100_128, in100_256, in1k_128, in1k_256, ... (a directory under data_root)
 data_dir = '' # '' -> {data_root}/{dataset}; set it to use a dataset outside data_root
 gradient_accumulation_steps = 1
@@ -133,6 +133,11 @@ if data_dir:
     dataset = os.path.basename(os.path.normpath(data_dir))
 else:
     data_dir = os.path.join(data_root, dataset)
+if not os.path.exists(os.path.join(data_dir, 'meta.json')):
+    found = sorted(d for d in os.listdir(data_root) if os.path.exists(os.path.join(data_root, d, 'meta.json'))) if os.path.isdir(data_root) else []
+    raise FileNotFoundError(f"no prepared dataset at {data_dir} (dataset='{dataset}', data_root='{data_root}'). "
+                            f"Datasets found under {data_root}: {found or 'none'}. "
+                            f"Point --data_root / $JIT_DATA_ROOT at the folder containing the dataset, or pass --data_dir directly.")
 model_name, arch = resolve_arch(model, **{k: (None if v < 0 else v) for k, v in dict(
     depth=depth, hidden_size=hidden_size, num_heads=num_heads, patch_size=patch_size, bottleneck_dim=bottleneck_dim,
     in_context_len=in_context_len, in_context_start=in_context_start, mlp_ratio=mlp_ratio).items()})
@@ -159,6 +164,7 @@ noise_scale = noise_scale or img_size / 256
 sampler = EpochSampler(len(data), batch_size)
 effective_batch_size = batch_size * gradient_accumulation_steps
 iters_per_epoch = len(data) // effective_batch_size
+assert iters_per_epoch > 0, f'effective batch {effective_batch_size} is larger than the dataset ({len(data):,} images); lower batch_size / gradient_accumulation_steps'
 max_iters = epochs * iters_per_epoch
 lr = blr * effective_batch_size / 256
 print(f"{data_dir}: {len(data):,} images, {num_classes} classes, {img_size}px | effective batch {effective_batch_size}, "

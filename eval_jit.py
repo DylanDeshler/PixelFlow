@@ -3,8 +3,8 @@ FID / IS evaluation of a JiT checkpoint, with a CFG sweep. Works on train_jit.py
 JiT's released checkpoints (checkpoint-*.pth from their README), so the pipeline can be checked
 against the paper before trusting it on your own runs.
 
-$ python eval_jit.py --ckpt=jit_b16_in100_128/ckpt.pt --data_dir=/data/jit/in100_128 --cfgs=1.0,1.5,2.0,2.5,3.0
-$ python eval_jit.py --ckpt=/path/to/jit-b-16/checkpoint-last.pth --data_dir=/data/jit/in1k_256 --cfgs=3.0 --interval_min=0.1 --num_images=50000
+$ python eval_jit.py --ckpt=runs/in100_128/jit-b16/base/ckpt.pt --data_dir=/data/in100_128 --cfgs=1.0,1.5,2.0,2.5,3.0
+$ python eval_jit.py --ckpt=/path/to/jit-b-16/checkpoint-last.pth --data_dir=/data/in1k_256 --cfgs=3.0 --interval_min=0.1 --num_images=50000
 
 --save_samples keeps every generated image, one output per cfg, in a standard format:
     png   folder of PNGs named {index}_class{label}.png, as JiT's evaluation writes (works with their torch-fidelity CLI)
