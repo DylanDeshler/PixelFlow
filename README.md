@@ -128,6 +128,10 @@ python train_jit.py config/jit_in100_128.py --repa_encoder=dino_vitb16        # 
 python eval_jit.py --ckpt=runs/in100_128/jit-b16/base/ckpt.pt --data_dir=/data/in100_128 --cfgs=1.0,1.5,2.0,2.5,3.0
 ```
 
+`eval_jit.py --cfgs=1.0:4.0:0.25` sweeps guidance (comma lists work too). It reports the best-FID scale, a trade-off pick (highest IS
+with FID within `--fid_tolerance`, default 5%, of the best) and the FID/IS Pareto frontier, and saves `cfg_sweep_*.png`: FID, IS and
+precision/recall vs CFG, plus the FID-IS trade-off curve. Sweep at 10k images, then re-score the picks with `--final_num_images=50000`.
+
 `eval_jit.py --save_samples=png|npz` keeps every generated image, as a PNG folder (`{index}_class{label}.png`, JiT's own format)
 or an ADM-evaluator `.npz` (`arr_0` images plus `labels`), with a `_classes.json` mapping labels to ImageNet indices and names.
 Training saves a fixed-noise 8x8 sample grid, captioned with class names, at every eval.
