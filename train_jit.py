@@ -83,7 +83,7 @@ min_lr = 0.0
 weight_decay = 0.0
 beta1 = 0.9
 beta2 = 0.95
-grad_clip = 0.0 # JiT doesn't clip
+grad_clip = 1.0
 ema_decay1 = 0.9999
 ema_decay2 = 0.9996
 ema_warmup = True # decay = min(decay, (1+step)/(10+step)); False is JiT's update (full decay from step 0)
@@ -101,9 +101,13 @@ fid_num_images = 10000 # must be divisible by the number of classes
 fid_cfg = 1.0
 fid_interval_min = 0.0
 fid_interval_max = 1.0
+fid_cfg_guided = 3.0 # also FID / IS (/ precision, recall with diag) and a sample grid with this CFG scale; 0 disables
+guided_interval_min = 0.0 # CFG interval for the guided eval: guidance applied only for t in [min, max]
+guided_interval_max = 1.0
 sampling_method = 'heun'
 num_sampling_steps = 50
 gen_batch_size = 256
+eval_loss_images = 2048 # fixed train / held-out images for the eval train / val loss (training objective, same noise every eval)
 # diagnostics, run at every FID eval (see diagnostics.py)
 diag = True
 diag_raw = True # 3: also FID / precision / recall of the raw (non-EMA) weights
@@ -138,6 +142,32 @@ if not os.path.exists(os.path.join(data_dir, 'meta.json')):
     raise FileNotFoundError(f"no prepared dataset at {data_dir} (dataset='{dataset}', data_root='{data_root}'). "
                             f"Datasets found under {data_root}: {found or 'none'}. "
                             f"Point --data_root / $JIT_DATA_ROOT at the folder containing the dataset, or pass --data_dir directly.")
+
+def check_prepared(data_dir, diag):
+    """
+    Fails fast, before building the model, if any file produced by prepare_jit_data.py / fid.py is missing,
+    listing the commands that create them.
+    """
+    with open(os.path.join(data_dir, 'meta.json')) as f:
+        meta = json.load(f)
+    subset = 'in100' if meta['num_classes'] == 100 else 'in1k'
+    val_dir = os.path.join(data_dir, 'val')
+    has_stats = any(os.path.exists(os.path.join(data_dir, n)) for n in ('fid_stats_jit.npz', 'fid_stats.npz'))
+    missing, steps = [], []
+    if diag and not os.path.exists(os.path.join(val_dir, 'meta.json')):
+        missing.append(f'{val_dir} (held-out split, needed for diagnostics)')
+        steps.append(f"python prepare_jit_data.py --data_dir=<ImageNet ImageFolder root, e.g. /data/imagenet> --out_dir={data_dir} "
+                     f"--img_size={meta['img_size']} --subset={subset} --split=val")
+    needs_fid = not has_stats or (diag and (not os.path.exists(os.path.join(data_dir, 'train_inception.npy'))
+                                            or not os.path.exists(os.path.join(val_dir, 'val_inception.npy'))))
+    if needs_fid:
+        missing.append(f'FID reference stats / Inception features in {data_dir}' + (' and val/' if diag else ''))
+        steps.append(f'python fid.py --data_dir={data_dir}' + ('   # after the val split exists, so its features are written too' if diag else ''))
+    if missing:
+        raise FileNotFoundError('dataset preparation incomplete. missing:\n  ' + '\n  '.join(missing) +
+                                '\nrun:\n  ' + '\n  '.join(steps) + ('\nor pass --diag=False to train without diagnostics (needs only fid.py)' if diag else ''))
+
+check_prepared(data_dir, diag)
 model_name, arch = resolve_arch(model, **{k: (None if v < 0 else v) for k, v in dict(
     depth=depth, hidden_size=hidden_size, num_heads=num_heads, patch_size=patch_size, bottleneck_dim=bottleneck_dim,
     in_context_len=in_context_len, in_context_start=in_context_start, mlp_ratio=mlp_ratio).items()})
@@ -252,14 +282,39 @@ ref_stats = load_ref_stats(ref_stats_path)
 metrics = InceptionMetrics(device)
 print(f"FID reference: {ref_stats_path}")
 
+# fixed subsets for the eval train / val loss (uint8 on CPU)
+def _spaced(n, k):
+    return np.linspace(0, n - 1, min(k, n)).round().astype(np.int64)
+loss_sets = {'train': data.get(_spaced(len(data), eval_loss_images))}
+if os.path.exists(os.path.join(data_dir, 'val', 'meta.json')):
+    _val = MemmapImages(os.path.join(data_dir, 'val'))
+    loss_sets['val'] = _val.get(_spaced(len(_val), eval_loss_images))
+
+@torch.no_grad()
+def estimate_loss(images, labels, chunk=256, seed=0):
+    """
+    The training objective (flow-matching v-loss, no label dropout, no masking) on fixed images with fixed noise and t,
+    using the raw weights. Same seed every eval, so values are comparable across evals and between train / val.
+    """
+    was_training = denoiser.training
+    denoiser.eval()
+    total = 0.0
+    with torch.random.fork_rng(devices=[device] if device_type == 'cuda' else []):
+        torch.manual_seed(seed)
+        for i in range(0, len(images), chunk):
+            x = to_model_input(images[i:i + chunk], flip=False, device=device)
+            y = torch.from_numpy(labels[i:i + chunk]).to(device)
+            with ctx:
+                total += flow_loss(denoiser, x, y).item() * len(x)
+    denoiser.train(was_training)
+    return total / len(images)
+
 def spaced(n, k):
     # k evenly spaced indices; the memmaps are sorted by class, so this is roughly class-stratified
     return np.linspace(0, n - 1, min(k, n)).round().astype(np.int64)
 
 if diag:
-    val_dir = os.path.join(data_dir, 'val')
-    assert os.path.exists(os.path.join(val_dir, 'meta.json')), f'diag=True needs the held-out split in {val_dir} (prepare_jit_data.py --split=val), or pass --diag=False'
-    assert os.path.exists(os.path.join(val_dir, 'val_inception.npy')), 'diag=True needs fid.py run after the val split was prepared'
+    val_dir = os.path.join(data_dir, 'val') # presence checked by check_prepared
     val_data = MemmapImages(val_dir)
     # 1/4/6: fixed batches, no flips
     xd, yd = data.get(spaced(len(data), diag_images))
@@ -316,10 +371,11 @@ class SpectrumAccumulator:
         return self.power / self.count
 
 @torch.no_grad()
-def generate(spectrum=None):
+def generate(spectrum=None, guided=False):
+    cfg, interval = (fid_cfg_guided, (guided_interval_min, guided_interval_max)) if guided else (fid_cfg, (fid_interval_min, fid_interval_max))
     return generate_and_score(
         denoiser, metrics, ref_stats, fid_num_images, num_classes, device, ctx,
-        cfg=fid_cfg, interval=(fid_interval_min, fid_interval_max), steps=num_sampling_steps,
+        cfg=cfg, interval=interval, steps=num_sampling_steps,
         method=sampling_method, batch_size=gen_batch_size, on_batch=spectrum,
     )
 
@@ -330,9 +386,12 @@ def evaluate(step):
     """
     t_start = time.time()
     log, images, record = {}, {}, {}
+    for split, (xs, ys) in loss_sets.items():
+        log[f'eval/{split}_loss'] = estimate_loss(xs, ys)
     spectrum = SpectrumAccumulator(diag_spectrum_images) if diag else None
     with ema_weights(denoiser, 1):
         out = generate(spectrum)
+        guided = generate(guided=True) if fid_cfg_guided > 0 else None
         if diag:
             # 5. probes on the EMA weights (the model that is sampled from)
             denoiser.eval()
@@ -341,12 +400,17 @@ def evaluate(step):
             denoiser.train()
             probes = diag_lib.run_probes(tr, probe_train_y, va, probe_val_y, num_classes)
     log['val/fid'], log['val/is'] = out['fid'], out['is']
+    if guided is not None:
+        log[f'val/fid_cfg{fid_cfg_guided:g}'], log[f'val/is_cfg{fid_cfg_guided:g}'] = guided['fid'], guided['is']
     if not diag:
         return out['fid'], log, images
 
     gen_feats = out['features'].to(device)
     # 2. precision / recall
     log['val/precision'], log['val/recall'] = precision_recall(pr_real, gen_feats)
+    if guided is not None:
+        g = f'cfg{fid_cfg_guided:g}'
+        log[f'val/precision_{g}'], log[f'val/recall_{g}'] = precision_recall(pr_real, guided['features'].to(device))
     # 7. memorization
     for k, v in diag_lib.memorization(gen_feats, train_bank, val_feats).items():
         log[f'mem/{k}'] = v
@@ -360,6 +424,8 @@ def evaluate(step):
         log[f'probe/knn_block{b:02d}_t{t:.2f}'] = r['knn']
         log[f'probe/linear_block{b:02d}_t{t:.2f}'] = r['linear']
     record['probes'] = {f'block{b}_t{t}': r for (b, t), r in probes.items()}
+    images['probes'] = diag_lib.probe_heatmap(probes, probe_blocks, probe_ts, f'probes on held-out images, null label (iter {step})',
+                                              os.path.join(out_dir, 'diagnostics', f'probes_{step}.png'))
     # 1 + 4 + 6. per-noise-level pass on the raw weights (the ones being optimized)
     denoiser.eval()
     passes = {split: diag_lib.noise_level_pass(denoiser.net, xb, yb, diag_ts, noise_scale, t_eps, ctx, band_masks)
@@ -416,15 +482,24 @@ def evaluate(step):
 
 @torch.no_grad()
 def save_samples(step):
-    # one sample for each of 64 evenly spaced classes, fixed noise so grids are comparable over training
+    # one sample for each of 64 evenly spaced classes, fixed noise so grids are comparable over training and across CFG scales:
+    # samples_{step}.png at fid_cfg, samples_{step}_cfg{g}.png at fid_cfg_guided
     labels = torch.linspace(0, num_classes - 1, 64).long().to(device)
-    with ema_weights(denoiser, 1), torch.random.fork_rng(devices=[device] if device_type == 'cuda' else []):
-        torch.manual_seed(0)
+    settings = [(fid_cfg, (fid_interval_min, fid_interval_max), '')]
+    if fid_cfg_guided > 0:
+        settings.append((fid_cfg_guided, (guided_interval_min, guided_interval_max), f'_cfg{fid_cfg_guided:g}'))
+    names = [class_names[i] for i in labels.tolist()]
+    with ema_weights(denoiser, 1):
         denoiser.eval()
-        with ctx:
-            x = denoiser.generate(labels)
+        for cfg, interval, suffix in settings:
+            denoiser.cfg_scale, denoiser.cfg_interval = cfg, interval
+            denoiser.steps, denoiser.method = num_sampling_steps, sampling_method
+            with torch.random.fork_rng(devices=[device] if device_type == 'cuda' else []):
+                torch.manual_seed(0)
+                with ctx:
+                    x = denoiser.generate(labels)
+            save_labeled_grid(x, names, os.path.join(out_dir, f'samples_{step}{suffix}.png'))
         denoiser.train()
-    save_labeled_grid(x, [class_names[i] for i in labels.tolist()], os.path.join(out_dir, f'samples_{step}.png'))
 
 def save_checkpoint():
     ema1, ema2 = ema_state_dicts(denoiser)
@@ -447,7 +522,7 @@ def save_checkpoint():
     tmp_path = os.path.join(out_dir, 'ckpt.pt.tmp')
     torch.save(checkpoint, tmp_path)
     os.replace(tmp_path, os.path.join(out_dir, 'ckpt.pt'))
-    print(f"saved checkpoint to {out_dir} at iter {iter_num}")
+    print(f"saved checkpoint to {out_dir} at iter {iter_num} (epoch {iter_num / iters_per_epoch:.2f})")
 
 # logging
 if wandb_log:
@@ -475,8 +550,9 @@ while True:
         fid, eval_log, eval_images = evaluate(iter_num)
         save_samples(iter_num)
         best_fid = min(best_fid, fid)
-        extra = ''.join(f", {k.split('/')[-1]} {eval_log[k]:.3f}" for k in ('val/precision', 'val/recall', 'val/fid_raw', 'mem/nn_ratio') if k in eval_log)
-        print(f"iter {iter_num} (epoch {iter_num / iters_per_epoch:.1f}): FID-{fid_num_images / 1000:g}k {fid:.2f}, IS {eval_log['val/is']:.1f} (cfg {fid_cfg}){extra}")
+        extra = ''.join(f", {k.split('/')[-1]} {eval_log[k]:.3f}" for k in (f'val/fid_cfg{fid_cfg_guided:g}', 'val/precision', 'val/recall', 'val/fid_raw', 'mem/nn_ratio') if k in eval_log)
+        loss_str = ', '.join(f"{k.split('/')[-1].replace('_', ' ')} {eval_log[k]:.4f}" for k in ('eval/train_loss', 'eval/val_loss') if k in eval_log)
+        print(f"iter {iter_num} (epoch {iter_num / iters_per_epoch:.2f}): {loss_str}, FID-{fid_num_images / 1000:g}k {fid:.2f}, IS {eval_log['val/is']:.1f} (cfg {fid_cfg}){extra}")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -544,7 +620,7 @@ while True:
         imgs_per_sec = effective_batch_size / dt
         repa_str = f", repa {loss_repa.item():.4f}" if encoder is not None else ""
         grad_str = f", grad norm {math.sqrt(sum(v ** 2 for v in grad_norms.values())):.4f}" if log_opt else ""
-        print(f"iter {iter_num}: loss {lossf:.4f}{repa_str}{grad_str}, time {dt*1000:.2f}ms, {imgs_per_sec:.0f} img/s")
+        print(f"iter {iter_num} (epoch {iter_num / iters_per_epoch:.2f}): loss {lossf:.4f}{repa_str}{grad_str}, time {dt*1000:.2f}ms, {imgs_per_sec:.0f} img/s")
         if wandb_log:
             log = {
                 "iter": iter_num,

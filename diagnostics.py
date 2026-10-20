@@ -322,3 +322,29 @@ def heatmap(values, row_labels, col_labels, title, path, log=True):
     fig.savefig(path, dpi=120)
     plt.close(fig)
     return path
+
+def probe_heatmap(probes, blocks, ts, title, path):
+    """
+    Side-by-side k-NN and linear probe accuracy matrices (rows: block depth, cols: noise level t), values annotated.
+    probes: {(block, t): {'knn': acc, 'linear': acc}}
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    fig, axes = plt.subplots(1, 2, figsize=(2.5 + 1.6 * len(ts), 1.2 + 0.55 * len(blocks)), squeeze=False)
+    for ax, kind in zip(axes[0], ('knn', 'linear')):
+        m = np.array([[probes[(b, t)][kind] for t in ts] for b in blocks])
+        im = ax.imshow(m, aspect='auto', cmap='viridis')
+        for i in range(len(blocks)):
+            for j in range(len(ts)):
+                ax.text(j, i, f'{m[i, j]:.1f}', ha='center', va='center', fontsize=8,
+                        color='white' if m[i, j] < (m.min() + m.max()) / 2 else 'black')
+        ax.set_xticks(range(len(ts)), [f't={t:g}' for t in ts], fontsize=8)
+        ax.set_yticks(range(len(blocks)), [f'block {b}' for b in blocks], fontsize=8)
+        ax.set_title(f"{'k-NN' if kind == 'knn' else 'linear'} probe top-1 (%)", fontsize=9)
+        fig.colorbar(im, ax=ax)
+    fig.suptitle(title, fontsize=9)
+    fig.tight_layout()
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+    return path

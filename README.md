@@ -153,6 +153,11 @@ locality diagnostics (window ablation, attention distance at high noise) should 
 2. Download the released JiT-B/16 checkpoint (Dropbox link in their README) and run `eval_jit.py` on it with their
    evaluation flags (50k images, their CFG scale/interval). It should land near the paper's 3.66.
 
+Each eval also reports the training objective on fixed train and held-out subsets (`eval/train_loss`, `eval/val_loss`, same noise
+every eval), FID / IS at CFG 3 (`--fid_cfg_guided`, 0 disables) alongside the no-CFG FID, and saves sample grids at both
+(`samples_{iter}.png`, `samples_{iter}_cfg3.png`). With diagnostics on, `diagnostics/probes_{iter}.png` shows k-NN and linear probe
+accuracy as block x noise-level matrices.
+
 Training-time FIDs use no CFG, 10k samples and a fixed seed, so the same noise and labels are used at every eval and across runs.
 They're for comparing runs with each other. Paper-comparable numbers need `eval_jit.py` with 50k samples and CFG.
 

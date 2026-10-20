@@ -244,7 +244,7 @@ def save_checkpoint():
     tmp_path = os.path.join(out_dir, 'ckpt.pt.tmp')
     torch.save(checkpoint, tmp_path)
     os.replace(tmp_path, os.path.join(out_dir, 'ckpt.pt'))
-    print(f"saved checkpoint to {out_dir} at iter {iter_num}")
+    print(f"saved checkpoint to {out_dir} at iter {iter_num} (epoch {iter_num / iters_per_epoch:.2f})")
 
 # logging
 if wandb_log:
@@ -271,7 +271,7 @@ while True:
     if (iter_num % eval_interval == 0 or iter_num == max_iters) and (eval_only or not (init_from == 'resume' and local_iter_num == 0)):
         top1, top5 = evaluate_knn()
         best_knn_top1 = max(best_knn_top1, top1)
-        print(f"iter {iter_num} (epoch {iter_num / iters_per_epoch:.1f}): k-NN top1 {top1:.2f}%, top5 {top5:.2f}%")
+        print(f"iter {iter_num} (epoch {iter_num / iters_per_epoch:.2f}): k-NN top1 {top1:.2f}%, top5 {top5:.2f}%")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -338,7 +338,7 @@ while True:
             raise RuntimeError(f"loss is {lossf} at iter {iter_num}, stopping")
         entropy, mean_entropy = teacher_stats(teacher_output, temp)
         imgs_per_sec = effective_batch_size / dt
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, {imgs_per_sec:.0f} img/s, teacher entropy {entropy:.3f} / batch {mean_entropy:.3f}")
+        print(f"iter {iter_num} (epoch {iter_num / iters_per_epoch:.2f}): loss {lossf:.4f}, time {dt*1000:.2f}ms, {imgs_per_sec:.0f} img/s, teacher entropy {entropy:.3f} / batch {mean_entropy:.3f}")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,

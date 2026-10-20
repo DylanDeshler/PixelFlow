@@ -67,7 +67,7 @@ def load_samples(path, max_samples, seed=0):
     idx = np.sort(np.random.default_rng(seed).choice(len(arr), min(max_samples, len(arr)), replace=False))
     return torch.from_numpy(np.asarray(arr[idx], dtype=np.float32))
 
-def coefficient_variances(x):
+def coefficient_variances(x, keep_shape=False):
     """
     Variance of every Fourier coefficient after decorrelating channels: [C, *spatial] flattened to [D].
     Orthonormal transforms (PCA over channels, ortho FFT) keep the injected noise white with unit variance per coefficient.
@@ -84,7 +84,8 @@ def coefficient_variances(x):
     for i in range(0, N, chunk):
         xc = torch.einsum('cd,nc...->nd...', V, x[i:i + chunk].double() - mean)
         power = power + torch.fft.fftn(xc, dim=spatial_dims, norm='ortho').abs().pow(2).sum(0)
-    return (power / N).flatten()
+    power = power / N # [C, *spatial], channels ordered by increasing variance (eigh)
+    return power if keep_shape else power.flatten()
 
 def pool_to(x, size):
     """
@@ -120,6 +121,54 @@ def info_curve(p, u, q):
         snr = torch.exp(uc).unsqueeze(1)
         return (torch.log1p(snr * p.unsqueeze(0)) - torch.log1p(snr * q)).clamp_min(0).sum(1)
     return _over_u(info, u, len(p)) / torch.log(p / q).sum()
+
+def radial_power(power):
+    """
+    Radially averaged (isotropic) version of a 2D coefficient-variance map [H, W], plus the per-ring profile and the
+    ring frequencies (cycles / pixel). Averaging over rings removes most of the estimation noise of per-coefficient variances.
+    """
+    R = power.shape[-1]
+    f = torch.fft.fftfreq(R, dtype=torch.float64)
+    ring = (torch.sqrt(f.view(-1, 1) ** 2 + f.view(1, -1) ** 2) * R).round().long()
+    profile = torch.zeros(int(ring.max()) + 1, dtype=torch.float64).scatter_add_(0, ring.flatten(), power.flatten().double())
+    profile = profile / torch.bincount(ring.flatten()).double()
+    return profile[ring], profile, torch.arange(len(profile), dtype=torch.float64) / R
+
+def wiener_kernel_radius(power_iso, noise_var, qs=(0.5, 0.9)):
+    """
+    Spatial extent of the optimal linear (Wiener) denoiser H = P / (P + n): radii (pixels) containing q of its kernel's
+    squared energy. (Absolute kernel mass is a poor measure: natural images' 1/f^2 spectrum gives the kernel a scale-free
+    tail of tiny weights, a low-pass average over the whole image, whose mass never converges.)
+    """
+    h = torch.fft.fftshift(torch.fft.ifft2(power_iso / (power_iso + noise_var)).real) ** 2
+    R = h.shape[-1]
+    yy, xx = torch.meshgrid(torch.arange(R) - R // 2, torch.arange(R) - R // 2, indexing='ij')
+    r = torch.sqrt((yy ** 2 + xx ** 2).double()).flatten()
+    order = torch.argsort(r)
+    cum = torch.cumsum(h.flatten()[order], 0) / h.sum()
+    return [r[order][int(torch.searchsorted(cum, torch.tensor([q], dtype=cum.dtype)).clamp(max=len(r) - 1))].item() for q in qs]
+
+def crossover_wavelength(profile, freqs, noise_var):
+    """
+    Wavelength (pixels) of the lowest frequency whose signal power has dropped below the noise: structure coarser than this
+    is visible in z_t, finer structure is hidden and has to be inferred, so it is roughly the scale being decided at this t.
+    Returns 0 if every frequency is still visible.
+    """
+    below = (profile[1:] < noise_var).nonzero()
+    return 0.0 if len(below) == 0 else 1.0 / freqs[1:][below[0, 0]].item()
+
+def scale_schedule(x, noise_scale, ts):
+    """
+    Per t, for the dominant (luminance-like) decorrelated channel of 2D image data: Wiener kernel energy radii r50 / r90
+    and the crossover wavelength, all in pixels. z_t / t = x + ((1 - t) s / t) eps, so the noise variance is ((1 - t) s / t)^2.
+    """
+    power_iso, profile, freqs = radial_power(coefficient_variances(x, keep_shape=True)[-1])
+    out = []
+    for t in ts:
+        n = ((1 - t) * noise_scale / t) ** 2
+        r50, r90 = wiener_kernel_radius(power_iso, n)
+        out.append({'t': t, 'r50_px': r50, 'r90_px': r90, 'crossover_px': crossover_wavelength(profile, freqs, n)})
+    return out
 
 # -----------------------------------------------------------------------------
 # training distribution: logit(t) ~ N(P_mean, P_std)  =>  u ~ N(2 (P_mean - log s), 2 P_std)
@@ -217,6 +266,8 @@ if __name__ == '__main__':
     parser.add_argument('--value_range', type=float, default=2.0, help='range of the data in model units ([-1, 1] -> 2)')
     parser.add_argument('--max_samples', type=int, default=5000)
     parser.add_argument('--plot', type=str, default='', help='optional path for a PNG of the curves')
+    parser.add_argument('--patch_size', type=int, default=16, help='to express Wiener kernel radii in patches')
+    parser.add_argument('--schedule_out', type=str, default='', help='optional JSON path for the Wiener radius schedule')
     args = parser.parse_args()
 
     def default_scale(path, s):
@@ -230,6 +281,21 @@ if __name__ == '__main__':
     s = default_scale(args.data, args.noise_scale)
     x = load_samples(args.data, args.max_samples)
     new = analyze(args.data, x, s, args.P_mean, args.P_std, args.quant_bits, args.value_range)
+
+    # spatial scales vs noise level (2D images): what range the denoiser needs at each t, for attention schedules
+    if x.ndim == 4:
+        ts = torch.sigmoid(torch.linspace(-4, 4, 17)).tolist()
+        sched = scale_schedule(x, s, ts)
+        p = args.patch_size
+        print(f"\nspatial scales vs noise level (dominant channel, noise scale {s}, {p}px patches)")
+        print("   t      logit(t)   Wiener r50 / r90 px    crossover wavelength px (patches)")
+        for e in sched:
+            cw = f"{e['crossover_px']:6.1f} ({e['crossover_px'] / p:5.2f})" if e['crossover_px'] else "   all visible"
+            print(f"  {e['t']:.3f}   {math.log(e['t'] / (1 - e['t'])):+6.2f}     {e['r50_px']:5.1f} / {e['r90_px']:5.1f}         {cw}")
+        if args.schedule_out:
+            with open(args.schedule_out, 'w') as f:
+                json.dump({'data': args.data, 'noise_scale': s, 'img_size': int(x.shape[-1]), 'schedule': sched}, f, indent=1)
+            print(f"schedule saved to {args.schedule_out}")
 
     if args.ref_data:
         xr = load_samples(args.ref_data, args.max_samples)
