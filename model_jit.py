@@ -267,8 +267,8 @@ class AttnResState:
 
     Efficiency: w_l . RMSNorm(v) = (v . (g_l * w_l)) / rms(v). The queries are parameters, so when a source is created its
     logits for every sublayer are one matmul against all the (g_l * w_l) at once, and a mix only gathers them (as the
-    paper's two-phase computation does); the weighted sum is accumulated in place (_DepthMix). Nothing [S, B, T, D]-sized
-    is saved for backward.
+    paper's two-phase computation does). The weighted sum is accumulated in place in eager mode (_DepthMix) and left to
+    the compiler's fusion under whole-model compile. Nothing [S, B, T, D]-sized is saved for backward.
     """
     def __init__(self, net, emb):
         self.queries, self.norms = net.attn_res_queries, net.attn_res_norms
@@ -303,7 +303,12 @@ class AttnResState:
             logits.append(self._logits(self.partial, self.keys[l:l + 1])[..., 0])
         if len(sources) == 1: # the first sublayer only sees the embedding (so its query never trains)
             return sources[0]
-        return _DepthMix.apply(torch.stack(logits).softmax(0), *sources)
+        alpha = torch.stack(logits).softmax(0)
+        if torch.compiler.is_compiling():
+            # whole-model compile unrolls the block loop, so S is fixed here: the plain weighted sum fuses into one
+            # kernel and the compiler saves only alpha and the sources for backward
+            return sum(alpha[i].unsqueeze(-1).to(v.dtype) * v for i, v in enumerate(sources))
+        return _DepthMix.apply(alpha, *sources)
 
     def prepend(self, prefix):
         # in-context tokens: the embedding source gets them, every other source zeros at those positions

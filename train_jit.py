@@ -144,7 +144,7 @@ diag_opt_stats = True # 4: grad norms and update/weight ratios per block, every 
 # system
 device = 'cuda'
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float32'
-compile = True # JiT compiles its blocks with @torch.compile; False disables dynamo entirely
+compile = True # torch.compile the whole network; False disables dynamo entirely
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 _defaults = {k: globals()[k] for k in config_keys} # to name the run by what changed
@@ -356,6 +356,11 @@ else:
     denoiser.ema_params2 = [p.detach().clone() for p in denoiser.parameters()]
 
 trainable_params = [p for _, p in trainable if p.requires_grad]
+if compile:
+    # whole network, after every hook (REPA capture, token masking) is registered so they're traced in;
+    # Module.compile keeps the parameter names, so checkpoints and EMA are unaffected
+    print("compiling the model... (the first iteration and the first eval take a few minutes)")
+    denoiser.net.compile()
 ref_stats_path = os.path.join(data_dir, 'fid_stats_jit.npz')
 if not os.path.exists(ref_stats_path):
     ref_stats_path = os.path.join(data_dir, 'fid_stats.npz')

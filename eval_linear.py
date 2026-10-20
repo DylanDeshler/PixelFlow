@@ -164,6 +164,8 @@ def load_jit(ckpt, checkpoint):
     print(f"loaded {'EMA' + str(jit_ema) if jit_ema else 'raw'} weights of {checkpoint['denoiser_args']['model']} from {ckpt} "
           f"at iter {checkpoint['iter_num']} (epoch {checkpoint.get('epoch', 0):.1f}): blocks {blocks}, t={jit_t}")
     backbone = JiTBackbone(net, blocks, jit_t, denoiser.noise_scale)
+    if compile and 'cuda' in device:
+        net.compile() # after the capture hooks are registered
     backbone.iter_num, backbone.epoch = checkpoint['iter_num'], checkpoint.get('epoch')
     return backbone
 
@@ -325,7 +327,7 @@ if linear:
         return x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
     features_fn = backbone.get_intermediate_layers
-    if compile and 'cuda' in device and not is_jit: # JiT compiles its blocks itself
+    if compile and 'cuda' in device and not is_jit: # the JiT network is compiled in load_jit
         print("compiling the backbone... (takes a ~minute)")
         features_fn = torch.compile(features_fn)
 

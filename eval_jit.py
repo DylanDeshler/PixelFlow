@@ -164,6 +164,8 @@ else:
                          t_eps=a.t_eps, noise_scale=a.noise_scale)
 denoiser = build_denoiser(**denoiser_args).to(device)
 denoiser.load_state_dict(checkpoint[f'model_ema{ema}'])
+if compile:
+    denoiser.net.compile()
 denoiser.time_schedule = time_schedule
 print(f"loaded EMA{ema} weights of {denoiser_args['model']} from {ckpt}")
 checkpoint = None
