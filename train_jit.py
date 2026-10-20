@@ -32,11 +32,12 @@ import torch
 from data_jit import MemmapImages, EpochSampler, to_model_input
 from jit_common import build_denoiser, resolve_arch, run_dir, legacy_run_dir, ema_state_dicts, ema_weights, generate_and_score, save_labeled_grid
 from fid import InceptionMetrics, load_ref_stats, precision_recall
-from repa import FrozenEncoder, Projector, BlockCapture, repa_loss
+from repa import FrozenEncoder, Projector, MaskedTransformerAdapter, BlockCapture, repa_loss, mta_loss
 from masking import TokenMasker, flow_loss
 from muon import Muon, CombinedOptimizer
 import diagnostics as diag_lib
 import plot_trends
+from progress_gif import make_progress_gifs
 
 # -----------------------------------------------------------------------------
 # I/O
@@ -98,11 +99,14 @@ grad_clip = 1.0
 ema_decay1 = 0.9999
 ema_decay2 = 0.9996
 ema_warmup = True # decay = min(decay, (1+step)/(10+step)); False is JiT's update (full decay from step 0)
-# REPA ('' disables). see repa.py for the available encoders
-repa_encoder = ''
-repa_depth = 4 # align the output of this block (1-indexed)
-repa_coeff = 0.5
-repa_proj_dim = 2048
+# representation alignment ('' disables). see repa.py for the encoders and the two adapters
+repa_encoder = '' # e.g. timm:vit_base_patch14_dinov2.lvd142m (PixelREPA's DINOv2 setup), dinov2_vitb14, dino_vitb16
+repa_adapter = 'mlp' # 'mlp' (REPA's MLP projector; hurts JiT per Shin et al. 2026) or 'mta' (PixelREPA's Masked Transformer Adapter)
+repa_depth = 4 # align the output of this block (1-indexed); JiT-B's in_context_start, the block PixelREPA uses
+repa_coeff = -1.0 # alignment loss weight; -1 -> the method's published value: 0.5 for mlp (REPA), 0.1 for mta (PixelREPA)
+repa_proj_dim = 2048 # mlp only: projector width (REPA)
+repa_mask_ratio = 0.2 # mta only: fraction of adapter-input tokens masked (PixelREPA)
+repa_adapter_depth = 2 # mta only: transformer blocks in the adapter (PixelREPA)
 # MAE-style token masking (masking.py): same loss, masked patches predicted from context. 0 disables
 mask_ratio = 0.0 # fraction of patches replaced by a learned mask token in a masked sample
 mask_prob = 0.0 # fraction of each batch that is masked (the rest trains unmasked, as at inference)
@@ -132,6 +136,7 @@ diag_probe_train_images = 10000
 diag_probe_val_images = 5000
 diag_spectrum_images = 2000 # generated samples for the sample-vs-real spectrum
 diag_window_tiles = '1,2,4' # windowed-attention ablation: attention confined to k x k patch tiles ('' disables; k >= grid skipped)
+progress_gif = True # after each eval, rebuild samples/progress*.gif from all saved sample grids (same seed / classes) and log to wandb
 trend_plots = True # after each eval, regenerate the plot_trends.py figures in {out_dir}/trends and log them to wandb (needs diag)
 diag_opt_stats = True # 4: grad norms and update/weight ratios per block, every log_interval
 # system
@@ -247,10 +252,22 @@ grid = img_size // denoiser.net.patch_size
 
 encoder, projector, capture = None, None, None
 if repa_encoder:
-    encoder = FrozenEncoder(repa_encoder).to(device)
-    projector = Projector(denoiser.net.hidden_size, encoder.embed_dim, repa_proj_dim).to(device)
+    assert repa_adapter in ('mlp', 'mta'), f"repa_adapter must be 'mlp' or 'mta', got {repa_adapter}"
+    repa_coeff = repa_coeff if repa_coeff >= 0 else (0.5 if repa_adapter == 'mlp' else 0.1)
+    encoder = FrozenEncoder(repa_encoder, img_size=img_size, patch_size=denoiser.net.patch_size).to(device)
+    if repa_adapter == 'mlp':
+        projector = Projector(denoiser.net.hidden_size, encoder.embed_dim, repa_proj_dim).to(device)
+    else: # 'projector' holds the adapter too, so checkpointing / optimizer setup treat both the same way
+        projector = MaskedTransformerAdapter(img_size, denoiser.net.patch_size, encoder.embed_dim, denoiser.net.hidden_size,
+                                             denoiser.net.num_heads, num_classes, depth=repa_adapter_depth, mask_ratio=repa_mask_ratio).to(device)
     capture = BlockCapture(denoiser.net, repa_depth)
-    print(f"REPA: block {repa_depth} -> {repa_encoder} ({encoder.embed_dim}-d, {grid}x{grid} grid), coeff {repa_coeff}")
+    with open(os.path.join(out_dir, 'config.json')) as f:
+        run_config = json.load(f)
+    run_config['resolved']['repa_coeff'] = repa_coeff # the published weight when repa_coeff = -1
+    with open(os.path.join(out_dir, 'config.json'), 'w') as f:
+        json.dump(run_config, f, indent=2)
+    print(f"alignment ({'REPA, MLP projector' if repa_adapter == 'mlp' else f'PixelREPA, {repa_adapter_depth}-block adapter, {repa_mask_ratio:.0%} masking'}): "
+          f"block {repa_depth} -> {repa_encoder} ({encoder.embed_dim}-d, {grid}x{grid} grid), coeff {repa_coeff}")
 
 # same weight decay grouping as JiT (no decay on biases / norms)
 decay, no_decay = [], []
@@ -258,6 +275,8 @@ masker = None
 if mask_ratio > 0:
     assert mask_weighting in ('effective_t', 'jit'), "mask_weighting must be 'effective_t' or 'jit'"
     masker = TokenMasker(denoiser.net).to(device)
+    if mask_prob == 0:
+        print(f"warning: mask_ratio={mask_ratio} but mask_prob=0, so no sample is ever masked; set --mask_prob (e.g. 0.5) to enable masking")
     print(f"token masking: {mask_ratio:.0%} of patches in {mask_prob:.0%} of samples, weighting {mask_weighting}")
 trainable = list(denoiser.named_parameters()) + (list(projector.named_parameters()) if projector is not None else []) \
     + (list(masker.named_parameters()) if masker is not None else [])
@@ -601,6 +620,12 @@ while True:
     if (eval_only or (iter_num > 0 and local_iter_num > 0 and (iter_num % eval_iters == 0 or iter_num == max_iters))):
         fid, eval_log, eval_images = evaluate(iter_num)
         save_samples(iter_num)
+        progress_gifs = {}
+        if progress_gif:
+            try: # animation must never stop training
+                progress_gifs = make_progress_gifs(out_dir)
+            except Exception as e:
+                print(f"warning: progress gif failed ({type(e).__name__}: {e}); training continues")
         trend_images = {}
         if trend_plots and diag:
             try: # plotting must never stop training
@@ -620,6 +645,7 @@ while True:
                 **eval_log,
                 **{f"diag_img/{k}": wandb.Image(v) for k, v in eval_images.items()},
                 **{f"trends/{k}": wandb.Image(v) for k, v in trend_images.items()},
+                **{f"samples/progress{k}": wandb.Video(v, format='gif') for k, v in progress_gifs.items()},
             }, step=iter_num)
         t0 = time.time() # don't count eval time in the next iteration's timing
 
@@ -637,14 +663,19 @@ while True:
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     for micro_step in range(gradient_accumulation_steps):
         with ctx:
-            if masker is None:
+            if masker is None and not (encoder is not None and repa_adapter == 'mta'):
                 loss_fm = denoiser(X, Y) # JiT's own loss
             else:
-                loss_fm = flow_loss(denoiser, X, Y, masker, masker.sample(len(X), mask_ratio, mask_prob, device), mask_weighting)
+                # same loss, but exposing this forward's t / dropped labels (the PixelREPA adapter is conditioned on them)
+                token_mask = masker.sample(len(X), mask_ratio, mask_prob, device) if masker is not None else None
+                loss_fm, t_used, y_used = flow_loss(denoiser, X, Y, masker, token_mask, mask_weighting, return_aux=True)
             loss = loss_fm
             if encoder is not None:
                 target = encoder(X, grid)
-                loss_repa = repa_loss(capture.out, target, projector)
+                if repa_adapter == 'mlp':
+                    loss_repa = repa_loss(capture.out, target, projector)
+                else:
+                    loss_repa = mta_loss(capture.out, target, projector, t_used, y_used)
                 loss = loss + repa_coeff * loss_repa
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately fetch the next batch while the GPU works on the forward pass

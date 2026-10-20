@@ -230,7 +230,7 @@ _NAME_EXCLUDE = {
     'eval_only', 'init_from', 'wandb_log', 'wandb_project', 'wandb_run_name', 'fid_num_images', 'fid_cfg',
     'fid_interval_min', 'fid_interval_max', 'sample_cfg', 'sample_interval_min', 'sample_interval_max',
     'sampling_method', 'num_sampling_steps', 'time_schedule', 'gen_batch_size', 'eval_loss_images',
-    'device', 'dtype', 'compile', 'trend_plots',
+    'device', 'dtype', 'compile', 'trend_plots', 'progress_gif',
 }
 _ARCH_SHORT = {'depth': 'd', 'hidden_size': 'w', 'num_heads': 'h', 'patch_size': 'p', 'bottleneck_dim': 'bn',
                'in_context_len': 'icl', 'in_context_start': 'ics', 'mlp_ratio': 'mlp'}
@@ -245,13 +245,15 @@ _NAME_TOKENS = {
     'blr': 'blr', 'lr_schedule': 'lr-', 'min_lr': 'minlr', 'warmup_epochs': 'warmup', 'weight_decay': 'wd',
     'beta1': 'beta1-', 'beta2': 'beta2-', 'grad_clip': 'clip', 'ema_decay1': 'ema', 'ema_decay2': 'ema2-', 'ema_warmup': 'emawarmup',
     'attn_dropout': 'attndrop', 'proj_dropout': 'projdrop',
-    'repa_encoder': 'repa-', 'repa_depth': 'repadepth', 'repa_coeff': 'repacoeff', 'repa_proj_dim': 'repaproj',
+    'repa_encoder': 'repa-', 'repa_adapter': 'adapter-', 'repa_depth': 'repadepth', 'repa_coeff': 'repacoeff', 'repa_proj_dim': 'repaproj',
+    'repa_mask_ratio': 'repamask', 'repa_adapter_depth': 'adapterdepth',
     'mask_ratio': 'mask', 'mask_prob': 'maskprob', 'mask_weighting': 'maskweight-',
 }
 
 def _fmt_value(v):
     if isinstance(v, str):
         v = os.path.splitext(os.path.basename(v.rstrip('/')))[0] if v.startswith(('file:', '/')) else v
+        v = v[len('timm:'):] if v.startswith('timm:') else v
         return v.replace('/', '-').replace(':', '-').replace('=', '-').replace(' ', '-')
     return f'{v:g}' if isinstance(v, float) else str(v)
 

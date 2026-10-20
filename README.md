@@ -72,7 +72,7 @@ The only local changes make the model device-agnostic (their code hard-coded `.c
 | `prepare_jit_data.py` | center-cropped uint8 memmaps (ImageNet-1k or ImageNet-100, any resolution) |
 | `fid.py` | in-memory FID/IS (numerically the same as JiT's setup), precision/recall, reference stats and features |
 | `diagnostics.py` | data-efficiency diagnostics run at every FID eval (see below) |
-| `repa.py` | frozen alignment targets (DINO, MAE, DINOv2, any DINO-format checkpoint), projector, loss |
+| `repa.py` | frozen alignment targets (DINO, MAE, DINOv2, timm models, any DINO-format checkpoint); REPA's MLP projector and PixelREPA's masked transformer adapter |
 | `masking.py` | MAE-style token masking (`--mask_ratio`), same flow-matching loss, masked patches predicted from context |
 | `config/jit_*.py`, `config/model_*.py` | starting configs for each dataset tier, and model configs to compose with them |
 | `run_repa_targets.sh` | the alignment-target comparison on one tier |
@@ -134,11 +134,24 @@ precision/recall vs CFG, plus the FID-IS trade-off curve. Sweep at 10k images, t
 
 `eval_jit.py --save_samples=png|npz` keeps every generated image in `{out_dir}/samples/`, as a PNG folder (`{index}_class{label}.png`, JiT's own format)
 or an ADM-evaluator `.npz` (`arr_0` images plus `labels`), with a `_classes.json` mapping labels to ImageNet indices and names.
-Training saves fixed-noise 8x8 sample grids, captioned with class names, to `samples/` at every eval.
+Training saves fixed-noise 8x8 sample grids, captioned with class names, to `samples/` at every eval, and rebuilds
+`samples/progress.gif` / `samples/progress_cfg3.gif` (one frame per eval, same seed and classes; also logged to wandb) so you can flip
+through training progress. For an existing run: `python progress_gif.py runs/in100_128/jit-b16/base`.
 
 Noise scale follows JiT's rule `img_size / 256` (`--noise_scale` overrides). The paper always scales patch size with
 resolution (256 tokens), so the 128px tiers with 16px patches are outside what it tested. Calibrate `noise_scale` on the
 `in100_128` baseline before comparing methods there.
+
+## Representation alignment: REPA vs PixelREPA
+
+Plain REPA (`--repa_adapter=mlp`, REPA's MLP projector, weight 0.5) hurts JiT: Shin et al. 2026 report FID 5.14 vs 4.37 for JiT-B/16
+at 200 epochs. `--repa_adapter=mta` is their PixelREPA, ported from github.com/kaist-cvml/PixelREPA and checked to give outputs identical
+to their adapter: a 2-block JiT-style adapter on the JiT tokens after 20% random token masking, aligned to DINOv2 with 1 - cosine at weight 0.1.
+Their encoder setup is DINOv2-B rebuilt by timm at JiT's image and patch size:
+
+```bash
+python train_jit.py config/jit_in100_128.py --repa_encoder=timm:vit_base_patch14_dinov2.lvd142m --repa_adapter=mta
+```
 
 ## Muon
 

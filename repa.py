@@ -1,14 +1,22 @@
 """
-REPA (Yu et al. 2024) for JiT: align an intermediate JiT block's tokens (on the noisy input) with a
-frozen encoder's patch features of the clean image, via an MLP projector and negative cosine similarity.
+Representation alignment for JiT: align an intermediate JiT block's tokens (on the noisy input) with a frozen
+encoder's patch features of the clean image.
+
+Adapters (repa_adapter in train_jit.py):
+    mlp   REPA (Yu et al. 2024): 3-layer SiLU MLP projector per token, negative cosine similarity. Shin et al. 2026
+          ("Representation Alignment for Just Image Transformers is not Easier than You Think") show this hurts JiT
+          (JiT-B/16, 200 epochs: FID 5.14 with REPA vs 4.37 without).
+    mta   PixelREPA (Shin et al. 2026, https://github.com/kaist-cvml/PixelREPA): a Masked Transformer Adapter, i.e.
+          2 JiT blocks with their own time / class conditioning, applied to the JiT tokens after random 20% token
+          masking, trained with 1 - cosine similarity at weight 0.1. The adapter, not the JiT features, absorbs the
+          mapping into the compressed semantic space.
 
 Targets (repa_encoder in train_jit.py):
     dino_vits16, dino_vitb16, mae_vitb16, ...   any name in vit.PRETRAINED (ImageNet-1k only)
-    dinov2_vits14, dinov2_vitb14, ...           torch.hub DINOv2 (LVD-142M)
+    dinov2_vits14, dinov2_vitb14, ...           torch.hub DINOv2 (LVD-142M), input resized so its 14px grid matches JiT's
+    timm:<model>                                a timm model rebuilt at JiT's image and patch size, as PixelREPA does
+                                                (timm:vit_base_patch14_dinov2.lvd142m = DINOv2-B with 16px patches at 256px)
     file:/path/to/ckpt.pth                      any DINO-format ViT checkpoint (e.g. iBOT IN-1k / IN-22k, DeiT)
-
-The encoder input is resized so its patch grid matches JiT's token grid (e.g. 16x16 for 256px JiT/16:
-256px for /16 encoders, 224px for /14 encoders).
 """
 
 import torch
@@ -51,10 +59,17 @@ def load_vit_file(path):
     return model
 
 class FrozenEncoder(nn.Module):
-    def __init__(self, name):
+    def __init__(self, name, img_size=None, patch_size=None):
         super().__init__()
         self.name = name
-        if name.startswith('dinov2_'):
+        if name.startswith('timm:'):
+            # PixelREPA's setup: timm rebuilds the encoder at the JiT image size with the JiT patch size (resampling the
+            # patch embedding and position embedding), so its token grid is JiT's by construction
+            import timm
+            self.model = timm.create_model(name[len('timm:'):], pretrained=True, img_size=img_size, patch_size=patch_size)
+            self.patch_size = patch_size
+            self.kind = 'timm'
+        elif name.startswith('dinov2_'):
             self.model = torch.hub.load('facebookresearch/dinov2', name)
             self.patch_size = 14
             self.kind = 'dinov2'
@@ -78,6 +93,10 @@ class FrozenEncoder(nn.Module):
         """
         x = ((x + 1) / 2 - self.mean) / self.std
         size = grid * self.patch_size
+        if self.kind == 'timm':
+            if x.shape[-1] != size: # PixelREPA resizes bilinearly when the sizes differ
+                x = F.interpolate(x, size=(size, size), mode='bilinear', align_corners=False)
+            return self.model.forward_features(x)[:, self.model.num_prefix_tokens:]
         if x.shape[-1] != size:
             x = F.interpolate(x, size=(size, size), mode='bicubic', align_corners=False)
         if self.kind == 'dinov2':
@@ -97,6 +116,71 @@ class Projector(nn.Module):
 
     def forward(self, x):
         return self.mlp(x)
+
+class MaskedTransformerAdapter(nn.Module):
+    """
+    PixelREPA's Masked Transformer Adapter (following model_pixelREPA.py in their repo): JiT blocks with their own
+    time / class embeddings and in-context class tokens, over the JiT tokens with a random fraction replaced by a mask
+    token, then a projection head to the encoder width (only when the widths differ, as in their code).
+    """
+    def __init__(self, input_size, patch_size, out_dim, hidden_size, num_heads, num_classes,
+                 depth=2, mlp_ratio=4.0, in_context_len=32, mask_ratio=0.2):
+        super().__init__()
+        from model_jit import JiTBlock, TimestepEmbedder, LabelEmbedder
+        from util.model_util import VisionRotaryEmbeddingFast
+        self.hidden_size, self.out_dim, self.in_context_len, self.mask_ratio = hidden_size, out_dim, in_context_len, mask_ratio
+        self.t_embedder = TimestepEmbedder(hidden_size)
+        self.y_embedder = LabelEmbedder(num_classes, hidden_size)
+        half_head_dim = hidden_size // num_heads // 2
+        hw_seq_len = input_size // patch_size
+        self.in_context_posemb = nn.Parameter(torch.zeros(1, in_context_len, hidden_size))
+        nn.init.normal_(self.in_context_posemb, std=.02)
+        self.feat_rope_incontext = VisionRotaryEmbeddingFast(dim=half_head_dim, pt_seq_len=hw_seq_len, num_cls_token=in_context_len)
+        self.blocks = nn.ModuleList([JiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)])
+        self.projection_layer = nn.Sequential( # PixelREPA's ProjectionHead
+            nn.Linear(hidden_size, hidden_size), nn.LayerNorm(hidden_size), nn.SiLU(), nn.Linear(hidden_size, out_dim),
+        )
+        # in their code the mask token lives in the JiT model; it is only ever used on this adapter path
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, hidden_size))
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+        self.apply(_basic_init)
+        nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
+        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+        for block in self.blocks:
+            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+        nn.init.normal_(self.mask_token, std=.02)
+
+    def forward(self, h, t, y):
+        """
+        h: JiT tokens [N, L, hidden] (no in-context tokens); t: [N]; y: [N] (the same dropped labels as the JiT forward).
+        """
+        if self.training and self.mask_ratio > 0:
+            keep = torch.rand(h.shape[0], h.shape[1], 1, device=h.device) > self.mask_ratio # per-token, as in their code
+            h = torch.where(keep, h, self.mask_token.to(h.dtype))
+        t_emb = self.t_embedder(t)
+        y_emb = self.y_embedder(y)
+        c = t_emb + y_emb
+        x = torch.cat([y_emb.unsqueeze(1).repeat(1, self.in_context_len, 1) + self.in_context_posemb, h], dim=1)
+        for block in self.blocks:
+            x = block(x, c, self.feat_rope_incontext)
+        x = x[:, self.in_context_len:]
+        if self.hidden_size != self.out_dim:
+            x = self.projection_layer(x)
+        return x
+
+def mta_loss(hidden, target, adapter, t, y):
+    # PixelREPA: 1 - cosine similarity between adapter outputs and the encoder's patch features, averaged over tokens
+    pred = F.normalize(adapter(hidden, t, y).float(), dim=-1)
+    return (1 - (pred * F.normalize(target.float(), dim=-1)).sum(-1)).mean()
 
 def repa_loss(hidden, target, projector):
     # mean negative cosine similarity over tokens and batch

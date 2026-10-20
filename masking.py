@@ -57,10 +57,12 @@ class TokenMasker(nn.Module):
         m = mask.view(-1, 1, g, g).float()
         return m.repeat_interleave(self.patch_size, dim=2).repeat_interleave(self.patch_size, dim=3)
 
-def flow_loss(denoiser, x, labels, masker=None, mask=None, weighting='effective_t'):
+def flow_loss(denoiser, x, labels, masker=None, mask=None, weighting='effective_t', return_aux=False):
     """
     JiT's training loss (Denoiser.forward: label dropout, logit-normal t, x-prediction, v-loss), with optional token
     masking. With mask=None this is numerically the same computation as denoiser(x, labels).
+    return_aux: also return the t (flattened) and the (possibly dropped) labels this forward used, for auxiliary heads
+    that need the same conditioning (PixelREPA's adapter).
     """
     labels = denoiser.drop_labels(labels) if denoiser.training else labels
     t = denoiser.sample_t(x.size(0), device=x.device).view(-1, *([1] * (x.ndim - 1)))
@@ -76,4 +78,6 @@ def flow_loss(denoiser, x, labels, masker=None, mask=None, weighting='effective_
     if mask is not None and weighting == 'effective_t':
         pm = masker.pixel_mask(mask)
         err = err * (1 - pm) + (x - x_pred) ** 2 * pm # masked patches weighted as t=0
+    if return_aux:
+        return err.mean(), t.flatten(), labels
     return err.mean()
