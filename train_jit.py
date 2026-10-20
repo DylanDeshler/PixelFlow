@@ -192,6 +192,8 @@ if not compile:
     torch._dynamo.config.disable = True
 torch._dynamo.config.cache_size_limit = 128
 os.makedirs(out_dir, exist_ok=True)
+samples_dir = os.path.join(out_dir, 'samples') # every generated sample grid
+os.makedirs(samples_dir, exist_ok=True)
 torch.manual_seed(1337)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
@@ -527,7 +529,7 @@ def evaluate(step):
 @torch.no_grad()
 def save_samples(step):
     # one sample for each of 64 evenly spaced classes, fixed noise so grids are comparable over training and across CFG scales:
-    # samples_{step}.png at fid_cfg, samples_{step}_cfg{g}.png at sample_cfg
+    # {out_dir}/samples/samples_{step}.png at fid_cfg, samples/samples_{step}_cfg{g}.png at sample_cfg
     labels = torch.linspace(0, num_classes - 1, 64).long().to(device)
     settings = [(fid_cfg, (fid_interval_min, fid_interval_max), '')]
     if sample_cfg > 0:
@@ -542,7 +544,7 @@ def save_samples(step):
                 torch.manual_seed(0)
                 with ctx:
                     x = denoiser.generate(labels)
-            save_labeled_grid(x, names, os.path.join(out_dir, f'samples_{step}{suffix}.png'))
+            save_labeled_grid(x, names, os.path.join(samples_dir, f'samples_{step}{suffix}.png'))
         denoiser.train()
 
 def save_checkpoint():

@@ -11,7 +11,7 @@ trade-off pick (highest IS among scales within --fid_tolerance of the best FID),
 plots FID, IS, precision/recall vs CFG and the FID-IS trade-off curve. Sweep cheaply, then re-score the picks:
 $ python eval_jit.py --ckpt=... --data_dir=/data/in100_128 --cfgs=1.0:4.0:0.25 --num_images=10000 --final_num_images=50000
 
---save_samples keeps every generated image, one output per cfg, in a standard format:
+--save_samples keeps every generated image, one output per cfg, in {out_dir}/samples/ in a standard format:
     png   folder of PNGs named {index}_class{label}.png, as JiT's evaluation writes (works with their torch-fidelity CLI)
     npz   uint8 'arr_0' [N, H, W, 3] (OpenAI's ADM evaluator format) plus int 'labels' [N]
 and a {name}_classes.json mapping label -> ImageNet-1k index and class name.
@@ -146,6 +146,8 @@ assert ckpt and data_dir, 'pass --ckpt and --data_dir'
 if not compile:
     torch._dynamo.config.disable = True
 out_dir = out_dir or os.path.dirname(os.path.abspath(ckpt))
+samples_dir = os.path.join(out_dir, 'samples') # sample grid and --save_samples outputs
+os.makedirs(samples_dir, exist_ok=True)
 torch.backends.cuda.matmul.allow_tf32 = True # same matmul precision as training (and silences torch.compile's TF32 warning)
 torch.backends.cudnn.allow_tf32 = True
 device_type = 'cuda' if 'cuda' in device else 'cpu'
@@ -238,7 +240,7 @@ def evaluate_cfg(cfg, n, real, save=True):
     if save and save_samples:
         assert save_samples in ('png', 'npz'), "save_samples must be '', 'png' or 'npz'"
         name = f"samples_{n / 1000:g}k_{sampling_method}{num_sampling_steps}{'' if time_schedule == 'uniform' else '_' + time_schedule}_cfg{cfg}_interval{interval_min}-{interval_max}"
-        writer = SampleWriter(os.path.join(out_dir, name + ('.npz' if save_samples == 'npz' else '')), save_samples, n, data.img_size)
+        writer = SampleWriter(os.path.join(samples_dir, name + ('.npz' if save_samples == 'npz' else '')), save_samples, n, data.img_size)
     out = generate_and_score(
         denoiser, metrics, ref_stats, n, data.num_classes, device, ctx,
         cfg=cfg, interval=(interval_min, interval_max), steps=num_sampling_steps,
@@ -292,7 +294,7 @@ torch.manual_seed(seed)
 with torch.no_grad(), ctx:
     x = denoiser.generate(labels)
 tag = f"{num_images / 1000:g}k_{sampling_method}{num_sampling_steps}" + ('' if time_schedule == 'uniform' else f'_{time_schedule}')
-save_labeled_grid(x, [class_names[i] for i in labels.tolist()], os.path.join(out_dir, f'eval_samples_{tag}.png'))
+save_labeled_grid(x, [class_names[i] for i in labels.tolist()], os.path.join(samples_dir, f'eval_samples_{tag}.png'))
 with open(os.path.join(out_dir, f'eval_{tag}.json'), 'w') as f:
     json.dump(results, f, indent=2)
 print(f"results written to {os.path.join(out_dir, f'eval_{tag}.json')}")

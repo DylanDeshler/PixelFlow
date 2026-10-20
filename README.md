@@ -132,9 +132,9 @@ python eval_jit.py --ckpt=runs/in100_128/jit-b16/base/ckpt.pt --data_dir=/data/i
 with FID within `--fid_tolerance`, default 5%, of the best) and the FID/IS Pareto frontier, and saves `cfg_sweep_*.png`: FID, IS and
 precision/recall vs CFG, plus the FID-IS trade-off curve. Sweep at 10k images, then re-score the picks with `--final_num_images=50000`.
 
-`eval_jit.py --save_samples=png|npz` keeps every generated image, as a PNG folder (`{index}_class{label}.png`, JiT's own format)
+`eval_jit.py --save_samples=png|npz` keeps every generated image in `{out_dir}/samples/`, as a PNG folder (`{index}_class{label}.png`, JiT's own format)
 or an ADM-evaluator `.npz` (`arr_0` images plus `labels`), with a `_classes.json` mapping labels to ImageNet indices and names.
-Training saves a fixed-noise 8x8 sample grid, captioned with class names, at every eval.
+Training saves fixed-noise 8x8 sample grids, captioned with class names, to `samples/` at every eval.
 
 Noise scale follows JiT's rule `img_size / 256` (`--noise_scale` overrides). The paper always scales patch size with
 resolution (256 tokens), so the 128px tiers with 16px patches are outside what it tested. Calibrate `noise_scale` on the
@@ -171,8 +171,8 @@ locality diagnostics (window ablation, attention distance at high noise) should 
    evaluation flags (50k images, their CFG scale/interval). It should land near the paper's 3.66.
 
 Each eval also reports the training objective on fixed train and held-out subsets (`eval/train_loss`, `eval/val_loss`, same noise
-every eval), a single FID-10k of the EMA weights at CFG 1, and sample grids at CFG 1 and CFG 3 (`samples_{iter}.png`,
-`samples_{iter}_cfg3.png`; the CFG-3 grid is one 64-image batch, no FID; `--sample_cfg`, 0 disables). Use `eval_jit.py` for guided
+every eval), a single FID-10k of the EMA weights at CFG 1, and sample grids at CFG 1 and CFG 3 (`samples/samples_{iter}.png`,
+`samples/samples_{iter}_cfg3.png`; the CFG-3 grid is one 64-image batch, no FID; `--sample_cfg`, 0 disables). Use `eval_jit.py` for guided
 FIDs and CFG sweeps. With diagnostics on, `diagnostics/probes_{iter}.png` shows k-NN and linear probe
 accuracy as block x noise-level matrices.
 
