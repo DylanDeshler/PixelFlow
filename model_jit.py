@@ -229,6 +229,28 @@ class JiTBlock(nn.Module):
         return res.mix(2 * index + 2)
 
 
+class _DepthMix(torch.autograd.Function):
+    """
+    h = sum_i alpha_i v_i over S sources, accumulated in place (one read of each source, no stacked copy), saving only
+    alpha and references to the sources, which autograd keeps anyway. alpha: [S, B, T]; sources: S tensors [B, T, D].
+    """
+    @staticmethod
+    def forward(ctx, alpha, *sources):
+        ctx.save_for_backward(alpha, *sources)
+        a = alpha.unsqueeze(-1).to(sources[0].dtype)
+        h = sources[0] * a[0]
+        for i in range(1, len(sources)):
+            h.addcmul_(sources[i], a[i])
+        return h
+
+    @staticmethod
+    def backward(ctx, grad):
+        alpha, *sources = ctx.saved_tensors
+        grad_alpha = torch.stack([torch.linalg.vecdot(v, grad.to(v.dtype)) for v in sources]).to(alpha.dtype) # [S, B, T]
+        a = alpha.unsqueeze(-1).to(grad.dtype)
+        return (grad_alpha, *(grad * a[i] for i in range(len(sources))))
+
+
 class AttnResState:
     """
     Attention Residuals (Kimi Team 2026, arXiv 2603.15031): instead of the fixed sum h_l = h_1 + sum_i f_i(h_i), the
@@ -242,40 +264,53 @@ class AttnResState:
     The final layer reads a mix with its own query. In JiT the sublayer outputs are the adaLN-gated branch outputs.
     In-context class tokens: when they are prepended, the embedding source gets the class tokens at those positions
     and earlier sources get zeros (those positions had no earlier outputs), matching what the plain residual stream holds.
+
+    Efficiency: w_l . RMSNorm(v) = (v . (g_l * w_l)) / rms(v). The queries are parameters, so when a source is created its
+    logits for every sublayer are one matmul against all the (g_l * w_l) at once, and a mix only gathers them (as the
+    paper's two-phase computation does); the weighted sum is accumulated in place (_DepthMix). Nothing [S, B, T, D]-sized
+    is saved for backward.
     """
     def __init__(self, net, emb):
         self.queries, self.norms = net.attn_res_queries, net.attn_res_norms
+        self.eps = self.norms[0].variance_epsilon
         self.group = 1 if net.attn_res == 'full' else 2 * net.attn_res_block_size # sublayers per source
-        self.sources = [emb]
+        self.keys = torch.stack([n.weight * q for n, q in zip(self.norms, self.queries)]) # [2 * depth + 1, D]
+        self.sources, self.logits = [], [] # completed sources and their logits for every sublayer [B, T, 2 * depth + 1]
         self.partial = None
         self.count = 0
+        self._append(emb)
+
+    def _logits(self, v, keys):
+        # v: [B, T, D] -> w . RMSNorm(v) for each row of keys, fp32 [B, T, K]
+        ms = torch.linalg.vecdot(v, v).unsqueeze(-1).float() / v.shape[-1] # mean square, [B, T, 1]
+        return (v @ keys.t().to(v.dtype)).float() * torch.rsqrt(ms + self.eps)
+
+    def _append(self, v):
+        self.sources.append(v)
+        self.logits.append(self._logits(v, self.keys))
 
     def add(self, out):
         self.partial = out if self.partial is None else self.partial + out
         self.count += 1
         if self.count == self.group:
-            self.sources.append(self.partial)
+            self._append(self.partial)
             self.partial, self.count = None, 0
 
     def mix(self, l):
-        sources = self.sources + ([self.partial] if self.partial is not None else [])
+        sources, logits = self.sources, [c[..., l] for c in self.logits]
+        if self.partial is not None:
+            sources = sources + [self.partial]
+            logits.append(self._logits(self.partial, self.keys[l:l + 1])[..., 0])
         if len(sources) == 1: # the first sublayer only sees the embedding (so its query never trains)
             return sources[0]
-        # w . RMSNorm(v) = (v . (g * w)) / rms(v), computed per source as two per-token reductions, so no normalized
-        # (or stacked) copy of the sources is built: autograd only keeps references to the sublayer outputs themselves
-        # plus [B, T] scalars, instead of several [S, B, T, D] tensors per sublayer (quadratic in depth for full)
-        norm = self.norms[l]
-        u = norm.weight * self.queries[l]
-        logits = torch.stack([(v * u.to(v.dtype)).sum(-1, dtype=torch.float32)
-                              * torch.rsqrt((v * v).sum(-1, dtype=torch.float32) / v.shape[-1] + norm.variance_epsilon)
-                              for v in sources]) # [S, B, T]
-        alpha = logits.softmax(0)
-        return sum(alpha[i].unsqueeze(-1).to(v.dtype) * v for i, v in enumerate(sources))
+        return _DepthMix.apply(torch.stack(logits).softmax(0), *sources)
 
     def prepend(self, prefix):
         # in-context tokens: the embedding source gets them, every other source zeros at those positions
         zeros = torch.zeros_like(prefix)
-        self.sources = [torch.cat([prefix if i == 0 else zeros, v], dim=1) for i, v in enumerate(self.sources)]
+        sources, self.sources, self.logits = self.sources, [], []
+        for i, v in enumerate(sources):
+            self._append(torch.cat([prefix if i == 0 else zeros, v], dim=1))
         if self.partial is not None:
             self.partial = torch.cat([zeros, self.partial], dim=1)
 
