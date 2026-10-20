@@ -3,5 +3,6 @@ dataset = 'in100_256'
 batch_size = 256
 gradient_accumulation_steps = 1
 epochs = 400
-eval_every_epochs = 40
+eval_every_epochs = 10
 fid_num_images = 10000
+in_context_len = 0
