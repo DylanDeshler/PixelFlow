@@ -22,7 +22,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from model_jit import modulate
+from model_jit import modulate, AttnResState
 from evaluation import knn_classifier
 
 
@@ -88,11 +88,17 @@ def _attention(attn, x, rope, n_prefix, g, mask=None):
     out = attn.proj((w @ v).transpose(1, 2).reshape(B, N, C)) # same casting as JiT: fp32 weights @ v under the caller's autocast
     return out, stats
 
-def _block(block, x, c, rope, n_prefix, g, mask=None):
+def _block(block, x, c, rope, n_prefix, g, mask=None, res=None, index=None):
+    # res: AttnResState for attention-residual models (x is then the depth-mixed attention input, see JiTBlock.forward_attn_res)
     shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = block.adaLN_modulation(c).chunk(6, dim=-1)
     attn_out, stats = _attention(block.attn, modulate(block.norm1(x), shift_msa, scale_msa), rope, n_prefix, g, mask)
-    x = x + gate_msa.unsqueeze(1) * attn_out
-    x = x + gate_mlp.unsqueeze(1) * block.mlp(modulate(block.norm2(x), shift_mlp, scale_mlp))
+    if res is None:
+        x = x + gate_msa.unsqueeze(1) * attn_out
+        x = x + gate_mlp.unsqueeze(1) * block.mlp(modulate(block.norm2(x), shift_mlp, scale_mlp))
+    else:
+        res.add(gate_msa.unsqueeze(1) * attn_out)
+        res.add(gate_mlp.unsqueeze(1) * block.mlp(modulate(block.norm2(res.mix(2 * index + 1)), shift_mlp, scale_mlp)))
+        x = res.mix(2 * index + 2)
     stats['gate_msa'], stats['gate_mlp'] = gate_msa.abs().mean(), gate_mlp.abs().mean()
     return x, stats
 
@@ -113,13 +119,18 @@ def instrumented_forward(net, x, t, y, capture_blocks=(), tile=None):
     h = net.x_embedder(x) + net.pos_embed
     stats = {k: [] for k in ('attn_entropy', 'attn_dist', 'attn_prefix_mass', 'gate_msa', 'gate_mlp')}
     feats = {}
+    res = AttnResState(net, h) if getattr(net, 'attn_res', 'none') != 'none' else None
     for i, block in enumerate(net.blocks):
         if net.in_context_len > 0 and i == net.in_context_start:
             ic = y_emb.unsqueeze(1).repeat(1, net.in_context_len, 1) + net.in_context_posemb
-            h = torch.cat([ic, h], dim=1)
+            if res is None:
+                h = torch.cat([ic, h], dim=1)
+            else:
+                res.prepend(ic)
+                h = res.mix(2 * i)
         n_prefix = net.in_context_len if (net.in_context_len > 0 and i >= net.in_context_start) else 0
         rope = net.feat_rope if i < net.in_context_start else net.feat_rope_incontext
-        h, block_stats = _block(block, h, c, rope, n_prefix, g, masks.get(n_prefix))
+        h, block_stats = _block(block, h, c, rope, n_prefix, g, masks.get(n_prefix), res, i)
         for k, v in block_stats.items():
             stats[k].append(v)
         if (i + 1) in capture_blocks:
@@ -198,11 +209,12 @@ def noise_level_pass(net, x, y, ts, noise_scale, t_eps, ctx, masks, seed=0, chun
 # 5. representation probes
 
 @torch.no_grad()
-def probe_features(net, images, ts, blocks, null_label, ctx, device, seed=0, chunk=256):
+def probe_features(net, images, ts, blocks, null_label, ctx, device, noise_scale=1.0, seed=0, chunk=256):
     """
     Mean-pooled patch tokens after each block in `blocks`, for each noise level in ts.
     images: uint8 numpy [N, R, R, 3] (kept on CPU, moved to the GPU chunk by chunk).
     Uses the null (unconditional) label: with the true label the class would leak in through adaLN / in-context tokens.
+    noise_scale: the model's training noise scale, so z = t x + (1 - t) noise_scale e matches what it was trained on.
     Returns {(block, t): [N, D] float32}.
     """
     from data_jit import to_model_input
@@ -211,7 +223,7 @@ def probe_features(net, images, ts, blocks, null_label, ctx, device, seed=0, chu
         g = torch.Generator(device=device).manual_seed(seed) # same noise for every t
         for i in range(0, len(images), chunk):
             xb = to_model_input(images[i:i + chunk], flip=False, device=device)
-            eb = torch.randn(xb.shape, generator=g, device=device)
+            eb = torch.randn(xb.shape, generator=g, device=device) * noise_scale
             t = torch.full((len(xb),), t_val, device=device)
             tt = t.view(-1, 1, 1, 1)
             z = tt * xb + (1 - tt) * eb

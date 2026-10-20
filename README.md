@@ -6,7 +6,7 @@ Single-GPU ImageNet-1k pretraining + frozen-feature evaluation for trying out Vi
 | --- | --- |
 | `vit.py` | baseline ViT (key-compatible with official DINO weights), DINO head, multi-crop wrapper, DINO loss. Defines the encoder interface new models must implement. |
 | `train_dino.py` | DINO pretraining. Defaults = official ViT-S/16 100 epoch recipe (effective batch 512). Logs k-NN accuracy every ~10 epochs. |
-| `eval_linear.py` | final eval of a checkpoint: full 20-NN + DINOv2-style linear probe sweep (52 heads, one backbone pass). |
+| `eval_linear.py` | final eval of a checkpoint (DINO, official weights, or a JiT `train_jit.py` checkpoint): full 20-NN + DINOv2-style linear probe sweep (52 heads, one backbone pass). |
 | `data.py` / `evaluation.py` | ImageNet loading, DINO augmentations, eval transforms, feature extraction, k-NN classifier. |
 | `prepare_imagenet.py` | downloads ImageNet from Hugging Face (or uses the official tarballs) and writes the ImageFolder layout. |
 | `configurator.py` | nanoGPT-style `--key=value` overrides of the config globals. |
@@ -166,6 +166,21 @@ rest (patch / time / class embeddings, output layer, gains, biases, REPA project
   and the 6 adaLN projections (as modded-nanogpt does for q / k / v).
 - `--muon_adaln=False` moves the zero-initialized adaLN projections to AdamW, for the ablation.
 
+## Attention Residuals
+
+`--attn_res=block` (or `full`) replaces JiT's residual stream with Attention Residuals (Kimi Team 2026, arXiv 2603.15031,
+`AttnResState` in `model_jit.py`). Each sublayer (every attention and every MLP) gets its input as a softmax mix over
+earlier outputs, alpha = softmax(w_l . RMSNorm(v_i)), instead of the plain sum. There is one zero-initialized pseudo-query
+per sublayer, plus one for the final layer, so mixing starts uniform. The sources are:
+- `full`: the patch embedding and every gated sublayer output.
+- `block`: the embedding, the summed outputs of each completed block of `--attn_res_block_size` JiT blocks (default about
+  8 blocks, the paper's setting), and the running partial sum of the current block.
+
+The paper reports about 1.25x compute efficiency for Block AttnRes on LLMs. This is the first test on a pixel-space
+denoiser. In-context class tokens are added to the embedding source, and the other sources are zero at those positions.
+The architecture is stored in the checkpoint, so `eval_jit.py` and `eval_linear.py` rebuild it. Block hooks (REPA,
+probes) see each block's output as the input the next block actually receives.
+
 ## Token masking
 
 `--mask_ratio=0.5` replaces half the patch tokens of a masked sample with a learned mask token (after the patch embedding, so
@@ -188,6 +203,16 @@ every eval), a single FID-10k of the EMA weights at CFG 1, and sample grids at C
 `samples/samples_{iter}_cfg3.png`; the CFG-3 grid is one 64-image batch, no FID; `--sample_cfg`, 0 disables). Use `eval_jit.py` for guided
 FIDs and CFG sweeps. With diagnostics on, `diagnostics/probes_{iter}.png` shows k-NN and linear probe
 accuracy as block x noise-level matrices.
+
+The mid-training probes are kept cheap: 10k train / 5k val images and one AdamW run per cell, with no lr sweep. For an
+accurate number, run `eval_linear.py` on the checkpoint. It uses the full train/val split the run trained on (found from
+its `config.json`), the DINOv2 head sweep (13 lrs x {each probe block, all blocks}, 12,500 iters), and k-NN per block.
+It reads the same features: mean-pooled tokens, null label, input noised to `--jit_t`. Pick t from the probe heatmap;
+results land in `{run}/eval/results_t{t}.json`.
+```bash
+python eval_linear.py --ckpt=runs/in100_128/jit-b16_icl0/muon/ckpt.pt --jit_t=1.0
+python eval_linear.py --ckpt=runs/in100_128/jit-b16_icl0/muon/ckpt.pt --jit_t=0.75 --jit_blocks=4,6,8 --knn=False
+```
 
 Training-time FIDs use no CFG, 10k samples and a fixed seed, so the same noise and labels are used at every eval and across runs.
 They're for comparing runs with each other. Paper-comparable numbers need `eval_jit.py` with 50k samples and CFG.

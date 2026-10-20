@@ -1,5 +1,6 @@
 # Vendored from https://github.com/LTH14/JiT (commit cbc743a, MIT license, see LICENSE_JiT).
-# Local change: attn_bias is created on query.device instead of via .cuda(), so the model runs on any device.
+# Local changes: attn_bias is created on query.device instead of via .cuda(), so the model runs on any device;
+# optional Attention Residuals (attn_res, see AttnResState), off by default, in which case the model is unchanged.
 # --------------------------------------------------------
 # References:
 # SiT: https://github.com/willisma/SiT
@@ -196,12 +197,80 @@ class JiTBlock(nn.Module):
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
 
+    def forward(self, x, c, feat_rope=None, res=None, index=None):
+        if res is None:
+            return self.forward_residual(x, c, feat_rope)
+        return self.forward_attn_res(x, c, feat_rope, res, index)
+
     @torch.compile
-    def forward(self, x,  c, feat_rope=None):
+    def forward_residual(self, x,  c, feat_rope=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)
         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), rope=feat_rope)
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
+
+    @torch.compile
+    def attn_branch(self, x, c, feat_rope=None):
+        shift_msa, scale_msa, gate_msa = self.adaLN_modulation(c).chunk(6, dim=-1)[:3]
+        return gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), rope=feat_rope)
+
+    @torch.compile
+    def mlp_branch(self, x, c):
+        shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)[3:]
+        return gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+
+    def forward_attn_res(self, x, c, feat_rope, res, index):
+        """
+        x: this block's attention input (already depth-mixed). Returns the next block's attention input (the final
+        layer's input for the last block), so forward hooks see the representation the network actually passes on.
+        """
+        res.add(self.attn_branch(x, c, feat_rope))
+        res.add(self.mlp_branch(res.mix(2 * index + 1), c))
+        return res.mix(2 * index + 2)
+
+
+class AttnResState:
+    """
+    Attention Residuals (Kimi Team 2026, arXiv 2603.15031): instead of the fixed sum h_l = h_1 + sum_i f_i(h_i), the
+    input of every sublayer l (each attention and each MLP counts as one) is a softmax mix over depth,
+        h_l = sum_i alpha_{i->l} v_i,  alpha_{i->l} = softmax_i(w_l . RMSNorm(v_i)),
+    with one learned pseudo-query w_l per sublayer, initialized to zero (uniform mixing at the start of training).
+    Sources v_i: the patch embedding, then
+        full    every sublayer output
+        block   (Block AttnRes) the sum of the sublayer outputs of each completed block of block_size JiT blocks, plus
+                the running partial sum of the current block
+    The final layer reads a mix with its own query. In JiT the sublayer outputs are the adaLN-gated branch outputs.
+    In-context class tokens: when they are prepended, the embedding source gets the class tokens at those positions
+    and earlier sources get zeros (those positions had no earlier outputs), matching what the plain residual stream holds.
+    """
+    def __init__(self, net, emb):
+        self.queries, self.norms = net.attn_res_queries, net.attn_res_norms
+        self.group = 1 if net.attn_res == 'full' else 2 * net.attn_res_block_size # sublayers per source
+        self.sources = [emb]
+        self.partial = None
+        self.count = 0
+
+    def add(self, out):
+        self.partial = out if self.partial is None else self.partial + out
+        self.count += 1
+        if self.count == self.group:
+            self.sources.append(self.partial)
+            self.partial, self.count = None, 0
+
+    def mix(self, l):
+        sources = self.sources + ([self.partial] if self.partial is not None else [])
+        if len(sources) == 1: # the first sublayer only sees the embedding (so its query never trains)
+            return sources[0]
+        v = torch.stack(sources) # [S, B, T, D]
+        logits = (self.norms[l](v).float() * self.queries[l].float()).sum(-1) # [S, B, T]
+        return (logits.softmax(0).unsqueeze(-1).to(v.dtype) * v).sum(0)
+
+    def prepend(self, prefix):
+        # in-context tokens: the embedding source gets them, every other source zeros at those positions
+        zeros = torch.zeros_like(prefix)
+        self.sources = [torch.cat([prefix if i == 0 else zeros, v], dim=1) for i, v in enumerate(self.sources)]
+        if self.partial is not None:
+            self.partial = torch.cat([zeros, self.partial], dim=1)
 
 
 class JiT(nn.Module):
@@ -222,7 +291,9 @@ class JiT(nn.Module):
         num_classes=1000,
         bottleneck_dim=128,
         in_context_len=32,
-        in_context_start=8
+        in_context_start=8,
+        attn_res='none',
+        attn_res_block_size=0
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -234,6 +305,10 @@ class JiT(nn.Module):
         self.in_context_len = in_context_len
         self.in_context_start = in_context_start
         self.num_classes = num_classes
+        assert attn_res in ('none', 'full', 'block'), f'attn_res must be none, full or block, got {attn_res}'
+        self.attn_res = attn_res
+        # JiT blocks per Block AttnRes block; 0 -> about 8 blocks, the paper's default
+        self.attn_res_block_size = attn_res_block_size or max(1, round(depth / 8))
 
         # time and class embed
         self.t_embedder = TimestepEmbedder(hidden_size)
@@ -275,6 +350,11 @@ class JiT(nn.Module):
 
         # linear predict
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
+
+        # attention residuals: a zero-initialized pseudo-query and a key RMSNorm per sublayer (2 per block) and the final layer
+        if self.attn_res != 'none':
+            self.attn_res_queries = nn.ParameterList([nn.Parameter(torch.zeros(hidden_size)) for _ in range(2 * depth + 1)])
+            self.attn_res_norms = nn.ModuleList([RMSNorm(hidden_size) for _ in range(2 * depth + 1)])
 
         self.initialize_weights()
 
@@ -345,13 +425,18 @@ class JiT(nn.Module):
         x = self.x_embedder(x)
         x += self.pos_embed
 
+        res = AttnResState(self, x) if self.attn_res != 'none' else None
         for i, block in enumerate(self.blocks):
             # in-context
             if self.in_context_len > 0 and i == self.in_context_start:
                 in_context_tokens = y_emb.unsqueeze(1).repeat(1, self.in_context_len, 1)
                 in_context_tokens += self.in_context_posemb
-                x = torch.cat([in_context_tokens, x], dim=1)
-            x = block(x, c, self.feat_rope if i < self.in_context_start else self.feat_rope_incontext)
+                if res is None:
+                    x = torch.cat([in_context_tokens, x], dim=1)
+                else:
+                    res.prepend(in_context_tokens)
+                    x = res.mix(2 * i)
+            x = block(x, c, self.feat_rope if i < self.in_context_start else self.feat_rope_incontext, res=res, index=i)
 
         x = x[:, self.in_context_len:]
 

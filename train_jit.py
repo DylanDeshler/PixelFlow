@@ -69,6 +69,8 @@ bottleneck_dim = -1 # width of the low-rank patch embedding
 in_context_len = -1 # number of in-context class tokens (0 disables them)
 in_context_start = -1 # block where the in-context tokens are prepended
 mlp_ratio = -1.0
+attn_res = 'none' # 'full' | 'block': Attention Residuals (arXiv 2603.15031), softmax mixing over depth instead of the plain residual sum
+attn_res_block_size = 0 # block only: JiT blocks per AttnRes block; 0 -> about 8 blocks (the paper's default)
 attn_dropout = 0.0
 proj_dropout = 0.0
 # flow matching
@@ -188,7 +190,9 @@ def check_prepared(data_dir, diag):
 check_prepared(data_dir, diag)
 model_name, arch = resolve_arch(model, **{k: (None if v < 0 else v) for k, v in dict(
     depth=depth, hidden_size=hidden_size, num_heads=num_heads, patch_size=patch_size, bottleneck_dim=bottleneck_dim,
-    in_context_len=in_context_len, in_context_start=in_context_start, mlp_ratio=mlp_ratio).items()})
+    in_context_len=in_context_len, in_context_start=in_context_start, mlp_ratio=mlp_ratio).items()},
+    attn_res=None if attn_res == 'none' else attn_res,
+    attn_res_block_size=attn_res_block_size if (attn_res == 'block' and attn_res_block_size > 0) else None)
 if not out_dir:
     out_dir = run_dir(runs_root, dataset, model, arch, config, _defaults, run_name)
     legacy = legacy_run_dir(runs_root, dataset, model, arch, config, _defaults, run_name)
@@ -470,8 +474,8 @@ def evaluate(step):
         if diag:
             # 5. probes on the EMA weights (the model that is sampled from)
             denoiser.eval()
-            tr = diag_lib.probe_features(denoiser.net, probe_train_x, probe_ts, probe_blocks, num_classes, ctx, device)
-            va = diag_lib.probe_features(denoiser.net, probe_val_x, probe_ts, probe_blocks, num_classes, ctx, device)
+            tr = diag_lib.probe_features(denoiser.net, probe_train_x, probe_ts, probe_blocks, num_classes, ctx, device, noise_scale)
+            va = diag_lib.probe_features(denoiser.net, probe_val_x, probe_ts, probe_blocks, num_classes, ctx, device, noise_scale)
             denoiser.train()
             probes = diag_lib.run_probes(tr, probe_train_y, va, probe_val_y, num_classes)
     log['val/fid'], log['val/is'] = out['fid'], out['is']
