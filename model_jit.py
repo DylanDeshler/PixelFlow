@@ -261,9 +261,16 @@ class AttnResState:
         sources = self.sources + ([self.partial] if self.partial is not None else [])
         if len(sources) == 1: # the first sublayer only sees the embedding (so its query never trains)
             return sources[0]
-        v = torch.stack(sources) # [S, B, T, D]
-        logits = (self.norms[l](v).float() * self.queries[l].float()).sum(-1) # [S, B, T]
-        return (logits.softmax(0).unsqueeze(-1).to(v.dtype) * v).sum(0)
+        # w . RMSNorm(v) = (v . (g * w)) / rms(v), computed per source as two per-token reductions, so no normalized
+        # (or stacked) copy of the sources is built: autograd only keeps references to the sublayer outputs themselves
+        # plus [B, T] scalars, instead of several [S, B, T, D] tensors per sublayer (quadratic in depth for full)
+        norm = self.norms[l]
+        u = norm.weight * self.queries[l]
+        logits = torch.stack([(v * u.to(v.dtype)).sum(-1, dtype=torch.float32)
+                              * torch.rsqrt((v * v).sum(-1, dtype=torch.float32) / v.shape[-1] + norm.variance_epsilon)
+                              for v in sources]) # [S, B, T]
+        alpha = logits.softmax(0)
+        return sum(alpha[i].unsqueeze(-1).to(v.dtype) * v for i, v in enumerate(sources))
 
     def prepend(self, prefix):
         # in-context tokens: the embedding source gets them, every other source zeros at those positions
