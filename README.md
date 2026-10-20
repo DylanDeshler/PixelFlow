@@ -73,8 +73,36 @@ The only local changes make the model device-agnostic (their code hard-coded `.c
 | `fid.py` | in-memory FID/IS (numerically the same as JiT's setup), precision/recall, reference stats and features |
 | `diagnostics.py` | data-efficiency diagnostics run at every FID eval (see below) |
 | `repa.py` | frozen alignment targets (DINO, MAE, DINOv2, any DINO-format checkpoint), projector, loss |
-| `config/jit_*.py` | starting configs for each dataset tier |
+| `masking.py` | MAE-style token masking (`--mask_ratio`), same flow-matching loss, masked patches predicted from context |
+| `config/jit_*.py`, `config/model_*.py` | starting configs for each dataset tier, and model configs to compose with them |
 | `run_repa_targets.sh` | the alignment-target comparison on one tier |
+
+## Configuration
+
+Every setting is a global in the config block at the top of `train_jit.py`. Set them from config files (applied left to right)
+and/or `--key=value` (applied last), without editing the script. Keys and types are checked, so typos and wrong types are errors.
+Paths are derived, not configured per run:
+
+- data: `{data_root}/{dataset}`. `data_root` defaults to `$JIT_DATA_ROOT` or `/data/jit`; tier configs only set `dataset`.
+- run directory: `{runs_root}/{dataset}/{model}/{changes}`. `{model}` is the preset plus changed architecture fields
+  (`jit-b16_d6_w384_h6`); `{changes}` lists every setting that differs from the script defaults and affects training
+  (`noise_scale=0.5_repa_encoder=dino_vitb16`, or `base`). Budget, eval, logging, diagnostics and system settings are left out, so
+  the same command with `--init_from=resume` (and e.g. more `--epochs`) continues the same run. Add `--run_name=seed2` for repeats.
+  `--out_dir` / `--data_dir` still override the derived paths.
+
+```bash
+export JIT_DATA_ROOT=/data/jit
+python train_jit.py config/jit_in100_128.py                                   # runs/in100_128/jit-b16/base
+python train_jit.py config/jit_in100_128.py config/model_jit_s16.py           # runs/in100_128/jit-b16_w384_h6/base
+python train_jit.py config/jit_in100_128.py --model=JiT-L/16 --depth=16 --batch_size=128   # runs/in100_128/jit-l16_d16/base
+python train_jit.py config/jit_in100_128.py --noise_scale=0.75                # runs/in100_128/jit-b16/noise_scale=0.75
+```
+
+The model is a JiT preset (`--model=JiT-B/16`, `JiT-L/16`, ...) with any architecture field overridden: `depth`, `hidden_size`,
+`num_heads`, `patch_size`, `bottleneck_dim`, `in_context_len` (0 disables the in-context class tokens), `in_context_start`,
+`mlp_ratio`. A value of -1 keeps the preset's. Custom architectures get a descriptive name such as `JiT-B/16(depth=6,hidden_size=384)`
+and are stored in the checkpoint, so `eval_jit.py` and `--init_from=resume` rebuild them automatically. Each run writes its full
+resolved config to `{out_dir}/config.json`.
 
 ## Dataset tiers
 
@@ -94,10 +122,10 @@ python prepare_jit_data.py --data_dir=/data/imagenet --out_dir=/data/jit/in100_1
 python prepare_jit_data.py --data_dir=/data/imagenet --out_dir=/data/jit/in100_128 --img_size=128 --subset=in100 --split=val
 python fid.py --data_dir=/data/jit/in100_128          # FID stats + Inception features for train and val
 
-python train_jit.py config/jit_in100_128.py
-python train_jit.py config/jit_in100_128.py --out_dir=in100_128_repa_dino --repa_encoder=dino_vitb16
+python train_jit.py config/jit_in100_128.py                                   # -> runs/in100_128/jit-b16/base
+python train_jit.py config/jit_in100_128.py --repa_encoder=dino_vitb16        # -> runs/in100_128/jit-b16/repa_encoder=dino_vitb16
 ./run_repa_targets.sh config/jit_in100_128.py         # none / DINO (IN-1k) / MAE (IN-1k) / DINOv2 (LVD-142M)
-python eval_jit.py --ckpt=jit_b16_in100_128/ckpt.pt --data_dir=/data/jit/in100_128 --cfgs=1.0,1.5,2.0,2.5,3.0
+python eval_jit.py --ckpt=runs/in100_128/jit-b16/base/ckpt.pt --data_dir=/data/jit/in100_128 --cfgs=1.0,1.5,2.0,2.5,3.0
 ```
 
 `eval_jit.py --save_samples=png|npz` keeps every generated image, as a PNG folder (`{index}_class{label}.png`, JiT's own format)
@@ -107,6 +135,16 @@ Training saves a fixed-noise 8x8 sample grid, captioned with class names, at eve
 Noise scale follows JiT's rule `img_size / 256` (`--noise_scale` overrides). The paper always scales patch size with
 resolution (256 tokens), so the 128px tiers with 16px patches are outside what it tested. Calibrate `noise_scale` on the
 `in100_128` baseline before comparing methods there.
+
+## Token masking
+
+`--mask_ratio=0.5` replaces half the patch tokens of a masked sample with a learned mask token (after the patch embedding, so
+position is kept), in a `--mask_prob` fraction of each batch (default 0.5; the rest trains unmasked, as at inference). There is no
+extra loss term: the usual flow-matching loss on every patch makes masked patches an inpainting-from-context task. JiT's v-loss
+weights the clean-image error by 1/(1-t)^2 (up to 400x), so with the default `--mask_weighting=effective_t` masked patches are weighted
+as t=0, the noise level they actually have, rather than letting their irreducible error dominate at low noise (`jit` keeps the
+literal weighting, for the ablation). Evaluation and sampling never mask. If masking works by forcing longer-range context, the
+locality diagnostics (window ablation, attention distance at high noise) should move along with FID.
 
 ## Verify the pipeline against the paper first
 
@@ -129,9 +167,15 @@ and `{out_dir}/diagnostics/diag_{iter}.json`:
 | 2 | precision / recall (k=3, Inception) | `val/precision`, `val/recall` | low recall with fine precision: coverage / data-limited |
 | 3 | raw vs EMA weights | `val/*_raw` | EMA much better: noisy gradients (batch size, variance reduction, EMA horizon) |
 | 4 | grad norms, update/weight ratio per block (every `log_interval`), adaLN gates, attention entropy | `grad_norm/*`, `update_ratio/*`, `gate_*/*`, `attn_entropy/*` | blocks that barely update or are gated off; collapsed or uniform attention |
-| 5 | k-NN + linear probe of mean-pooled tokens (blocks 4/8/12 at t=1, 0.75, 0.5, null label) | `probe/*` | whether / when semantic features emerge, and whether FID gains follow them |
+| 4b | locality: mean attention distance of patch queries (relative to uniform attention) and attention mass on the in-context class tokens, per block; windowed-attention ablation: held-out loss increase when attention is confined to non-overlapping k x k patch tiles in every layer (`diag_window_tiles`, default 1,2,4) | `attn_dist/*`, `attn_prefix_mass/*`, `window_loss_increase/*`, heatmaps | an increase near 0 at high noise (small t) means the model isn't using context beyond the tile where global structure is decided |
+| 5 | k-NN + linear probe of mean-pooled tokens (blocks at 1/3, 2/3 and the end of the model, t=1, 0.75, 0.5, null label) | `probe/*` | whether / when semantic features emerge, and whether FID gains follow them |
 | 6 | relative error per frequency band and noise level; sample vs real spectrum | `freq_err/*`, `spectrum_log_ratio/*`, heatmaps | capacity spent on (or missing) high frequencies |
 | 7 | memorization: nearest-training-image distance of samples vs held-out images | `mem/nn_ratio`, `mem/near_dup_rate` | ratio < 1 or near-dup rate well above 1%: samples copy training images |
+
+In the windowed ablation the in-context class tokens may only attend to each other, so they can't relay image content between
+tiles; a test confirms that perturbing one tile leaves every other tile's output exactly unchanged. The model never saw masked
+attention in training, so part of any increase is distribution shift. Compare across noise levels, training time and methods
+rather than reading absolute values.
 
 JiT's convention is t=1 clean and t=0 pure noise. The eval runs two extra sample batches (raw weights) plus about 40k
 instrumented forward passes, so it costs roughly 2-3x a plain FID eval; `--diag_raw=False` or `--diag=False` cut that.

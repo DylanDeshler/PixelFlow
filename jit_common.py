@@ -3,6 +3,7 @@ Shared pieces for train_jit.py / eval_jit.py: building JiT's Denoiser from a fla
 EMA weight swapping, and FID evaluation of generated samples.
 """
 
+import os
 from types import SimpleNamespace
 from contextlib import contextmanager
 
@@ -12,6 +13,40 @@ from tqdm import tqdm
 
 from denoiser import Denoiser
 from fid import to_uint8
+import model_jit
+
+# architecture of each JiT preset, as defined in model_jit.py (mlp_ratio is the JiT default for all of them)
+JIT_PRESETS = {
+    'JiT-B/16': dict(depth=12, hidden_size=768, num_heads=12, bottleneck_dim=128, in_context_len=32, in_context_start=4, patch_size=16),
+    'JiT-B/32': dict(depth=12, hidden_size=768, num_heads=12, bottleneck_dim=128, in_context_len=32, in_context_start=4, patch_size=32),
+    'JiT-L/16': dict(depth=24, hidden_size=1024, num_heads=16, bottleneck_dim=128, in_context_len=32, in_context_start=8, patch_size=16),
+    'JiT-L/32': dict(depth=24, hidden_size=1024, num_heads=16, bottleneck_dim=128, in_context_len=32, in_context_start=8, patch_size=32),
+    'JiT-H/16': dict(depth=32, hidden_size=1280, num_heads=16, bottleneck_dim=256, in_context_len=32, in_context_start=10, patch_size=16),
+    'JiT-H/32': dict(depth=32, hidden_size=1280, num_heads=16, bottleneck_dim=256, in_context_len=32, in_context_start=10, patch_size=32),
+}
+for _name, _arch in JIT_PRESETS.items():
+    assert _name in model_jit.JiT_models, f'{_name} missing from model_jit.JiT_models'
+
+def resolve_arch(model, **overrides):
+    """
+    Preset architecture with any overrides applied (None means keep the preset value).
+    Returns (name, arch): name is the preset itself if nothing changed, otherwise a descriptive custom name.
+    """
+    arch = dict(JIT_PRESETS[model], mlp_ratio=4.0)
+    changed = {k: v for k, v in overrides.items() if v is not None and arch.get(k) != v}
+    arch.update(changed)
+    assert arch['hidden_size'] % arch['num_heads'] == 0, 'hidden_size must be divisible by num_heads'
+    assert (arch['hidden_size'] // arch['num_heads']) % 4 == 0, 'head dim must be divisible by 4 (2D RoPE)'
+    assert arch['in_context_len'] == 0 or arch['in_context_start'] < arch['depth'], 'in_context_start must be < depth'
+    if not changed:
+        return model, arch
+    name = model + '(' + ','.join(f'{k}={v}' for k, v in sorted(changed.items())) + ')'
+    return name, arch
+
+def _register(name, arch):
+    # JiT's Denoiser looks the network up in model_jit.JiT_models by name, so custom architectures get registered there
+    if name not in model_jit.JiT_models:
+        model_jit.JiT_models[name] = lambda **kwargs: model_jit.JiT(**arch, **kwargs)
 
 
 class FastDenoiser(Denoiser):
@@ -26,9 +61,31 @@ class FastDenoiser(Denoiser):
             return (x_cond - z) / (1.0 - t).clamp_min(self.t_eps)
         return super()._forward_sample(z, t, labels)
 
+    ema_warmup = False
+
+    @torch.no_grad()
+    def update_ema(self, step=None):
+        """
+        JiT's EMA update, optionally with warmup: decay = min(decay, (1 + step) / (10 + step)). JiT applies the full decay
+        from step 0, so EMA1 (0.9999) is still 37% random init after 10k iterations; warmup removes that early lag and
+        converges to JiT's update (the cap reaches 0.9999 at step ~90k, 0.9996 at ~22k).
+        """
+        d1, d2 = self.ema_decay1, self.ema_decay2
+        if self.ema_warmup and step is not None:
+            cap = (1 + step) / (10 + step)
+            d1, d2 = min(d1, cap), min(d2, cap)
+        params = list(self.parameters())
+        torch._foreach_lerp_(self.ema_params1, params, 1 - d1) # ema = d * ema + (1 - d) * param
+        torch._foreach_lerp_(self.ema_params2, params, 1 - d2)
+
 def build_denoiser(model, img_size, num_classes, attn_dropout=0.0, proj_dropout=0.0, label_drop_prob=0.1,
                    P_mean=-0.8, P_std=0.8, t_eps=5e-2, noise_scale=1.0, ema_decay1=0.9999, ema_decay2=0.9996,
-                   sampling_method='heun', num_sampling_steps=50, cfg=1.0, interval_min=0.0, interval_max=1.0):
+                   sampling_method='heun', num_sampling_steps=50, cfg=1.0, interval_min=0.0, interval_max=1.0, arch=None):
+    """
+    arch: full architecture dict (from resolve_arch) for non-preset models; stored in checkpoints so eval can rebuild them.
+    """
+    if arch is not None:
+        _register(model, arch)
     args = SimpleNamespace(
         model=model, img_size=img_size, class_num=num_classes, attn_dropout=attn_dropout, proj_dropout=proj_dropout,
         label_drop_prob=label_drop_prob, P_mean=P_mean, P_std=P_std, t_eps=t_eps, noise_scale=noise_scale,
@@ -113,3 +170,38 @@ def save_labeled_grid(x, names, path, nrow=8):
         canvas.paste(Image.fromarray(img), (c * W, r * (H + caption)))
         draw.text((c * W + 2, r * (H + caption) + H), name[: max(4, W // 6)], fill='black')
     canvas.save(path)
+
+# settings that don't change what is trained (budget, evaluation, logging, system), left out of run directory names;
+# diag* (diagnostics) settings are excluded too
+_NAME_EXCLUDE = {
+    'out_dir', 'runs_root', 'run_name', 'data_root', 'data_dir', 'dataset', 'model', 'depth', 'hidden_size', 'num_heads',
+    'patch_size', 'bottleneck_dim', 'in_context_len', 'in_context_start', 'mlp_ratio',
+    'epochs', 'batch_size', 'gradient_accumulation_steps', 'eval_every_epochs', 'save_every_epochs', 'log_interval',
+    'eval_only', 'init_from', 'wandb_log', 'wandb_project', 'wandb_run_name', 'fid_num_images', 'fid_cfg',
+    'fid_interval_min', 'fid_interval_max', 'sampling_method', 'num_sampling_steps', 'gen_batch_size',
+    'device', 'dtype', 'compile',
+}
+_ARCH_SHORT = {'depth': 'd', 'hidden_size': 'w', 'num_heads': 'h', 'patch_size': 'p', 'bottleneck_dim': 'bn',
+               'in_context_len': 'icl', 'in_context_start': 'ics', 'mlp_ratio': 'mlp'}
+
+def run_dir(runs_root, dataset, model, arch, config, defaults, run_name=''):
+    """
+    {runs_root}/{dataset}/{model}/{changes}[_{run_name}], e.g. runs/in100_128/jit-b16_d6_w384_h6/noise_scale=0.75.
+    model: preset short name plus architecture fields that differ from the preset. changes: every other setting that
+    differs from the script defaults and affects training ('base' if none). Budget / eval / logging / system settings
+    are excluded, so extending --epochs and resuming lands in the same directory.
+    """
+    preset = dict(JIT_PRESETS[model], mlp_ratio=4.0)
+    model_part = model.lower().replace('/', '')
+    model_part += ''.join(f'_{_ARCH_SHORT[k]}{arch[k]:g}' for k in _ARCH_SHORT if arch[k] != preset[k])
+    def fmt(v):
+        if isinstance(v, str):
+            v = os.path.basename(v.rstrip('/')) if v.startswith(('file:', '/')) else v
+            return v.replace('/', '-').replace(':', '-')
+        return f'{v:g}' if isinstance(v, float) else str(v)
+    changes = [f'{k}={fmt(v)}' for k, v in sorted(config.items())
+               if k not in _NAME_EXCLUDE and not k.startswith('diag') and v != defaults[k]]
+    leaf = '_'.join(changes) or 'base'
+    if run_name:
+        leaf += f'_{run_name}'
+    return os.path.join(runs_root, dataset, model_part, leaf)

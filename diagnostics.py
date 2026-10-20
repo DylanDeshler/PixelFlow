@@ -5,6 +5,8 @@ Training diagnostics for JiT, aimed at finding where data efficiency is lost.
     2. precision / recall of samples                    fidelity vs coverage (in train_jit.py, via fid.py)
     3. EMA vs raw weights                               FID / precision / recall of both (in train_jit.py)
     4. optimization health                              grad norms, update/weight ratios per block, adaLN gates, attention entropy
+       + locality                                       mean attention distance per block, and a windowed-attention ablation:
+                                                        attention confined to non-overlapping tiles, loss increase per noise level
     5. representation probes                            k-NN + linear probe on intermediate tokens, at several noise levels
     6. error by frequency band                          prediction error spectrum per noise level, sample vs real spectra
     7. memorization                                     nearest-training-image distances of samples vs held-out images
@@ -27,50 +29,101 @@ from evaluation import knn_classifier
 # -----------------------------------------------------------------------------
 # instrumented forward (mirrors JiT.forward / JiTBlock.forward / Attention.forward in model_jit.py, eagerly)
 
-def _attention(attn, x, rope):
+_geometry = {}
+
+def grid_geometry(g, device):
+    """
+    Row-major (row, col) of the g*g patch tokens, their pairwise Euclidean distances (in patches), and the mean distance
+    under uniform attention, which normalizes the attention distance so 1.0 = as spread out as uniform attention.
+    """
+    key = (g, str(device))
+    if key not in _geometry:
+        r, c = torch.meshgrid(torch.arange(g), torch.arange(g), indexing='ij')
+        pos = torch.stack([r.flatten(), c.flatten()], 1).float().to(device)
+        dist = torch.cdist(pos, pos)
+        _geometry[key] = (pos, dist, dist.mean())
+    return _geometry[key]
+
+def tile_mask(g, tile, n_prefix, device):
+    """
+    Attention mask for the windowed-attention ablation: patch tokens only see patches in the same non-overlapping
+    tile x tile block (in every layer, so information can never leave a tile), plus the in-context class tokens.
+    The in-context tokens only see each other, so they can't relay image content between tiles.
+    True = allowed. Shape [n_prefix + g*g] squared.
+    """
+    pos, _, _ = grid_geometry(g, device)
+    tile_id = (pos[:, 0] // tile) * g + (pos[:, 1] // tile)
+    same_tile = tile_id.view(-1, 1) == tile_id.view(1, -1)
+    if n_prefix == 0:
+        return same_tile
+    n = n_prefix + g * g
+    mask = torch.zeros(n, n, dtype=torch.bool, device=device)
+    mask[:n_prefix, :n_prefix] = True
+    mask[n_prefix:, :n_prefix] = True
+    mask[n_prefix:, n_prefix:] = same_tile
+    return mask
+
+def _attention(attn, x, rope, n_prefix, g, mask=None):
     B, N, C = x.shape
     H = attn.num_heads
     qkv = attn.qkv(x).reshape(B, N, 3, H, C // H).permute(2, 0, 3, 1, 4)
     q, k, v = qkv[0], qkv[1], qkv[2]
     q, k = rope(attn.q_norm(q)), rope(attn.k_norm(k))
     with torch.autocast(device_type=x.device.type, enabled=False):
-        w = torch.softmax(q.float() @ k.float().transpose(-2, -1) / math.sqrt(q.shape[-1]), dim=-1)
+        logits = q.float() @ k.float().transpose(-2, -1) / math.sqrt(q.shape[-1])
+        if mask is not None:
+            logits = logits.masked_fill(~mask, float('-inf'))
+        w = torch.softmax(logits, dim=-1)
+    stats = {}
     # attention entropy per query, normalized by log(N): 1 = uniform, 0 = attends to one token
-    entropy = (-(w * torch.log(w.clamp_min(1e-12))).sum(-1) / math.log(N)).mean()
+    stats['attn_entropy'] = (-(w * torch.log(w.clamp_min(1e-12))).sum(-1) / math.log(N)).mean()
+    # locality of patch queries: mean spatial distance to the patches they attend to (renormalized over patch keys),
+    # relative to uniform attention; and the attention mass they put on the in-context class tokens
+    wp = w[:, :, n_prefix:, :]
+    wpp = wp[..., n_prefix:]
+    wpp = wpp / wpp.sum(-1, keepdim=True).clamp_min(1e-12)
+    _, dist, uniform = grid_geometry(g, x.device)
+    stats['attn_dist'] = (wpp * dist).sum(-1).mean() / uniform
+    stats['attn_prefix_mass'] = wp[..., :n_prefix].sum(-1).mean() if n_prefix else torch.zeros((), device=x.device)
     out = attn.proj((w @ v).transpose(1, 2).reshape(B, N, C)) # same casting as JiT: fp32 weights @ v under the caller's autocast
-    return out, entropy
+    return out, stats
 
-def _block(block, x, c, rope):
+def _block(block, x, c, rope, n_prefix, g, mask=None):
     shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = block.adaLN_modulation(c).chunk(6, dim=-1)
-    attn_out, entropy = _attention(block.attn, modulate(block.norm1(x), shift_msa, scale_msa), rope)
+    attn_out, stats = _attention(block.attn, modulate(block.norm1(x), shift_msa, scale_msa), rope, n_prefix, g, mask)
     x = x + gate_msa.unsqueeze(1) * attn_out
     x = x + gate_mlp.unsqueeze(1) * block.mlp(modulate(block.norm2(x), shift_mlp, scale_mlp))
-    return x, entropy, gate_msa.abs().mean(), gate_mlp.abs().mean()
+    stats['gate_msa'], stats['gate_mlp'] = gate_msa.abs().mean(), gate_mlp.abs().mean()
+    return x, stats
 
 @torch.no_grad()
-def instrumented_forward(net, x, t, y, capture_blocks=()):
+def instrumented_forward(net, x, t, y, capture_blocks=(), tile=None):
     """
-    Same output as net(x, t, y), plus per-block attention entropy, |gate| sizes, and the patch tokens
-    (in-context class tokens removed) after the blocks in capture_blocks (1-indexed).
+    Same output as net(x, t, y), plus per-block attention stats (entropy, spatial distance, mass on in-context tokens),
+    |gate| sizes, and the patch tokens (in-context class tokens removed) after the blocks in capture_blocks (1-indexed).
+    tile: if set, runs the windowed-attention ablation (see tile_mask) instead of full attention.
     """
+    g = int(round(net.x_embedder.num_patches ** 0.5))
+    masks = {}
+    if tile is not None:
+        masks = {0: tile_mask(g, tile, 0, x.device), net.in_context_len: tile_mask(g, tile, net.in_context_len, x.device)}
     t_emb = net.t_embedder(t)
     y_emb = net.y_embedder(y)
     c = t_emb + y_emb
     h = net.x_embedder(x) + net.pos_embed
-    stats = {'attn_entropy': [], 'gate_msa': [], 'gate_mlp': []}
+    stats = {k: [] for k in ('attn_entropy', 'attn_dist', 'attn_prefix_mass', 'gate_msa', 'gate_mlp')}
     feats = {}
     for i, block in enumerate(net.blocks):
         if net.in_context_len > 0 and i == net.in_context_start:
             ic = y_emb.unsqueeze(1).repeat(1, net.in_context_len, 1) + net.in_context_posemb
             h = torch.cat([ic, h], dim=1)
+        n_prefix = net.in_context_len if (net.in_context_len > 0 and i >= net.in_context_start) else 0
         rope = net.feat_rope if i < net.in_context_start else net.feat_rope_incontext
-        h, entropy, g_msa, g_mlp = _block(block, h, c, rope)
-        stats['attn_entropy'].append(entropy)
-        stats['gate_msa'].append(g_msa)
-        stats['gate_mlp'].append(g_mlp)
+        h, block_stats = _block(block, h, c, rope, n_prefix, g, masks.get(n_prefix))
+        for k, v in block_stats.items():
+            stats[k].append(v)
         if (i + 1) in capture_blocks:
-            n_strip = net.in_context_len if (net.in_context_len > 0 and i >= net.in_context_start) else 0
-            feats[i + 1] = h[:, n_strip:]
+            feats[i + 1] = h[:, n_prefix:]
     h = h[:, net.in_context_len:]
     fl = net.final_layer
     shift, scale = fl.adaLN_modulation(c).chunk(2, dim=1)
@@ -105,11 +158,12 @@ def t_grid(n_bins, lo=-3.0, hi=3.0):
     return torch.sigmoid(torch.linspace(lo, hi, n_bins))
 
 @torch.no_grad()
-def noise_level_pass(net, x, y, ts, noise_scale, t_eps, ctx, masks, seed=0, chunk=128):
+def noise_level_pass(net, x, y, ts, noise_scale, t_eps, ctx, masks, seed=0, chunk=128, tile=None):
     """
     For each t in ts, noises the fixed batch x with fixed noise and records:
       v_loss (the training objective), x_mse, relative prediction error per frequency band,
-      attention entropy / gate sizes per block (averaged over the batch).
+      attention entropy / spatial distance / in-context mass and gate sizes per block (averaged over the batch).
+    tile: run the windowed-attention ablation (tile_mask) instead of full attention; same images, noise and t.
     Returns dict of tensors with a leading len(ts) dimension.
     """
     g = torch.Generator(device=x.device).manual_seed(seed)
@@ -124,7 +178,7 @@ def noise_level_pass(net, x, y, ts, noise_scale, t_eps, ctx, masks, seed=0, chun
             tt = t.view(-1, 1, 1, 1)
             z = tt * xb + (1 - tt) * eb
             with ctx:
-                x_pred, stats, _ = instrumented_forward(net, z, t, yb)
+                x_pred, stats, _ = instrumented_forward(net, z, t, yb, tile=tile)
             x_pred = x_pred.float()
             v = (xb - z) / (1 - tt).clamp_min(t_eps)
             v_pred = (x_pred - z) / (1 - tt).clamp_min(t_eps)

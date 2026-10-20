@@ -6,11 +6,12 @@ DDP training loop. Defaults follow JiT-B/16: AdamW (0.9, 0.95), no weight decay,
 scaled to the effective batch (2e-4 at 1024), constant lr after 5 warmup epochs, EMA 0.9999 / 0.9996,
 logit-normal t (-0.8, 0.8), x-prediction with v-loss.
 
-Datasets come from prepare_jit_data.py. Fast iteration on ImageNet-100 at 128px, then scale up:
-$ python train_jit.py --data_dir=/data/jit/in100_128 --out_dir=jit_b16_in100_128
-$ python train_jit.py --data_dir=/data/jit/in100_128 --out_dir=jit_b16_in100_128_repa_dino --repa_encoder=dino_vitb16
-$ python train_jit.py --data_dir=/data/jit/in1k_256 --out_dir=jit_b16_in1k_256 --epochs=200 --batch_size=128 --gradient_accumulation_steps=8
-$ python train_jit.py --out_dir=jit_b16_in100_128 --init_from=resume   # after preemption
+Datasets come from prepare_jit_data.py into {data_root}/{dataset}. Settings come from config files and/or --key=value,
+and the run directory is derived from them: {runs_root}/{dataset}/{model}/{changes}, e.g.
+$ python train_jit.py config/jit_in100_128.py                                  -> runs/in100_128/jit-b16/base
+$ python train_jit.py config/jit_in100_128.py --repa_encoder=dino_vitb16       -> runs/in100_128/jit-b16/repa_encoder=dino_vitb16
+$ python train_jit.py config/jit_in100_128.py config/model_jit_s16.py          -> runs/in100_128/jit-b16_w384_h6/base
+$ python train_jit.py config/jit_in100_128.py --repa_encoder=dino_vitb16 --init_from=resume   # same command + resume after preemption
 
 FID (no CFG, fixed seed) is tracked during training; final CFG-swept numbers come from eval_jit.py.
 With diag=True every FID eval also runs the data-efficiency diagnostics in diagnostics.py (needs the val split
@@ -29,29 +30,42 @@ import numpy as np
 import torch
 
 from data_jit import MemmapImages, EpochSampler, to_model_input
-from jit_common import build_denoiser, ema_state_dicts, ema_weights, generate_and_score, save_labeled_grid
+from jit_common import build_denoiser, resolve_arch, run_dir, ema_state_dicts, ema_weights, generate_and_score, save_labeled_grid
 from fid import InceptionMetrics, load_ref_stats, precision_recall
 from repa import FrozenEncoder, Projector, BlockCapture, repa_loss
+from masking import TokenMasker, flow_loss
 import diagnostics as diag_lib
 
 # -----------------------------------------------------------------------------
 # I/O
-out_dir = 'jit_b16_in100_128'
-eval_every_epochs = 20 # FID eval
+runs_root = 'runs'
+out_dir = '' # '' -> {runs_root}/{dataset}/{model}/{settings changed from these defaults}, see jit_common.run_dir
+run_name = '' # optional tag appended to the derived out_dir (e.g. seed2)
+eval_every_epochs = 10 # FID eval
 save_every_epochs = 1 # overwrite ckpt.pt
 log_interval = 100
 eval_only = False # if True, script exits right after one FID eval (use with init_from='resume')
 init_from = 'scratch' # 'scratch' or 'resume'
 # wandb logging
 wandb_log = True
-wandb_project = 'cross_patch'
-wandb_run_name = '' # defaults to out_dir
+wandb_project = 'pixelflow'
+wandb_run_name = '' # defaults to the run's path under runs_root
 # data
-data_dir = '/data/jit/in100_128'
+data_root = os.environ.get('JIT_DATA_ROOT', '/data/jit') # where prepare_jit_data.py wrote the datasets
+dataset = 'in100_128' # in100_128, in100_256, in1k_128, in1k_256, ... (a directory under data_root)
+data_dir = '' # '' -> {data_root}/{dataset}; set it to use a dataset outside data_root
 gradient_accumulation_steps = 1
 batch_size = 1024 # micro batch; effective batch = batch_size * gradient_accumulation_steps (JiT uses 1024)
-# model
-model = 'JiT-B/16'
+# model: a JiT preset, optionally with any architecture field overridden (-1 keeps the preset's value)
+model = 'JiT-B/16' # JiT-B/16, JiT-B/32, JiT-L/16, JiT-L/32, JiT-H/16, JiT-H/32
+depth = -1
+hidden_size = -1
+num_heads = -1
+patch_size = -1
+bottleneck_dim = -1 # width of the low-rank patch embedding
+in_context_len = -1 # number of in-context class tokens (0 disables them)
+in_context_start = -1 # block where the in-context tokens are prepended
+mlp_ratio = -1.0
 attn_dropout = 0.0
 proj_dropout = 0.0
 # flow matching
@@ -72,11 +86,16 @@ beta2 = 0.95
 grad_clip = 0.0 # JiT doesn't clip
 ema_decay1 = 0.9999
 ema_decay2 = 0.9996
+ema_warmup = True # decay = min(decay, (1+step)/(10+step)); False is JiT's update (full decay from step 0)
 # REPA ('' disables). see repa.py for the available encoders
 repa_encoder = ''
 repa_depth = 4 # align the output of this block (1-indexed)
 repa_coeff = 0.5
 repa_proj_dim = 2048
+# MAE-style token masking (masking.py): same loss, masked patches predicted from context. 0 disables
+mask_ratio = 0.0 # fraction of patches replaced by a learned mask token in a masked sample
+mask_prob = 0.5 # fraction of each batch that is masked (the rest trains unmasked, as at inference)
+mask_weighting = 'effective_t' # 'effective_t' (masked patches weighted as t=0) or 'jit' (sampled-t weight for all patches)
 # FID eval during training
 fid_num_images = 10000 # must be divisible by the number of classes
 fid_cfg = 1.0
@@ -91,11 +110,12 @@ diag_raw = True # 3: also FID / precision / recall of the raw (non-EMA) weights
 diag_images = 1024 # 1/4/6: fixed train and held-out images for the per-noise-level pass
 diag_t_bins = 10
 diag_freq_bands = 8
-diag_probe_blocks = '4,8,12'
+diag_probe_blocks = '' # comma separated, 1-indexed; '' -> a third, two thirds and the last block of the model
 diag_probe_ts = '1.0,0.75,0.5' # noise levels for the probes (t=1 is clean)
 diag_probe_train_images = 10000
 diag_probe_val_images = 5000
 diag_spectrum_images = 2000 # generated samples for the sample-vs-real spectrum
+diag_window_tiles = '1,2,4' # windowed-attention ablation: attention confined to k x k patch tiles ('' disables; k >= grid skipped)
 diag_opt_stats = True # 4: grad norms and update/weight ratios per block, every log_interval
 # system
 device = 'cuda'
@@ -103,14 +123,26 @@ dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported
 compile = True # JiT compiles its blocks with @torch.compile; False disables dynamo entirely
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
+_defaults = {k: globals()[k] for k in config_keys} # to name the run by what changed
 exec(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'configurator.py')).read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
+# derived paths and architecture
+if data_dir:
+    dataset = os.path.basename(os.path.normpath(data_dir))
+else:
+    data_dir = os.path.join(data_root, dataset)
+model_name, arch = resolve_arch(model, **{k: (None if v < 0 else v) for k, v in dict(
+    depth=depth, hidden_size=hidden_size, num_heads=num_heads, patch_size=patch_size, bottleneck_dim=bottleneck_dim,
+    in_context_len=in_context_len, in_context_start=in_context_start, mlp_ratio=mlp_ratio).items()})
+out_dir = out_dir or run_dir(runs_root, dataset, model, arch, config, _defaults, run_name)
+wandb_run_name = wandb_run_name or (os.path.relpath(out_dir, runs_root) if not out_dir.startswith('..') else out_dir)
+print(f"data: {data_dir}\nrun:  {out_dir}")
+
 if not compile:
     torch._dynamo.config.disable = True
 torch._dynamo.config.cache_size_limit = 128
-wandb_run_name = wandb_run_name or out_dir
 os.makedirs(out_dir, exist_ok=True)
 torch.manual_seed(1337)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
@@ -137,14 +169,21 @@ def get_batch():
     return to_model_input(x, flip=True, device=device), torch.from_numpy(y).to(device, non_blocking=True)
 
 # model
+assert img_size % arch['patch_size'] == 0, f"img_size {img_size} not divisible by patch_size {arch['patch_size']}"
 denoiser_args = dict(
-    model=model, img_size=img_size, num_classes=num_classes, attn_dropout=attn_dropout, proj_dropout=proj_dropout,
+    model=model_name, arch=arch, img_size=img_size, num_classes=num_classes, attn_dropout=attn_dropout, proj_dropout=proj_dropout,
     label_drop_prob=label_drop_prob, P_mean=P_mean, P_std=P_std, t_eps=t_eps, noise_scale=noise_scale,
     ema_decay1=ema_decay1, ema_decay2=ema_decay2, sampling_method=sampling_method,
     num_sampling_steps=num_sampling_steps, cfg=fid_cfg, interval_min=fid_interval_min, interval_max=fid_interval_max,
 )
 denoiser = build_denoiser(**denoiser_args).to(device)
+denoiser.ema_warmup = ema_warmup
 summary(denoiser)
+print(f"model {model_name}: {sum(p.numel() for p in denoiser.net.parameters()) / 1e6:.1f}M params, "
+      f"{(img_size // arch['patch_size']) ** 2} tokens of {arch['patch_size'] ** 2 * 3}-d patches")
+with open(os.path.join(out_dir, 'config.json'), 'w') as f:
+    json.dump({**config, 'resolved': {'data_dir': data_dir, 'out_dir': out_dir, 'model_name': model_name, 'arch': arch, 'noise_scale': noise_scale,
+                                       'effective_batch_size': effective_batch_size, 'lr': lr, 'max_iters': max_iters}}, f, indent=2)
 grid = img_size // denoiser.net.patch_size
 
 encoder, projector, capture = None, None, None
@@ -156,7 +195,13 @@ if repa_encoder:
 
 # same weight decay grouping as JiT (no decay on biases / norms)
 decay, no_decay = [], []
-trainable = list(denoiser.named_parameters()) + (list(projector.named_parameters()) if projector is not None else [])
+masker = None
+if mask_ratio > 0:
+    assert mask_weighting in ('effective_t', 'jit'), "mask_weighting must be 'effective_t' or 'jit'"
+    masker = TokenMasker(denoiser.net).to(device)
+    print(f"token masking: {mask_ratio:.0%} of patches in {mask_prob:.0%} of samples, weighting {mask_weighting}")
+trainable = list(denoiser.named_parameters()) + (list(projector.named_parameters()) if projector is not None else []) \
+    + (list(masker.named_parameters()) if masker is not None else [])
 for name, p in trainable:
     if not p.requires_grad:
         continue
@@ -180,6 +225,8 @@ if init_from == 'resume':
     denoiser.ema_params2 = [checkpoint['model_ema2'][name].to(device) for name, _ in denoiser.named_parameters()]
     if projector is not None:
         projector.load_state_dict(checkpoint['projector'])
+    if masker is not None:
+        masker.load_state_dict(checkpoint['masker'])
     optimizer.load_state_dict(checkpoint['optimizer'])
     iter_num = checkpoint['iter_num']
     best_fid = checkpoint['best_fid']
@@ -216,8 +263,12 @@ if diag:
     diag_ts = diag_lib.t_grid(diag_t_bins)
     band_masks = diag_lib.radial_band_masks(img_size, diag_freq_bands, device)
     # 5: probe sets (uint8 on CPU)
-    probe_blocks = tuple(int(b) for b in diag_probe_blocks.split(','))
+    n_blocks = len(denoiser.net.blocks)
+    probe_blocks = tuple(int(b) for b in diag_probe_blocks.split(',')) if diag_probe_blocks else \
+        tuple(sorted({max(1, n_blocks // 3), max(1, 2 * n_blocks // 3), n_blocks}))
+    assert all(1 <= b <= n_blocks for b in probe_blocks), f'diag_probe_blocks {probe_blocks} outside 1..{n_blocks}'
     probe_ts = [float(t) for t in diag_probe_ts.split(',')]
+    window_tiles = [k for k in (int(v) for v in diag_window_tiles.split(',') if v) if k < grid]
     probe_train_x, probe_train_y = data.get(spaced(len(data), diag_probe_train_images))
     probe_val_x, probe_val_y = val_data.get(spaced(len(val_data), diag_probe_val_images))
     probe_train_y, probe_val_y = torch.from_numpy(probe_train_y).to(device), torch.from_numpy(probe_val_y).to(device)
@@ -233,7 +284,7 @@ if diag:
         real_spectrum = real_spectrum + diag_lib.band_power(torch.from_numpy(xs).to(device).permute(0, 3, 1, 2).float() / 255, band_masks)
     real_spectrum = real_spectrum / min(diag_spectrum_images, len(val_data))
     os.makedirs(os.path.join(out_dir, 'diagnostics'), exist_ok=True)
-    print(f"diagnostics on: {len(val_data):,} held-out images, probes on blocks {probe_blocks} at t={probe_ts}")
+    print(f"diagnostics on: {len(val_data):,} held-out images, probes on blocks {probe_blocks} at t={probe_ts}, attention tiles {window_tiles}")
 
 def get_lr(it):
     # per-iteration version of JiT's schedule: linear warmup, then constant or half-cycle cosine
@@ -307,6 +358,9 @@ def evaluate(step):
     denoiser.eval()
     passes = {split: diag_lib.noise_level_pass(denoiser.net, xb, yb, diag_ts, noise_scale, t_eps, ctx, band_masks)
               for split, (xb, yb) in (('train', diag_train), ('val', diag_val))}
+    # 4. locality ablation on the held-out batch: same images / noise / t, attention confined to tiles
+    window_passes = {k: diag_lib.noise_level_pass(denoiser.net, *diag_val, diag_ts, noise_scale, t_eps, ctx, band_masks, tile=k)
+                     for k in window_tiles}
     denoiser.train()
     t_labels = [f'{t:.3f}' for t in diag_ts.tolist()]
     for i, tl in enumerate(t_labels):
@@ -319,6 +373,14 @@ def evaluate(step):
         log[f'attn_entropy/block{b + 1:02d}'] = pv['attn_entropy'][:, b].mean().item()
         log[f'gate_msa/block{b + 1:02d}'] = pv['gate_msa'][:, b].mean().item()
         log[f'gate_mlp/block{b + 1:02d}'] = pv['gate_mlp'][:, b].mean().item()
+        log[f'attn_dist/block{b + 1:02d}'] = pv['attn_dist'][:, b].mean().item()
+        if arch['in_context_len'] > 0 and b >= arch['in_context_start']: # only blocks that see in-context class tokens
+            log[f'attn_prefix_mass/block{b + 1:02d}'] = pv['attn_prefix_mass'][:, b].mean().item()
+    # relative held-out loss increase when attention can't leave a tile: ~0 means the model doesn't use longer-range context there
+    window_increase = {k: (wp['v_loss'] / pv['v_loss'] - 1) for k, wp in window_passes.items()}
+    for k, inc in window_increase.items():
+        for i, tl in enumerate(t_labels):
+            log[f'window_loss_increase/tile{k}_t{tl}'] = inc[i].item()
     band_labels = [f'band{k}' for k in range(diag_freq_bands)]
     for k, bl in enumerate(band_labels):
         log[f'freq_err/{bl}'] = pv['freq_rel_err'][:, k].mean().item()
@@ -331,8 +393,16 @@ def evaluate(step):
                                           f'held-out relative prediction error by frequency band (iter {step})', os.path.join(d, f'freq_err_{step}.png'))
     images['attn_entropy'] = diag_lib.heatmap(pv['attn_entropy'].numpy(), [f't={tl}' for tl in t_labels], [f'b{b + 1}' for b in range(pv['attn_entropy'].shape[1])],
                                               f'attention entropy, normalized (iter {step})', os.path.join(d, f'attn_entropy_{step}.png'), log=False)
+    images['attn_dist'] = diag_lib.heatmap(pv['attn_dist'].numpy(), [f't={tl}' for tl in t_labels], [f'b{b + 1}' for b in range(pv['attn_dist'].shape[1])],
+                                           f'mean attention distance / uniform (iter {step})', os.path.join(d, f'attn_dist_{step}.png'), log=False)
+    if window_increase:
+        images['window_loss_increase'] = diag_lib.heatmap(
+            torch.stack([window_increase[k] for k in window_tiles]).numpy(), [f'tile {k}x{k} ({k * arch["patch_size"]}px)' for k in window_tiles],
+            [f't={tl}' for tl in t_labels], f'held-out loss increase with attention confined to tiles (iter {step})',
+            os.path.join(d, f'window_loss_increase_{step}.png'), log=False)
     record.update({'iter': step, 'scalars': log, 't': diag_ts.tolist(),
-                   'passes': {split: {k: v.tolist() for k, v in p.items()} for split, p in passes.items()}})
+                   'passes': {split: {k: v.tolist() for k, v in p.items()} for split, p in passes.items()},
+                   'window_loss_increase': {f'tile{k}': v.tolist() for k, v in window_increase.items()}})
     with open(os.path.join(d, f'diag_{step}.json'), 'w') as f:
         json.dump(record, f)
     log['diag_minutes'] = (time.time() - t_start) / 60
@@ -357,6 +427,7 @@ def save_checkpoint():
         'model_ema1': ema1,
         'model_ema2': ema2,
         'projector': projector.state_dict() if projector is not None else None,
+        'masker': masker.state_dict() if masker is not None else None,
         'optimizer': optimizer.state_dict(),
         'denoiser_args': denoiser_args,
         'iter_num': iter_num,
@@ -377,7 +448,7 @@ if wandb_log:
     import wandb
     if wandb_run_id is None:
         wandb_run_id = uuid.uuid4().hex[:8] # stored in the checkpoint so a resumed run continues the same wandb run
-    wandb.init(project=wandb_project, name=wandb_run_name, config=config, id=wandb_run_id, resume='allow')
+    wandb.init(project=wandb_project, name=wandb_run_name, group=dataset, config=config, id=wandb_run_id, resume='allow')
 
 eval_iters = eval_every_epochs * iters_per_epoch
 save_iters = max(1, save_every_epochs * iters_per_epoch)
@@ -423,7 +494,10 @@ while True:
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     for micro_step in range(gradient_accumulation_steps):
         with ctx:
-            loss_fm = denoiser(X, Y)
+            if masker is None:
+                loss_fm = denoiser(X, Y) # JiT's own loss
+            else:
+                loss_fm = flow_loss(denoiser, X, Y, masker, masker.sample(len(X), mask_ratio, mask_prob, device), mask_weighting)
             loss = loss_fm
             if encoder is not None:
                 target = encoder(X, grid)
@@ -449,7 +523,7 @@ while True:
         del weights_before
     # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
-    denoiser.update_ema()
+    denoiser.update_ema(iter_num)
 
     # timing and logging
     t1 = time.time()

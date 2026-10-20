@@ -1,6 +1,5 @@
 # Full ImageNet at 128px with JiT-B/16: checks that in100 findings hold with 1000 classes, at ~1/3 the cost of 256px.
-data_dir = '/data/jit/in1k_128'
-out_dir = 'jit_b16_in1k_128'
+dataset = 'in1k_128'
 batch_size = 1024
 gradient_accumulation_steps = 1
 epochs = 200
