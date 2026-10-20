@@ -36,7 +36,7 @@ parser.add_argument('--out_dir', type=str, required=True)
 parser.add_argument('--img_size', type=int, required=True)
 parser.add_argument('--subset', type=str, default='in1k', choices=['in1k', 'in100'])
 parser.add_argument('--split', type=str, default='train', choices=['train', 'val'], help='val is written to {out_dir}/val')
-parser.add_argument('--workers', type=int, default=os.cpu_count())
+parser.add_argument('--workers', type=int, default=os.cpu_count()//2)
 args = parser.parse_args()
 
 OFFICIAL_STATS = {
