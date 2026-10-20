@@ -127,7 +127,7 @@ diag_images = 1024 # 1/4/6: fixed train and held-out images for the per-noise-le
 diag_t_bins = 10
 diag_freq_bands = 8
 diag_probe_blocks = '' # comma separated, 1-indexed; '' -> a third, two thirds and the last block of the model
-diag_probe_ts = '1.0,0.75,0.5' # noise levels for the probes (t=1 is clean)
+diag_probe_ts = '1.0,0.75,0.5,0.25,0.1' # noise levels for the probes (t=1 is clean)
 diag_probe_train_images = 10000
 diag_probe_val_images = 5000
 diag_spectrum_images = 2000 # generated samples for the sample-vs-real spectrum
@@ -563,10 +563,11 @@ def save_checkpoint():
         'train_seconds': train_seconds,
     }
     # write then rename, so a preemption mid-save can't corrupt the only checkpoint
+    t_save = time.time()
     tmp_path = os.path.join(out_dir, 'ckpt.pt.tmp')
     torch.save(checkpoint, tmp_path)
     os.replace(tmp_path, os.path.join(out_dir, 'ckpt.pt'))
-    print(f"saved checkpoint to {out_dir} at iter {iter_num} (epoch {iter_num / iters_per_epoch:.2f})")
+    print(f"saved checkpoint to {out_dir} at iter {iter_num} (epoch {iter_num / iters_per_epoch:.2f}) in {time.time() - t_save:.1f}s")
 
 # logging
 if wandb_log:
@@ -620,6 +621,7 @@ while True:
 
     if iter_num > 0 and local_iter_num > 0 and (iter_num % save_iters == 0 or iter_num == max_iters):
         save_checkpoint()
+        t0 = time.time() # don't count the save in the next iteration's timing
 
     # termination conditions
     if iter_num >= max_iters:

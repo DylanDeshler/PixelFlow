@@ -1,7 +1,7 @@
 """
 Poor Man's Configurator (from nanoGPT). Override any config global from the command line:
 $ python train_dino.py --batch_size=128 --out_dir=my_run
-or with python config files (applied in order, then --key=value overrides on top):
+or with python config files (applied in order, then all --key=value overrides on top, wherever they appear):
 $ python train_dino.py config/my_idea.py --batch_size=128
 
 Config files are plain python assignments. Unlike nanoGPT, their keys and types are checked the same way as
@@ -22,35 +22,37 @@ def _set_config(key, val, source):
     print(f"Overriding: {key} = {val}")
     globals()[key] = val
 
-for arg in sys.argv[1:]:
-    if '=' not in arg:
-        # assume it's the name of a config file
-        assert not arg.startswith('--'), f'expected --key=value, got {arg}'
-        config_file = arg
-        print(f"Overriding config with {config_file}:")
-        with open(config_file) as f:
-            source = f.read()
-        print(source)
-        namespace = {}
-        exec(source, {}, namespace)
-        for key, val in namespace.items():
-            # skip helpers the file may define (imports, functions, _private names)
-            if key.startswith('_') or isinstance(val, (types.ModuleType, types.FunctionType, type)):
-                continue
-            _set_config(key, val, config_file)
+# config files first (in the order given), then every --key=value override, wherever it appears on the command line,
+# so a flag can never be silently replaced by a config file listed after it
+config_files = [a for a in sys.argv[1:] if '=' not in a]
+overrides = [a for a in sys.argv[1:] if '=' in a]
+
+for config_file in config_files:
+    assert not config_file.startswith('--'), f'expected --key=value, got {config_file}'
+    print(f"Overriding config with {config_file}:")
+    with open(config_file) as f:
+        source = f.read()
+    print(source)
+    namespace = {}
+    exec(source, {}, namespace)
+    for key, val in namespace.items():
+        # skip helpers the file may define (imports, functions, _private names)
+        if key.startswith('_') or isinstance(val, (types.ModuleType, types.FunctionType, type)):
+            continue
+        _set_config(key, val, config_file)
+
+for arg in overrides:
+    assert arg.startswith('--'), f'expected --key=value, got {arg}'
+    key, val = arg.split('=', 1)
+    key = key[2:]
+    if key in globals() and isinstance(globals()[key], str):
+        # string configs stay raw strings (e.g. comma separated lists like --cfgs=1.0,2.0)
+        attempted_val = val
     else:
-        # assume it's a --key=value argument
-        assert arg.startswith('--'), f'expected --key=value, got {arg}'
-        key, val = arg.split('=', 1)
-        key = key[2:]
-        if key in globals() and isinstance(globals()[key], str):
-            # string configs stay raw strings (e.g. comma separated lists like --cfgs=1.0,2.0)
+        try:
+            # attempt to eval it (e.g. if bool, number, or etc)
+            attempted_val = literal_eval(val)
+        except (SyntaxError, ValueError):
+            # if that goes wrong, just use the string
             attempted_val = val
-        else:
-            try:
-                # attempt to eval it (e.g. if bool, number, or etc)
-                attempted_val = literal_eval(val)
-            except (SyntaxError, ValueError):
-                # if that goes wrong, just use the string
-                attempted_val = val
-        _set_config(key, attempted_val, 'command line')
+    _set_config(key, attempted_val, 'command line')

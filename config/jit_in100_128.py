@@ -3,6 +3,7 @@
 # keeps ~200k iters over 400 epochs. Check the baseline FID curve before fixing the budget for comparisons.
 dataset = 'in100_128'
 batch_size = 256
+gen_batch_size = batch_size * 2
 gradient_accumulation_steps = 1
 epochs = 400
 eval_every_epochs = 10
