@@ -4,7 +4,7 @@ Training-trend figures from train_jit.py's eval diagnostics, aimed at finding wh
 One run -> {run}/trends/*.png
 $ python plot_trends.py runs/in100_128/jit-b16/base
 Several runs -> per-run figures plus a comparison figure and table in --out
-$ python plot_trends.py runs/in100_128/jit-b16/base runs/in100_128/jit-b16/mask_ratio=0.5 --out=trends_compare
+$ python plot_trends.py runs/in100_128/jit-b16/base runs/in100_128/jit-b16/mask0.5 --out=trends_compare
 
 Reads {run}/diagnostics/diag_*.json (written at every FID eval with diag=True), {run}/config.json and, for the
 optimization figure, {run}/train_log.jsonl. The x axis is images seen (iterations x effective batch), so runs with

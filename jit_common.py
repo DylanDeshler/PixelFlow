@@ -235,24 +235,63 @@ _NAME_EXCLUDE = {
 _ARCH_SHORT = {'depth': 'd', 'hidden_size': 'w', 'num_heads': 'h', 'patch_size': 'p', 'bottleneck_dim': 'bn',
                'in_context_len': 'icl', 'in_context_start': 'ics', 'mlp_ratio': 'mlp'}
 
+# short, shell-friendly name tokens for the settings that change training. A value is appended to the prefix
+# ('noise' + 0.75 -> noise0.75); string settings use their value ('muon', 'repa-dino_vitb16'); booleans name the change
+# from the default ('no-emawarmup'). Settings missing here still get a readable '{key}{value}' token.
+_NAME_TOKENS = {
+    'optimizer_type': '', 'muon_adjust_lr': 'muon-', 'muon_lr': 'muonlr', 'muon_weight_decay': 'muonwd',
+    'muon_momentum': 'muonmom', 'muon_ns_steps': 'muonns', 'muon_split_fused': 'muonsplit', 'muon_adaln': 'muonadaln',
+    'noise_scale': 'noise', 'P_mean': 'pmean', 'P_std': 'pstd', 't_eps': 'teps', 'label_drop_prob': 'labeldrop',
+    'blr': 'blr', 'lr_schedule': 'lr-', 'min_lr': 'minlr', 'warmup_epochs': 'warmup', 'weight_decay': 'wd',
+    'beta1': 'beta1-', 'beta2': 'beta2-', 'grad_clip': 'clip', 'ema_decay1': 'ema', 'ema_decay2': 'ema2-', 'ema_warmup': 'emawarmup',
+    'attn_dropout': 'attndrop', 'proj_dropout': 'projdrop',
+    'repa_encoder': 'repa-', 'repa_depth': 'repadepth', 'repa_coeff': 'repacoeff', 'repa_proj_dim': 'repaproj',
+    'mask_ratio': 'mask', 'mask_prob': 'maskprob', 'mask_weighting': 'maskweight-',
+}
+
+def _fmt_value(v):
+    if isinstance(v, str):
+        v = os.path.splitext(os.path.basename(v.rstrip('/')))[0] if v.startswith(('file:', '/')) else v
+        return v.replace('/', '-').replace(':', '-').replace('=', '-').replace(' ', '-')
+    return f'{v:g}' if isinstance(v, float) else str(v)
+
+def _name_token(key, value):
+    prefix = _NAME_TOKENS.get(key, key.replace('_', '') + ('-' if isinstance(value, str) else ''))
+    if isinstance(value, bool):
+        return prefix if value else f'no-{prefix}'
+    return prefix + _fmt_value(value)
+
+def _model_part(model, arch):
+    preset = dict(JIT_PRESETS[model], mlp_ratio=4.0)
+    return model.lower().replace('/', '') + ''.join(f'_{_ARCH_SHORT[k]}{arch[k]:g}' for k in _ARCH_SHORT if arch[k] != preset[k])
+
+def _changed(config, defaults):
+    # in _NAME_TOKENS order (optimizer first, then noise schedule, ...), settings not in the table after, alphabetically
+    order = {k: i for i, k in enumerate(_NAME_TOKENS)}
+    changed = [(k, v) for k, v in config.items() if k not in _NAME_EXCLUDE and not k.startswith('diag') and v != defaults[k]]
+    return sorted(changed, key=lambda kv: (order.get(kv[0], len(order)), kv[0]))
+
 def run_dir(runs_root, dataset, model, arch, config, defaults, run_name=''):
     """
-    {runs_root}/{dataset}/{model}/{changes}[_{run_name}], e.g. runs/in100_128/jit-b16_d6_w384_h6/noise_scale=0.75.
-    model: preset short name plus architecture fields that differ from the preset. changes: every other setting that
-    differs from the script defaults and affects training ('base' if none). Budget / eval / logging / system settings
-    are excluded, so extending --epochs and resuming lands in the same directory.
+    {runs_root}/{dataset}/{model}/{changes}[_{run_name}], e.g. runs/in100_128/jit-b16_d6_w384_h6/muon_noise0.75.
+    model: preset short name plus architecture fields that differ from the preset. changes: a short token for every other
+    setting that differs from the script defaults and affects training ('base' if none). Budget / eval / logging / system
+    settings are excluded, so extending --epochs and resuming lands in the same directory.
     """
-    preset = dict(JIT_PRESETS[model], mlp_ratio=4.0)
-    model_part = model.lower().replace('/', '')
-    model_part += ''.join(f'_{_ARCH_SHORT[k]}{arch[k]:g}' for k in _ARCH_SHORT if arch[k] != preset[k])
+    leaf = '_'.join(_name_token(k, v) for k, v in _changed(config, defaults)) or 'base'
+    if run_name:
+        leaf += f'_{run_name}'
+    return os.path.join(runs_root, dataset, _model_part(model, arch), leaf)
+
+def legacy_run_dir(runs_root, dataset, model, arch, config, defaults, run_name=''):
+    # the earlier key=value naming (alphabetical, paths kept their extension), so runs created before the rename can still be resumed
     def fmt(v):
         if isinstance(v, str):
             v = os.path.basename(v.rstrip('/')) if v.startswith(('file:', '/')) else v
             return v.replace('/', '-').replace(':', '-')
         return f'{v:g}' if isinstance(v, float) else str(v)
-    changes = [f'{k}={fmt(v)}' for k, v in sorted(config.items())
-               if k not in _NAME_EXCLUDE and not k.startswith('diag') and v != defaults[k]]
-    leaf = '_'.join(changes) or 'base'
+    changed = sorted((k, v) for k, v in config.items() if k not in _NAME_EXCLUDE and not k.startswith('diag') and v != defaults[k])
+    leaf = '_'.join(f'{k}={fmt(v)}' for k, v in changed) or 'base'
     if run_name:
         leaf += f'_{run_name}'
-    return os.path.join(runs_root, dataset, model_part, leaf)
+    return os.path.join(runs_root, dataset, _model_part(model, arch), leaf)

@@ -9,7 +9,7 @@ logit-normal t (-0.8, 0.8), x-prediction with v-loss.
 Datasets come from prepare_jit_data.py into {data_root}/{dataset}. Settings come from config files and/or --key=value,
 and the run directory is derived from them: {runs_root}/{dataset}/{model}/{changes}, e.g.
 $ python train_jit.py config/jit_in100_128.py                                  -> runs/in100_128/jit-b16/base
-$ python train_jit.py config/jit_in100_128.py --repa_encoder=dino_vitb16       -> runs/in100_128/jit-b16/repa_encoder=dino_vitb16
+$ python train_jit.py config/jit_in100_128.py --repa_encoder=dino_vitb16       -> runs/in100_128/jit-b16/repa-dino_vitb16
 $ python train_jit.py config/jit_in100_128.py config/model_jit_s16.py          -> runs/in100_128/jit-b16_w384_h6/base
 $ python train_jit.py config/jit_in100_128.py --repa_encoder=dino_vitb16 --init_from=resume   # same command + resume after preemption
 
@@ -30,7 +30,7 @@ import numpy as np
 import torch
 
 from data_jit import MemmapImages, EpochSampler, to_model_input
-from jit_common import build_denoiser, resolve_arch, run_dir, ema_state_dicts, ema_weights, generate_and_score, save_labeled_grid
+from jit_common import build_denoiser, resolve_arch, run_dir, legacy_run_dir, ema_state_dicts, ema_weights, generate_and_score, save_labeled_grid
 from fid import InceptionMetrics, load_ref_stats, precision_recall
 from repa import FrozenEncoder, Projector, BlockCapture, repa_loss
 from masking import TokenMasker, flow_loss
@@ -184,7 +184,12 @@ check_prepared(data_dir, diag)
 model_name, arch = resolve_arch(model, **{k: (None if v < 0 else v) for k, v in dict(
     depth=depth, hidden_size=hidden_size, num_heads=num_heads, patch_size=patch_size, bottleneck_dim=bottleneck_dim,
     in_context_len=in_context_len, in_context_start=in_context_start, mlp_ratio=mlp_ratio).items()})
-out_dir = out_dir or run_dir(runs_root, dataset, model, arch, config, _defaults, run_name)
+if not out_dir:
+    out_dir = run_dir(runs_root, dataset, model, arch, config, _defaults, run_name)
+    legacy = legacy_run_dir(runs_root, dataset, model, arch, config, _defaults, run_name)
+    if init_from == 'resume' and not os.path.exists(os.path.join(out_dir, 'ckpt.pt')) and os.path.exists(os.path.join(legacy, 'ckpt.pt')):
+        print(f"resuming a run saved under the old directory name {legacy}\n  (rename it to keep things tidy: mv '{legacy}' '{out_dir}')")
+        out_dir = legacy
 wandb_run_name = wandb_run_name or (os.path.relpath(out_dir, runs_root) if not out_dir.startswith('..') else out_dir)
 print(f"data: {data_dir}\nrun:  {out_dir}")
 

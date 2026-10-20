@@ -86,7 +86,7 @@ Paths are derived, not configured per run:
 - data: `{data_root}/{dataset}`. `data_root` defaults to `$JIT_DATA_ROOT` or `/data`; tier configs only set `dataset`.
 - run directory: `{runs_root}/{dataset}/{model}/{changes}`. `{model}` is the preset plus changed architecture fields
   (`jit-b16_d6_w384_h6`); `{changes}` lists every setting that differs from the script defaults and affects training
-  (`noise_scale=0.5_repa_encoder=dino_vitb16`, or `base`). Budget, eval, logging, diagnostics and system settings are left out, so
+  as short tokens (`muon`, `noise0.75_pmean-1`, `repa-dino_vitb16`, `mask0.5`, or `base`). Budget, eval, logging, diagnostics and system settings are left out, so
   the same command with `--init_from=resume` (and e.g. more `--epochs`) continues the same run. Add `--run_name=seed2` for repeats.
   `--out_dir` / `--data_dir` still override the derived paths.
 
@@ -95,7 +95,7 @@ export JIT_DATA_ROOT=/data
 python train_jit.py config/jit_in100_128.py                                   # runs/in100_128/jit-b16/base
 python train_jit.py config/jit_in100_128.py config/model_jit_s16.py           # runs/in100_128/jit-b16_w384_h6/base
 python train_jit.py config/jit_in100_128.py --model=JiT-L/16 --depth=16 --batch_size=128   # runs/in100_128/jit-l16_d16/base
-python train_jit.py config/jit_in100_128.py --noise_scale=0.75                # runs/in100_128/jit-b16/noise_scale=0.75
+python train_jit.py config/jit_in100_128.py --noise_scale=0.75                # runs/in100_128/jit-b16/noise0.75
 ```
 
 The model is a JiT preset (`--model=JiT-B/16`, `JiT-L/16`, ...) with any architecture field overridden: `depth`, `hidden_size`,
@@ -123,7 +123,7 @@ python prepare_jit_data.py --data_dir=/data/imagenet --out_dir=/data/in100_128 -
 python fid.py --data_dir=/data/in100_128          # FID stats + Inception features for train and val
 
 python train_jit.py config/jit_in100_128.py                                   # -> runs/in100_128/jit-b16/base
-python train_jit.py config/jit_in100_128.py --repa_encoder=dino_vitb16        # -> runs/in100_128/jit-b16/repa_encoder=dino_vitb16
+python train_jit.py config/jit_in100_128.py --repa_encoder=dino_vitb16        # -> runs/in100_128/jit-b16/repa-dino_vitb16
 ./run_repa_targets.sh config/jit_in100_128.py         # none / DINO (IN-1k) / MAE (IN-1k) / DINOv2 (LVD-142M)
 python eval_jit.py --ckpt=runs/in100_128/jit-b16/base/ckpt.pt --data_dir=/data/in100_128 --cfgs=1.0,1.5,2.0,2.5,3.0
 ```
@@ -210,7 +210,7 @@ sizes line up by compute), written to `{run}/trends/`:
 
 ```bash
 python plot_trends.py runs/in100_128/jit-b16/base
-python plot_trends.py runs/in100_128/jit-b16/base runs/in100_128/jit-b16/mask_ratio=0.5 runs/in100_128/jit-b16_bn256/base --out=trends_compare
+python plot_trends.py runs/in100_128/jit-b16/base runs/in100_128/jit-b16/mask0.5 runs/in100_128/jit-b16_bn256/base --out=trends_compare
 ```
 
 | figure | question it answers |
