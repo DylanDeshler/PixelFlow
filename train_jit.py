@@ -30,7 +30,7 @@ import numpy as np
 import torch
 
 from data_jit import MemmapImages, EpochSampler, to_model_input
-from jit_common import build_denoiser, resolve_arch, run_dir, legacy_run_dir, ema_state_dicts, ema_weights, generate_and_score, save_labeled_grid
+from jit_common import build_denoiser, resolve_arch, describe_arch, run_dir, legacy_run_dir, ema_state_dicts, ema_weights, generate_and_score, save_labeled_grid
 from fid import InceptionMetrics, load_ref_stats, precision_recall
 from repa import FrozenEncoder, Projector, MaskedTransformerAdapter, BlockCapture, repa_loss, mta_loss
 from masking import TokenMasker, flow_loss
@@ -71,6 +71,7 @@ in_context_start = -1 # block where the in-context tokens are prepended
 mlp_ratio = -1.0
 attn_res = 'none' # 'full' | 'block': Attention Residuals (arXiv 2603.15031), softmax mixing over depth instead of the plain residual sum
 attn_res_block_size = 0 # block only: JiT blocks per AttnRes block; 0 -> about 8 blocks (the paper's default)
+adaln_single = False # adaLN-single (PixArt-alpha): one modulation projection shared by all blocks + a learned table per block (~40M fewer params on JiT-B)
 attn_dropout = 0.0
 proj_dropout = 0.0
 # flow matching
@@ -192,7 +193,8 @@ model_name, arch = resolve_arch(model, **{k: (None if v < 0 else v) for k, v in 
     depth=depth, hidden_size=hidden_size, num_heads=num_heads, patch_size=patch_size, bottleneck_dim=bottleneck_dim,
     in_context_len=in_context_len, in_context_start=in_context_start, mlp_ratio=mlp_ratio).items()},
     attn_res=None if attn_res == 'none' else attn_res,
-    attn_res_block_size=attn_res_block_size if (attn_res == 'block' and attn_res_block_size > 0) else None)
+    attn_res_block_size=attn_res_block_size if (attn_res == 'block' and attn_res_block_size > 0) else None,
+    adaln_single=adaln_single or None)
 if not out_dir:
     out_dir = run_dir(runs_root, dataset, model, arch, config, _defaults, run_name)
     legacy = legacy_run_dir(runs_root, dataset, model, arch, config, _defaults, run_name)
@@ -246,6 +248,7 @@ denoiser.ema_warmup = ema_warmup
 assert time_schedule in ('uniform', 'shift', 'train_quantile'), f'unknown time_schedule {time_schedule}'
 denoiser.time_schedule = time_schedule
 summary(denoiser)
+print(describe_arch(model, arch))
 print(f"model {model_name}: {sum(p.numel() for p in denoiser.net.parameters()) / 1e6:.1f}M params, "
       f"{(img_size // arch['patch_size']) ** 2} tokens of {arch['patch_size'] ** 2 * 3}-d patches")
 with open(os.path.join(out_dir, 'config.json'), 'w') as f:
@@ -295,12 +298,14 @@ def muon_split(name):
         return 3
     if name.endswith('mlp.w12.weight'):
         return 2
-    if name.endswith('adaLN_modulation.1.weight'):
+    if name.endswith('adaLN_modulation.1.weight') or name.endswith('t_block.1.weight'):
         return 6
     return 1
 
 muon_named = {id(p): (n, p) for n, p in denoiser.net.blocks.named_parameters()
               if optimizer_type == 'muon' and p.ndim >= 2 and p.requires_grad and (muon_adaln or 'adaLN_modulation' not in n)}
+if optimizer_type == 'muon' and muon_adaln and adaln_single: # the shared adaLN projection is the blocks' adaLN matrix
+    muon_named[id(denoiser.net.t_block[1].weight)] = ('t_block.1.weight', denoiser.net.t_block[1].weight)
 muon_params = {} # split -> params
 for name, p in trainable:
     if not p.requires_grad:
@@ -535,6 +540,10 @@ def evaluate(step):
     band_labels = [f'band{k}' for k in range(diag_freq_bands)]
     for k, bl in enumerate(band_labels):
         log[f'freq_err/{bl}'] = pv['freq_rel_err'][:, k].mean().item()
+        # at the cleanest noise level: model error relative to passing the input through / to the Wiener filter
+        # (> 1 = the model loses detail it was given)
+        log[f'freq_vs_copy/{bl}'] = (pv['freq_rel_err'][-1, k] / pv['freq_rel_err_copy'][-1, k]).item()
+        log[f'freq_vs_wiener/{bl}'] = (pv['freq_rel_err'][-1, k] / pv['freq_rel_err_wiener'][-1, k]).item()
     # 6. sample vs real spectrum, log10 ratio per band (0 = matches real images)
     spec_ratio = torch.log10(spectrum.result() / real_spectrum).cpu()
     for k, bl in enumerate(band_labels):
@@ -739,6 +748,7 @@ while True:
                 log["grad_norm/total"] = math.sqrt(sum(v ** 2 for v in grad_norms.values()))
                 log.update({f"grad_norm/{k}": v for k, v in grad_norms.items()})
                 log.update({f"update_ratio/{k}": update_norms[k] / (weight_norms[k] + 1e-12) for k in update_norms})
+                log.update({f"weight_norm/{k}": v for k, v in weight_norms.items()})
             wandb.log(log, step=iter_num)
         # same stats to a local file, for plot_trends.py (independent of wandb)
         record = {'iter': iter_num, 'epoch': iter_num / iters_per_epoch, 'images': iter_num * effective_batch_size,
@@ -750,6 +760,7 @@ while True:
         if log_opt:
             record['grad_norm'] = grad_norms
             record['update_ratio'] = {k: update_norms[k] / (weight_norms[k] + 1e-12) for k in update_norms}
+            record['weight_norm'] = weight_norms # the ratio's denominator: a large ratio can just mean small weights
         with open(os.path.join(out_dir, 'train_log.jsonl'), 'a') as f:
             f.write(json.dumps(record) + '\n')
     iter_num += 1

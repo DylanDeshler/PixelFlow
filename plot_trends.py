@@ -184,22 +184,37 @@ def fig_noise_levels(run, out):
     fig.tight_layout(rect=(0, 0, 1, 0.94))
     return save(fig, os.path.join(out, 'noise_levels.png'))
 
-def band_error(run, t_select):
+def band_error(run, t_select, key='freq_rel_err'):
     ts = np.array(run['diags'][-1]['t'])
     sel = t_select(ts)
-    return np.array([np.array(d['passes']['val']['freq_rel_err'])[sel].mean(0) for d in run['diags']]).T, ts[sel] # [band, eval]
+    return np.array([np.array(d['passes']['val'][key])[sel].mean(0) for d in run['diags']]).T, ts[sel] # [band, eval]
 
 def fig_detail(run, out):
     plt = setup()
     from matplotlib.colors import TwoSlopeNorm
-    fig, axes = plt.subplots(1, 3, figsize=(16, 4.8), facecolor=SURFACE)
+    fig, axes = plt.subplots(1, 4, figsize=(21, 4.8), facecolor=SURFACE)
     for ax, (name, sel) in zip(axes[:2], (('low noise', lambda ts: ts >= 0.8), ('high noise', lambda ts: ts <= 0.1))):
         err, tsel = band_error(run, sel)
         im = ax.imshow(err, aspect='auto', cmap='Blues', vmin=0, vmax=1)
         bands = [f'band {k}' for k in range(err.shape[0])]
         heatmap_style(ax, im, fig, eval_labels(run), bands, f'relative error by band, {name} (t={", ".join(f"{t:.2f}" for t in tsel)})', 'error / signal power')
         ax.set_xlabel(run['xlabel'], color=INK_2, fontsize=8)
+    # model vs passing the noisy input through, at low noise: red = worse than copying, i.e. detail it was given is lost
     ax = axes[2]
+    with_copy = [d for d in run['diags'] if 'freq_rel_err_copy' in d['passes']['val']]
+    if with_copy:
+        sub = dict(run, diags=with_copy, x=np.array([run['scale'](d['iter']) for d in with_copy]))
+        err, tsel = band_error(sub, lambda ts: ts >= 0.8)
+        copy, _ = band_error(sub, lambda ts: ts >= 0.8, 'freq_rel_err_copy')
+        ratio = np.log2(err / copy)
+        lim = max(1e-6, np.abs(ratio).max())
+        im = ax.imshow(ratio, aspect='auto', cmap='RdBu_r', norm=TwoSlopeNorm(0, -lim, lim))
+        heatmap_style(ax, im, fig, eval_labels(sub), [f'band {k}' for k in range(ratio.shape[0])],
+                      f'model vs copying the input, low noise (t={", ".join(f"{t:.2f}" for t in tsel)}; red = worse)', 'log2 error ratio')
+        ax.set_xlabel(run['xlabel'], color=INK_2, fontsize=8)
+    else:
+        note(ax, 'no copy baseline (diagnostics from before it existed)')
+    ax = axes[3]
     nb = sum(1 for k in run['diags'][-1]['scalars'] if k.startswith('spectrum_log_ratio/'))
     if nb:
         spec = np.array([[d['scalars'][f'spectrum_log_ratio/band{k}'] for d in run['diags']] for k in range(nb)])

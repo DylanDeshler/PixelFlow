@@ -90,7 +90,7 @@ def _attention(attn, x, rope, n_prefix, g, mask=None):
 
 def _block(block, x, c, rope, n_prefix, g, mask=None, res=None, index=None):
     # res: AttnResState for attention-residual models (x is then the depth-mixed attention input, see JiTBlock.forward_attn_res)
-    shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = block.adaLN_modulation(c).chunk(6, dim=-1)
+    shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = block.modulation(c)
     attn_out, stats = _attention(block.attn, modulate(block.norm1(x), shift_msa, scale_msa), rope, n_prefix, g, mask)
     if res is None:
         x = x + gate_msa.unsqueeze(1) * attn_out
@@ -116,6 +116,7 @@ def instrumented_forward(net, x, t, y, capture_blocks=(), tile=None):
     t_emb = net.t_embedder(t)
     y_emb = net.y_embedder(y)
     c = t_emb + y_emb
+    c_blocks = net.t_block(c) if getattr(net, 'adaln_single', False) else c
     h = net.x_embedder(x) + net.pos_embed
     stats = {k: [] for k in ('attn_entropy', 'attn_dist', 'attn_prefix_mass', 'gate_msa', 'gate_mlp')}
     feats = {}
@@ -130,14 +131,14 @@ def instrumented_forward(net, x, t, y, capture_blocks=(), tile=None):
                 h = res.mix(2 * i)
         n_prefix = net.in_context_len if (net.in_context_len > 0 and i >= net.in_context_start) else 0
         rope = net.feat_rope if i < net.in_context_start else net.feat_rope_incontext
-        h, block_stats = _block(block, h, c, rope, n_prefix, g, masks.get(n_prefix), res, i)
+        h, block_stats = _block(block, h, c_blocks, rope, n_prefix, g, masks.get(n_prefix), res, i)
         for k, v in block_stats.items():
             stats[k].append(v)
         if (i + 1) in capture_blocks:
             feats[i + 1] = h[:, n_prefix:]
     h = h[:, net.in_context_len:]
     fl = net.final_layer
-    shift, scale = fl.adaLN_modulation(c).chunk(2, dim=1)
+    shift, scale = fl.modulation(c)
     out = net.unpatchify(fl.linear(modulate(fl.norm_final(h), shift, scale)), net.patch_size)
     stats = {k: torch.stack(v) for k, v in stats.items()}
     return out, stats, feats
@@ -173,6 +174,11 @@ def noise_level_pass(net, x, y, ts, noise_scale, t_eps, ctx, masks, seed=0, chun
     """
     For each t in ts, noises the fixed batch x with fixed noise and records:
       v_loss (the training objective), x_mse, relative prediction error per frequency band,
+      the same band error for two estimates that need no learning, on the same images and noise:
+        copy    x_hat = z / t, i.e. pass the (rescaled) noisy input through: a model that can keep the input's detail
+                and edit it should never be worse than this at low noise
+        wiener  the optimal linear shift-invariant denoiser of z / t, using the batch's mean power spectrum (estimated on
+                the same images, so slightly optimistic)
       attention entropy / spatial distance / in-context mass and gate sizes per block (averaged over the batch).
     tile: run the windowed-attention ablation (tile_mask) instead of full attention; same images, noise and t.
     Returns dict of tensors with a leading len(ts) dimension.
@@ -180,9 +186,13 @@ def noise_level_pass(net, x, y, ts, noise_scale, t_eps, ctx, masks, seed=0, chun
     g = torch.Generator(device=x.device).manual_seed(seed)
     noise = torch.randn(x.shape, generator=g, device=x.device) * noise_scale
     out = defaultdict(list)
+    spectrum = torch.fft.fft2(x.float()).abs().pow(2).mean(dim=(0, 1)) # mean signal power per frequency
     for t_val in ts.tolist():
         acc = defaultdict(float)
-        err_power, x_power = 0, 0
+        err_power, x_power, copy_power, wiener_power = 0, 0, 0, 0
+        # noise power per frequency in z / t (unnormalized FFT of white noise: H * W * variance), and the Wiener gain
+        noise_power = ((1 - t_val) / t_val) ** 2 * noise_scale ** 2 * x.shape[-2] * x.shape[-1]
+        gain = spectrum / (spectrum + noise_power)
         for i in range(0, len(x), chunk):
             xb, yb, eb = x[i:i + chunk], y[i:i + chunk], noise[i:i + chunk]
             t = torch.full((len(xb),), t_val, device=x.device)
@@ -200,9 +210,15 @@ def noise_level_pass(net, x, y, ts, noise_scale, t_eps, ctx, masks, seed=0, chun
                 acc[k] = acc[k] + s.float() * w
             err_power = err_power + band_power(x_pred - xb, masks)
             x_power = x_power + band_power(xb, masks)
+            copy = z.float() / t_val
+            copy_power = copy_power + band_power(copy - xb, masks)
+            wiener = torch.fft.ifft2(torch.fft.fft2(copy) * gain).real
+            wiener_power = wiener_power + band_power(wiener - xb, masks)
         for k, val in acc.items():
             out[k].append(torch.as_tensor(val, device='cpu', dtype=torch.float32))
         out['freq_rel_err'].append((err_power / x_power).cpu())
+        out['freq_rel_err_copy'].append((copy_power / x_power).cpu())
+        out['freq_rel_err_wiener'].append((wiener_power / x_power).cpu())
     return {k: torch.stack(v) for k, v in out.items()}
 
 # -----------------------------------------------------------------------------
@@ -305,8 +321,8 @@ def param_group(name):
     if parts[0] == 'net':
         parts = parts[1:]
     if parts[0] == 'blocks':
-        sub = parts[2] if parts[2] in ('attn', 'mlp', 'adaLN_modulation') else 'norm'
-        return f"blocks.{int(parts[1]):02d}.{sub.replace('_modulation', '')}"
+        sub = 'adaLN' if parts[2] in ('adaLN_modulation', 'scale_shift_table') else parts[2] if parts[2] in ('attn', 'mlp') else 'norm'
+        return f"blocks.{int(parts[1]):02d}.{sub}"
     return parts[0]
 
 def grouped_norms(named_tensors):

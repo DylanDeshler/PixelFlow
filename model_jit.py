@@ -1,6 +1,7 @@
 # Vendored from https://github.com/LTH14/JiT (commit cbc743a, MIT license, see LICENSE_JiT).
 # Local changes: attn_bias is created on query.device instead of via .cuda(), so the model runs on any device;
-# optional Attention Residuals (attn_res, see AttnResState), off by default, in which case the model is unchanged.
+# optional Attention Residuals (attn_res, see AttnResState) and adaLN-single (adaln_single), both off by default, in
+# which case the model is unchanged.
 # --------------------------------------------------------
 # References:
 # SiT: https://github.com/willisma/SiT
@@ -166,25 +167,35 @@ class FinalLayer(nn.Module):
     """
     The final layer of JiT.
     """
-    def __init__(self, hidden_size, patch_size, out_channels):
+    def __init__(self, hidden_size, patch_size, out_channels, adaln_single=False):
         super().__init__()
         self.norm_final = RMSNorm(hidden_size)
         self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 2 * hidden_size, bias=True)
-        )
+        self.adaln_single = adaln_single
+        if adaln_single:
+            # PixArt-alpha's final layer: a learned table plus the conditioning itself, no projection
+            self.scale_shift_table = nn.Parameter(torch.randn(2, hidden_size) / hidden_size ** 0.5)
+        else:
+            self.adaLN_modulation = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(hidden_size, 2 * hidden_size, bias=True)
+            )
+
+    def modulation(self, c):
+        if self.adaln_single:
+            return (self.scale_shift_table[None] + F.silu(c)[:, None]).unbind(1)
+        return self.adaLN_modulation(c).chunk(2, dim=1)
 
     @torch.compile
     def forward(self, x, c):
-        shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
+        shift, scale = self.modulation(c)
         x = modulate(self.norm_final(x), shift, scale)
         x = self.linear(x)
         return x
 
 
 class JiTBlock(nn.Module):
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0, adaln_single=False):
         super().__init__()
         self.norm1 = RMSNorm(hidden_size, eps=1e-6)
         self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=True,
@@ -192,10 +203,25 @@ class JiTBlock(nn.Module):
         self.norm2 = RMSNorm(hidden_size, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         self.mlp = SwiGLUFFN(hidden_size, mlp_hidden_dim, drop=proj_drop)
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 6 * hidden_size, bias=True)
-        )
+        self.adaln_single = adaln_single
+        if adaln_single:
+            # adaLN-single (PixArt-alpha): the 6 modulation vectors come from one projection shared by all blocks
+            # (JiT.t_block), plus this block's learned table
+            self.scale_shift_table = nn.Parameter(torch.randn(6, hidden_size) / hidden_size ** 0.5)
+        else:
+            self.adaLN_modulation = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+            )
+
+    def modulation(self, c):
+        """
+        (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp), each [N, hidden]. c is the conditioning
+        vector [N, hidden], or with adaln_single the shared projection of it [N, 6 * hidden].
+        """
+        if self.adaln_single:
+            return (self.scale_shift_table[None] + c.view(c.shape[0], 6, -1)).unbind(1)
+        return self.adaLN_modulation(c).chunk(6, dim=-1)
 
     def forward(self, x, c, feat_rope=None, res=None, index=None):
         if res is None:
@@ -204,19 +230,19 @@ class JiTBlock(nn.Module):
 
     @torch.compile
     def forward_residual(self, x,  c, feat_rope=None):
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.modulation(c)
         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), rope=feat_rope)
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
     @torch.compile
     def attn_branch(self, x, c, feat_rope=None):
-        shift_msa, scale_msa, gate_msa = self.adaLN_modulation(c).chunk(6, dim=-1)[:3]
+        shift_msa, scale_msa, gate_msa = self.modulation(c)[:3]
         return gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), rope=feat_rope)
 
     @torch.compile
     def mlp_branch(self, x, c):
-        shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)[3:]
+        shift_mlp, scale_mlp, gate_mlp = self.modulation(c)[3:]
         return gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
 
     def forward_attn_res(self, x, c, feat_rope, res, index):
@@ -340,7 +366,8 @@ class JiT(nn.Module):
         in_context_len=32,
         in_context_start=8,
         attn_res='none',
-        attn_res_block_size=0
+        attn_res_block_size=0,
+        adaln_single=False
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -356,10 +383,14 @@ class JiT(nn.Module):
         self.attn_res = attn_res
         # JiT blocks per Block AttnRes block; 0 -> about 8 blocks, the paper's default
         self.attn_res_block_size = attn_res_block_size or max(1, round(depth / 8))
+        self.adaln_single = adaln_single
 
         # time and class embed
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = LabelEmbedder(num_classes, hidden_size)
+        if adaln_single:
+            # one modulation projection shared by every block (PixArt-alpha's t_block), instead of one per block
+            self.t_block = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size, bias=True))
 
         # linear embed
         self.x_embedder = BottleneckPatchEmbed(input_size, patch_size, in_channels, bottleneck_dim, hidden_size, bias=True)
@@ -391,12 +422,12 @@ class JiT(nn.Module):
         self.blocks = nn.ModuleList([
             JiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio,
                      attn_drop=attn_drop if (depth // 4 * 3 > i >= depth // 4) else 0.0,
-                     proj_drop=proj_drop if (depth // 4 * 3 > i >= depth // 4) else 0.0)
+                     proj_drop=proj_drop if (depth // 4 * 3 > i >= depth // 4) else 0.0, adaln_single=adaln_single)
             for i in range(depth)
         ])
 
         # linear predict
-        self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
+        self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels, adaln_single=adaln_single)
 
         # attention residuals: a zero-initialized pseudo-query and a key RMSNorm per sublayer (2 per block) and the final layer
         if self.attn_res != 'none':
@@ -431,14 +462,24 @@ class JiT(nn.Module):
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
-        # Zero-out adaLN modulation layers:
-        for block in self.blocks:
-            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+        if self.adaln_single:
+            # PixArt-alpha's init: the shared projection starts at zero, so modulation starts at the (random) per-block
+            # tables; blocks start as identities through zero-initialized attention / MLP output projections instead of
+            # zero gates (JiT's adaLN-Zero)
+            nn.init.constant_(self.t_block[-1].weight, 0)
+            nn.init.constant_(self.t_block[-1].bias, 0)
+            for block in self.blocks:
+                nn.init.constant_(block.attn.proj.weight, 0)
+                nn.init.constant_(block.mlp.w3.weight, 0)
+        else:
+            # Zero-out adaLN modulation layers:
+            for block in self.blocks:
+                nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+                nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
 
-        # Zero-out output layers:
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+            # Zero-out output layers:
+            nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
 
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
@@ -467,6 +508,7 @@ class JiT(nn.Module):
         t_emb = self.t_embedder(t)
         y_emb = self.y_embedder(y)
         c = t_emb + y_emb
+        c_blocks = self.t_block(c) if self.adaln_single else c
 
         # forward JiT
         x = self.x_embedder(x)
@@ -483,7 +525,7 @@ class JiT(nn.Module):
                 else:
                     res.prepend(in_context_tokens)
                     x = res.mix(2 * i)
-            x = block(x, c, self.feat_rope if i < self.in_context_start else self.feat_rope_incontext, res=res, index=i)
+            x = block(x, c_blocks, self.feat_rope if i < self.in_context_start else self.feat_rope_incontext, res=res, index=i)
 
         x = x[:, self.in_context_len:]
 

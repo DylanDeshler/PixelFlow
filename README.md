@@ -181,6 +181,15 @@ denoiser. In-context class tokens are added to the embedding source, and the oth
 The architecture is stored in the checkpoint, so `eval_jit.py` and `eval_linear.py` rebuild it. Block hooks (REPA,
 probes) see each block's output as the input the next block actually receives.
 
+## adaLN-single
+
+`--adaln_single=True` swaps JiT's per-block adaLN projections for PixArt-alpha's adaLN-single. One projection of
+the conditioning vector is shared by all blocks, and each block adds its own learned 6 x hidden table. The final layer
+uses a table plus the conditioning itself. JiT-B/16 goes from 131M to 91M parameters. Initialization follows PixArt:
+the shared projection starts at zero, and blocks start as identities through zero-initialized attention / MLP output
+projections, since the gates now start at the random tables rather than at zero. With Muon, the shared projection is
+orthogonalized per component, like the per-block adaLN matrices.
+
 ## Token masking
 
 `--mask_ratio=0.5` replaces half the patch tokens of a masked sample with a learned mask token (after the patch embedding, so
@@ -230,7 +239,7 @@ and `{out_dir}/diagnostics/diag_{iter}.json`:
 | 4 | grad norms, update/weight ratio per block (every `log_interval`), adaLN gates, attention entropy | `grad_norm/*`, `update_ratio/*`, `gate_*/*`, `attn_entropy/*` | blocks that barely update or are gated off; collapsed or uniform attention |
 | 4b | locality: mean attention distance of patch queries (relative to uniform attention) and attention mass on the in-context class tokens, per block; windowed-attention ablation: held-out loss increase when attention is confined to non-overlapping k x k patch tiles in every layer (`diag_window_tiles`, default 1,2,4) | `attn_dist/*`, `attn_prefix_mass/*`, `window_loss_increase/*`, heatmaps | an increase near 0 at high noise (small t) means the model isn't using context beyond the tile where global structure is decided |
 | 5 | k-NN + linear probe of mean-pooled tokens (blocks at 1/3, 2/3 and the end of the model, t=1, 0.75, 0.5, null label) | `probe/*` | whether / when semantic features emerge, and whether FID gains follow them |
-| 6 | relative error per frequency band and noise level; sample vs real spectrum | `freq_err/*`, `spectrum_log_ratio/*`, heatmaps | capacity spent on (or missing) high frequencies |
+| 6 | relative error per frequency band and noise level; sample vs real spectrum | `freq_err/*`, `spectrum_log_ratio/*`, heatmaps | capacity spent on (or missing) high frequencies; vs copying the input (`z / t`) and a Wiener filter on the same images and noise (`freq_vs_copy/*`, `freq_vs_wiener/*` at the cleanest t, model-vs-copy panel in `detail.png`): above 1 at low noise = detail it was given is lost |
 | 7 | memorization: nearest-training-image distance of samples vs held-out images | `mem/nn_ratio`, `mem/near_dup_rate` | ratio < 1 or near-dup rate well above 1%: samples copy training images |
 
 In the windowed ablation the in-context class tokens may only attend to each other, so they can't relay image content between
