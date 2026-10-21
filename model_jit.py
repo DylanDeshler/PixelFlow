@@ -1,7 +1,8 @@
 # Vendored from https://github.com/LTH14/JiT (commit cbc743a, MIT license, see LICENSE_JiT).
 # Local changes: attn_bias is created on query.device instead of via .cuda(), so the model runs on any device;
-# optional Attention Residuals (attn_res, see AttnResState), adaLN-single (adaln_single) and a gated bottleneck
-# (gated_bottleneck, see GatedBottleneckPatchEmbed), all off by default, in which case the model is unchanged.
+# optional Attention Residuals (attn_res, see AttnResState), adaLN-single (adaln_single), a gated bottleneck
+# (gated_bottleneck, see GatedBottleneckPatchEmbed) and a skip pathway (skip_pathway, see SkipEmbed), all off by
+# default, in which case the model is unchanged.
 # --------------------------------------------------------
 # References:
 # SiT: https://github.com/willisma/SiT
@@ -62,6 +63,29 @@ class GatedBottleneckPatchEmbed(BottleneckPatchEmbed):
         if gate is None:
             return out
         return out + gate.unsqueeze(1) * self.bypass_tokens(x)
+
+
+class SkipEmbed(nn.Module):
+    """
+    Skip pathway: a full-rank patch embedding of the noisy input that bypasses the trunk entirely and is added, behind
+    a gate from the conditioning (JiT.skip_gate, zero-initialized), to the trunk's output just before the final layer
+    (and the optional skip_head blocks). The trunk only ever sees the bottlenecked embedding, at every noise level, so
+    it can't solve low-noise steps by editing the input locally; the input's fine detail is available only at the
+    output stage. A separate module so token masking can blank masked patches here too (masking.TokenMasker).
+    """
+    def __init__(self, patch_size, in_chans, embed_dim):
+        super().__init__()
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size, bias=False)
+
+    def forward(self, x):
+        return self.proj(x).flatten(2).transpose(1, 2)
+
+
+def resolve_skip_inject(skip_inject_block, depth):
+    # skip_inject_block: 0 -> after the last block, k > 0 -> after block k, -k -> before the last k blocks
+    after = depth if skip_inject_block == 0 else (depth + skip_inject_block if skip_inject_block < 0 else skip_inject_block)
+    assert 1 <= after <= depth, f'skip_inject_block {skip_inject_block} is outside the {depth}-block trunk'
+    return after
 
 
 class TimestepEmbedder(nn.Module):
@@ -211,7 +235,7 @@ class FinalLayer(nn.Module):
 
     @torch.compile
     def forward(self, x, c):
-        shift, scale = self.modulation(c)
+        shift, scale = (m.to(x.dtype) for m in self.modulation(c)) # adaln_single's fp32 table would promote x otherwise
         x = modulate(self.norm_final(x), shift, scale)
         x = self.linear(x)
         return x
@@ -243,7 +267,9 @@ class JiTBlock(nn.Module):
         vector [N, hidden], or with adaln_single the shared projection of it [N, 6 * hidden].
         """
         if self.adaln_single:
-            return (self.scale_shift_table[None] + c.view(c.shape[0], 6, -1)).unbind(1)
+            # back to c's dtype (bf16 under autocast, like a Linear's output): the fp32 table would otherwise promote the
+            # modulation, and with it every gated branch output / AttnRes source, to fp32
+            return (self.scale_shift_table[None] + c.view(c.shape[0], 6, -1)).to(c.dtype).unbind(1)
         return self.adaLN_modulation(c).chunk(6, dim=-1)
 
     def forward(self, x, c, feat_rope=None, res=None, index=None):
@@ -407,7 +433,10 @@ class JiT(nn.Module):
         attn_res_block_size=0,
         adaln_single=False,
         attn_res_adaln=False,
-        gated_bottleneck=False
+        gated_bottleneck=False,
+        skip_pathway=False,
+        skip_head_blocks=0,
+        skip_inject_block=0
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -427,6 +456,11 @@ class JiT(nn.Module):
         assert not attn_res_adaln or attn_res != 'none', 'attn_res_adaln needs attn_res'
         self.attn_res_adaln = attn_res_adaln
         self.gated_bottleneck = gated_bottleneck
+        assert skip_head_blocks == 0 or skip_pathway, 'skip_head_blocks needs skip_pathway'
+        self.skip_pathway = skip_pathway
+        # where the skip enters: after block skip_inject_after (1-indexed); 0 -> after the last block, -k -> before the last k
+        self.skip_inject_after = resolve_skip_inject(skip_inject_block, depth)
+        assert skip_inject_block == 0 or skip_pathway, 'skip_inject_block needs skip_pathway'
 
         # time and class embed
         self.t_embedder = TimestepEmbedder(hidden_size)
@@ -473,6 +507,13 @@ class JiT(nn.Module):
             for i in range(depth)
         ])
 
+        # skip pathway: full-rank input patches merged into the trunk's output (gated), then optional head blocks
+        if skip_pathway:
+            self.skip_embedder = SkipEmbed(patch_size, in_channels, hidden_size)
+            self.skip_gate = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, hidden_size, bias=True))
+            self.skip_head = nn.ModuleList([JiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, adaln_single=adaln_single)
+                                            for _ in range(skip_head_blocks)])
+
         # linear predict
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels, adaln_single=adaln_single)
 
@@ -517,6 +558,11 @@ class JiT(nn.Module):
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
+        if self.skip_pathway: # the skip embedding like the patch embedding; its gate starts closed (= no skip)
+            w = self.skip_embedder.proj.weight.data
+            nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+            nn.init.constant_(self.skip_gate[-1].weight, 0)
+            nn.init.constant_(self.skip_gate[-1].bias, 0)
         if self.attn_res_adaln: # starts as plain AttnRes
             nn.init.constant_(self.attn_res_modulation[-1].weight, 0)
             nn.init.constant_(self.attn_res_modulation[-1].bias, 0)
@@ -526,12 +572,12 @@ class JiT(nn.Module):
             # zero gates (JiT's adaLN-Zero)
             nn.init.constant_(self.t_block[-1].weight, 0)
             nn.init.constant_(self.t_block[-1].bias, 0)
-            for block in self.blocks:
+            for block in self.all_blocks():
                 nn.init.constant_(block.attn.proj.weight, 0)
                 nn.init.constant_(block.mlp.w3.weight, 0)
         else:
             # Zero-out adaLN modulation layers:
-            for block in self.blocks:
+            for block in self.all_blocks():
                 nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
                 nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
 
@@ -541,6 +587,30 @@ class JiT(nn.Module):
 
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
+
+    def inject_skip(self, x, gated, res, i):
+        """
+        Mid-trunk skip injection after block i (0-indexed), returning the next block's input. Without AttnRes the gated
+        skip is added to the residual stream. With AttnRes it's added into block i's output source (the running block
+        sum for Block AttnRes), the AttnRes form of a residual add: later sublayers and the final layer reach it through
+        that source. (A separate source would not be a no-op with the gate shut: a zero source still takes softmax weight
+        and dilutes the others.) In-context class tokens, if present at this depth, get zeros.
+        """
+        n_prefix = x.shape[1] - gated.shape[1]
+        if n_prefix:
+            gated = torch.cat([gated.new_zeros(gated.shape[0], n_prefix, gated.shape[2]), gated], dim=1)
+        if res is None:
+            return x + gated
+        if res.partial is not None:
+            res.partial = res.partial + gated
+        else:
+            res.sources[-1] = res.sources[-1] + gated
+            res.logits[-1] = res._logits(res.sources[-1], res.keys)
+        return res.mix(2 * (i + 1))
+
+    def all_blocks(self):
+        # the trunk's blocks plus the skip pathway's head blocks (for initialization)
+        return list(self.blocks) + (list(self.skip_head) if self.skip_pathway else [])
 
     def unpatchify(self, x, p):
         """
@@ -569,6 +639,7 @@ class JiT(nn.Module):
         c_blocks = self.t_block(c) if self.adaln_single else c
 
         # forward JiT
+        skip = self.skip_embedder(x) if self.skip_pathway else None # from the noisy input, before x is reused
         x = self.x_embedder(x, self.bottleneck_gate(c)) if self.gated_bottleneck else self.x_embedder(x)
         x += self.pos_embed
 
@@ -584,8 +655,15 @@ class JiT(nn.Module):
                     res.prepend(in_context_tokens)
                     x = res.mix(2 * i)
             x = block(x, c_blocks, self.feat_rope if i < self.in_context_start else self.feat_rope_incontext, res=res, index=i)
+            if self.skip_pathway and i + 1 == self.skip_inject_after < len(self.blocks):
+                x = self.inject_skip(x, self.skip_gate(c).unsqueeze(1) * skip, res, i)
 
         x = x[:, self.in_context_len:]
+        if self.skip_pathway:
+            if self.skip_inject_after == len(self.blocks): # after the trunk: added to its output directly
+                x = x + self.skip_gate(c).unsqueeze(1) * skip
+            for block in self.skip_head:
+                x = block(x, c_blocks, self.feat_rope)
 
         x = self.final_layer(x, c)
         output = self.unpatchify(x, self.patch_size)

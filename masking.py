@@ -27,11 +27,18 @@ class TokenMasker(nn.Module):
         self.num_patches = net.x_embedder.num_patches
         self.mask = None # [B, N] bool while active, else None
         net.x_embedder.register_forward_hook(self._hook)
+        if getattr(net, 'skip_pathway', False): # masked patches must not reach the output through the skip pathway
+            net.skip_embedder.register_forward_hook(self._skip_hook)
 
     def _hook(self, module, inputs, output):
         if self.mask is None:
             return output
         return torch.where(self.mask.unsqueeze(-1), self.mask_token.to(output.dtype), output)
+
+    def _skip_hook(self, module, inputs, output):
+        if self.mask is None:
+            return output
+        return output.masked_fill(self.mask.unsqueeze(-1), 0)
 
     def sample(self, batch_size, ratio, prob, device):
         """

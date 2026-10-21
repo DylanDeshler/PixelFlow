@@ -17,6 +17,7 @@ Figures:
     semantics_locality.png  probe accuracy per block, windowed-attention loss increase, attention distance
     optimization.png        loss, gradient norm, update/weight ratio per parameter group, lr
     attn_res.png            AttnRes: the final layer's mixing weight on the patch embedding per noise level, and over sources (attn_res runs only)
+    skip_pathway.png        how far the skip pathway's gate is open, per noise level (skip_pathway runs only)
     gated_bottleneck.png    how far the gated full-rank patch path is open, per noise level (gated_bottleneck runs only)
     compare.png / .csv      key curves and latest values across runs
 """
@@ -260,31 +261,37 @@ def fig_attn_res(run, out):
     fig.tight_layout(rect=(0, 0, 1, 0.93))
     return save(fig, os.path.join(out, 'attn_res.png'))
 
-def fig_gated_bottleneck(run, out):
-    # RMS of the gated full-rank patch embedding relative to the bottleneck path, per noise level (0 = gate shut)
-    diags = [d for d in run['diags'] if 'bypass_ratio' in d['passes']['val']]
+def fig_gate(run, out, key, name, title, ratio_label):
+    # how far a gated path is open per noise level over training: RMS of the gated term relative to what it's added to
+    diags = [d for d in run['diags'] if key in d['passes']['val']]
     if not diags:
         return None
     plt = setup()
     ts = diags[-1]['t']
-    ratio = np.array([np.array(d['passes']['val']['bypass_ratio'])[:, 0] for d in diags]).T # [t, eval]
+    ratio = np.array([np.array(d['passes']['val'][key])[:, 0] for d in diags]).T # [t, eval]
     sub = dict(run, diags=diags, x=np.array([run['scale'](d['iter']) for d in diags]))
     fig, axes = plt.subplots(1, 2, figsize=(13, 4.8), facecolor=SURFACE, gridspec_kw={'width_ratios': [1.3, 1]})
     ax = axes[0]
     im = ax.imshow(ratio, aspect='auto', cmap='Blues', vmin=0, vmax=max(1e-6, ratio.max()))
-    heatmap_style(ax, im, fig, eval_labels(sub), tlabels(ts), 'full-rank path / bottleneck path (RMS), by noise level', 'ratio')
+    heatmap_style(ax, im, fig, eval_labels(sub), tlabels(ts), f'{ratio_label} (RMS), by noise level', 'ratio')
     ax.set_xlabel(run['xlabel'], color=INK_2, fontsize=8)
     ax = axes[1]
     picks = sorted({0, len(diags) // 2, len(diags) - 1})
     for color, i in zip(ordinal_blues(len(picks)), picks):
         line(ax, ts, ratio[:, i], color, label=f"iter {diags[i]['iter']:,}")
     ax.set_xlabel('t (1 = clean)', color=INK_2, fontsize=8)
-    ax.set_ylabel('full-rank / bottleneck (RMS)', color=INK_2, fontsize=8)
+    ax.set_ylabel(f'{ratio_label} (RMS)', color=INK_2, fontsize=8)
     ax.legend(frameon=False, fontsize=8)
     ax.set_title('gate opening vs noise level', color=INK, fontsize=9, loc='left')
-    fig.suptitle(f"{run['name']}: gated bottleneck", color=INK, fontsize=11, x=0.01, ha='left')
+    fig.suptitle(f"{run['name']}: {title}", color=INK, fontsize=11, x=0.01, ha='left')
     fig.tight_layout(rect=(0, 0, 1, 0.93))
-    return save(fig, os.path.join(out, 'gated_bottleneck.png'))
+    return save(fig, os.path.join(out, f'{name}.png'))
+
+def fig_gated_bottleneck(run, out):
+    return fig_gate(run, out, 'bypass_ratio', 'gated_bottleneck', 'gated bottleneck', 'full-rank path / bottleneck path')
+
+def fig_skip_pathway(run, out):
+    return fig_gate(run, out, 'skip_ratio', 'skip_pathway', 'skip pathway', 'gated input patches / trunk output')
 
 def fig_semantics_locality(run, out):
     plt = setup()
@@ -435,7 +442,7 @@ def make_run_figures(run_dir):
     figures = {}
     for name, fn in (('convergence', fig_convergence), ('noise_levels', fig_noise_levels), ('detail', fig_detail),
                      ('semantics_locality', fig_semantics_locality), ('optimization', fig_optimization),
-                     ('attn_res', fig_attn_res), ('gated_bottleneck', fig_gated_bottleneck)):
+                     ('attn_res', fig_attn_res), ('gated_bottleneck', fig_gated_bottleneck), ('skip_pathway', fig_skip_pathway)):
         path = fn(run, out)
         if path:
             figures[name] = path

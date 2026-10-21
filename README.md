@@ -205,6 +205,23 @@ loss, but costs FID and mid/deep probe accuracy. Token masking replaces the whol
 diagnostics log the gated path's RMS relative to the bottleneck path per noise level (`bypass_ratio/t*`), plotted
 in `trends/gated_bottleneck.png`.
 
+## Skip pathway
+
+`--skip_pathway=True` adds a full-rank patch embedding of the noisy input that skips the trunk. It is added, behind
+a zero-initialized adaLN-style gate from the conditioning, to the trunk's output just before the final layer:
+`h_out = h + gate(c) * skip(patch(z))`, then `--skip_head_blocks=N` optional JiT blocks (default 0), then the final
+layer. It starts as exactly the model without it. The difference from `--gated_bottleneck`: the trunk only ever sees the
+bottlenecked embedding, at every noise level, so it can't solve low-noise steps by editing the input locally (what
+cost the no-bottleneck run its mid / deep-block semantics). The input's detail reaches only the output stage. With 0
+head blocks, the merge is linear (a learned per-patch filter of the input plus the trunk's prediction); head blocks let
+attention combine detail with trunk features. `--skip_inject_block` sets where the skip enters: 0 = after the trunk (default), -k = before the last k blocks
+(-1 = after block 11 of 12), k = after block k. Mid-trunk, it repurposes the last blocks as a detail-aware head at
+no extra parameters. The probe peak sits around two-thirds depth, and later blocks act more like a decoder. Without
+AttnRes it is added to the residual stream. With AttnRes it is added into that block's output source (the AttnRes
+form of a residual add). A separate source would dilute the other sources' softmax weight even with the gate shut.
+Every variant starts as exactly the model without the skip. Token masking zeroes masked patches in the skip as well. Diagnostics log
+the gated skip's RMS relative to the trunk output per noise level (`skip_ratio/t*`, `trends/skip_pathway.png`).
+
 ## adaLN-single
 
 `--adaln_single=True` swaps JiT's per-block adaLN projections for PixArt-alpha's adaLN-single. One projection of

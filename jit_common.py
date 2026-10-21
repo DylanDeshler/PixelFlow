@@ -48,15 +48,20 @@ def describe_arch(model, arch):
     One line with every architecture field as actually built, marking the ones that differ from the preset, e.g.
     'arch: depth 12, hidden_size 768, ..., in_context_len 0* (preset 32), ... (preset JiT-B/16, * = overridden)'.
     """
-    preset = dict(JIT_PRESETS[model], mlp_ratio=4.0, attn_res='none', attn_res_block_size=0, attn_res_adaln=False, adaln_single=False, gated_bottleneck=False)
+    preset = dict(JIT_PRESETS[model], mlp_ratio=4.0, attn_res='none', attn_res_block_size=0, attn_res_adaln=False, adaln_single=False, gated_bottleneck=False,
+                  skip_pathway=False, skip_head_blocks=0, skip_inject_block=0)
     full = dict(preset, **arch)
     parts = []
-    for k in ('depth', 'hidden_size', 'num_heads', 'patch_size', 'bottleneck_dim', 'gated_bottleneck', 'mlp_ratio', 'in_context_len', 'in_context_start',
+    for k in ('depth', 'hidden_size', 'num_heads', 'patch_size', 'bottleneck_dim', 'gated_bottleneck', 'skip_pathway', 'skip_head_blocks', 'skip_inject_block', 'mlp_ratio', 'in_context_len', 'in_context_start',
               'attn_res', 'attn_res_block_size', 'attn_res_adaln', 'adaln_single'):
         v = full[k]
         if k == 'in_context_start' and full['in_context_len'] == 0:
             continue # unused without in-context tokens
-        if (k == 'attn_res_block_size' and full['attn_res'] != 'block') or (k == 'attn_res_adaln' and full['attn_res'] == 'none'):
+        if (k == 'attn_res_block_size' and full['attn_res'] != 'block') or (k == 'attn_res_adaln' and full['attn_res'] == 'none') \
+                or (k in ('skip_head_blocks', 'skip_inject_block') and not full['skip_pathway']):
+            continue
+        if k == 'skip_inject_block': # resolved as in model_jit.JiT
+            parts.append(f"{k} {v}{'*' if v else ''} (after block {model_jit.resolve_skip_inject(v, full['depth'])} of {full['depth']})")
             continue
         if k == 'attn_res_block_size' and v == 0: # resolved as in model_jit.JiT
             parts.append(f"{k} {max(1, round(full['depth'] / 8))} (auto)")
@@ -269,6 +274,7 @@ _NAME_TOKENS = {
     'beta1': 'beta1-', 'beta2': 'beta2-', 'grad_clip': 'clip', 'ema_decay1': 'ema', 'ema_decay2': 'ema2-', 'ema_warmup': 'emawarmup',
     'attn_dropout': 'attndrop', 'proj_dropout': 'projdrop', 'attn_res': 'attnres-', 'attn_res_block_size': 'attnresbs',
     'adaln_single': 'adalnsingle', 'attn_res_adaln': 'attnresadaln', 'gated_bottleneck': 'gatedbn',
+    'skip_pathway': 'skip', 'skip_head_blocks': 'skiphead', 'skip_inject_block': 'skipat',
     'repa_encoder': 'repa-', 'repa_adapter': 'adapter-', 'repa_depth': 'repadepth', 'repa_coeff': 'repacoeff', 'repa_proj_dim': 'repaproj',
     'repa_mask_ratio': 'repamask', 'repa_adapter_depth': 'adapterdepth',
     'mask_ratio': 'mask', 'mask_prob': 'maskprob', 'mask_weighting': 'maskweight-',

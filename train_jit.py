@@ -71,6 +71,9 @@ in_context_start = -1 # block where the in-context tokens are prepended
 mlp_ratio = -1.0
 attn_res = 'none' # 'full' | 'block': Attention Residuals (arXiv 2603.15031), softmax mixing over depth instead of the plain residual sum
 attn_res_block_size = 0 # block only: JiT blocks per AttnRes block; 0 -> about 8 blocks (the paper's default)
+skip_pathway = False # full-rank input patches merged into the trunk's output before the final layer, behind a gate from the conditioning (zero-init)
+skip_head_blocks = 0 # skip_pathway only: JiT blocks after the merge, so input detail can be combined with trunk features
+skip_inject_block = 0 # skip_pathway only: 0 -> after the trunk; -k -> before the last k blocks; k -> after block k
 gated_bottleneck = False # add a full-rank patch embedding behind a gate from the conditioning (zero-init: starts as the bottleneck)
 attn_res_adaln = False # adaLN on the AttnRes queries from the conditioning (time + class), one shared projection (~1.2M params on JiT-B)
 adaln_single = False # adaLN-single (PixArt-alpha): one modulation projection shared by all blocks + a learned table per block (~40M fewer params on JiT-B)
@@ -196,7 +199,8 @@ model_name, arch = resolve_arch(model, **{k: (None if v < 0 else v) for k, v in 
     in_context_len=in_context_len, in_context_start=in_context_start, mlp_ratio=mlp_ratio).items()},
     attn_res=None if attn_res == 'none' else attn_res,
     attn_res_block_size=attn_res_block_size if (attn_res == 'block' and attn_res_block_size > 0) else None,
-    adaln_single=adaln_single or None, attn_res_adaln=attn_res_adaln or None, gated_bottleneck=gated_bottleneck or None)
+    adaln_single=adaln_single or None, attn_res_adaln=attn_res_adaln or None, gated_bottleneck=gated_bottleneck or None,
+    skip_pathway=skip_pathway or None, skip_head_blocks=skip_head_blocks or None, skip_inject_block=skip_inject_block or None)
 if not out_dir:
     out_dir = run_dir(runs_root, dataset, model, arch, config, _defaults, run_name)
     legacy = legacy_run_dir(runs_root, dataset, model, arch, config, _defaults, run_name)
@@ -310,6 +314,11 @@ def muon_split(name):
 muon_named = {id(p): (n, p) for n, p in denoiser.net.blocks.named_parameters()
               if optimizer_type == 'muon' and p.ndim >= 2 and p.requires_grad and (muon_adaln or 'adaLN_modulation' not in n)
               and 'scale_shift_table' not in n}
+if optimizer_type == 'muon' and skip_pathway: # the head blocks' hidden matrices, like the trunk's; the gate like adaLN
+    muon_named.update({id(p): ('skip_head.' + n, p) for n, p in denoiser.net.skip_head.named_parameters()
+                       if p.ndim >= 2 and p.requires_grad and (muon_adaln or 'adaLN_modulation' not in n) and 'scale_shift_table' not in n})
+    if muon_adaln:
+        muon_named[id(denoiser.net.skip_gate[1].weight)] = ('skip_gate.1.weight', denoiser.net.skip_gate[1].weight)
 if optimizer_type == 'muon' and muon_adaln and adaln_single: # the shared adaLN projection is the blocks' adaLN matrix
     muon_named[id(denoiser.net.t_block[1].weight)] = ('t_block.1.weight', denoiser.net.t_block[1].weight)
 if optimizer_type == 'muon' and muon_adaln and gated_bottleneck: # an adaLN-style gate projection
@@ -556,6 +565,9 @@ def evaluate(step):
         rows, cols = diag_lib.attn_res_labels(arch['depth'], alpha.shape[2])
         images['attn_res_alpha'] = diag_lib.attn_res_figure(alpha.numpy(), rows, cols, t_labels,
                                                             os.path.join(out_dir, 'diagnostics', f'attn_res_alpha_{step}.png'), step)
+    if 'skip_ratio' in pv: # skip pathway: RMS of the gated input patches / the trunk output, per noise level
+        for i, tl in enumerate(t_labels):
+            log[f'skip_ratio/t{tl}'] = pv['skip_ratio'][i, 0].item()
     if 'bypass_ratio' in pv: # gated bottleneck: RMS of the gated full-rank path / the bottleneck path, per noise level
         for i, tl in enumerate(t_labels):
             log[f'bypass_ratio/t{tl}'] = pv['bypass_ratio'][i, 0].item()

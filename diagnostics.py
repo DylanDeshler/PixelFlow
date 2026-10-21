@@ -117,6 +117,8 @@ def instrumented_forward(net, x, t, y, capture_blocks=(), tile=None):
     y_emb = net.y_embedder(y)
     c = t_emb + y_emb
     c_blocks = net.t_block(c) if getattr(net, 'adaln_single', False) else c
+    skip = net.skip_embedder(x) if getattr(net, 'skip_pathway', False) else None
+    skip_ratio = None
     if getattr(net, 'gated_bottleneck', False):
         # gated bottleneck: how much the full-rank bypass adds relative to the bottleneck path (RMS ratio; 0 = shut)
         base = BottleneckPatchEmbed.forward(net.x_embedder, x) # the bottleneck path alone
@@ -142,17 +144,31 @@ def instrumented_forward(net, x, t, y, capture_blocks=(), tile=None):
         n_prefix = net.in_context_len if (net.in_context_len > 0 and i >= net.in_context_start) else 0
         rope = net.feat_rope if i < net.in_context_start else net.feat_rope_incontext
         h, block_stats = _block(block, h, c_blocks, rope, n_prefix, g, masks.get(n_prefix), res, i)
+        if skip is not None and i + 1 == net.skip_inject_after < len(net.blocks):
+            gated = net.skip_gate(c).unsqueeze(1) * skip
+            skip_ratio = gated.float().pow(2).mean().sqrt() / h[:, n_prefix:].float().pow(2).mean().sqrt().clamp_min(1e-12)
+            h = net.inject_skip(h, gated, res, i)
         for k, v in block_stats.items():
             stats[k].append(v)
         if (i + 1) in capture_blocks:
             feats[i + 1] = h[:, n_prefix:]
     h = h[:, net.in_context_len:]
+    if skip is not None:
+        if net.skip_inject_after == len(net.blocks):
+            # skip pathway: RMS of the gated input patches relative to the trunk output they're added to (0 = gate shut)
+            gated = net.skip_gate(c).unsqueeze(1) * skip
+            skip_ratio = gated.float().pow(2).mean().sqrt() / h.float().pow(2).mean().sqrt().clamp_min(1e-12)
+            h = h + gated
+        for block in net.skip_head:
+            h = block(h, c_blocks, net.feat_rope)
     fl = net.final_layer
-    shift, scale = fl.modulation(c)
+    shift, scale = (m.to(h.dtype) for m in fl.modulation(c))
     out = net.unpatchify(fl.linear(modulate(fl.norm_final(h), shift, scale)), net.patch_size)
     stats = {k: torch.stack(v) for k, v in stats.items()}
     if bypass_ratio is not None:
         stats['bypass_ratio'] = bypass_ratio.reshape(1)
+    if skip_ratio is not None:
+        stats['skip_ratio'] = skip_ratio.reshape(1)
     if res is not None:
         stats['attn_res_alpha'] = attn_res_matrix(res.weights, x.device)
     return out, stats, feats
@@ -172,6 +188,7 @@ def attn_res_matrix(weights, device):
     return m
 
 def attn_res_labels(depth, n_sources):
+    # a mid-trunk skip pathway is part of the source of the block it was injected after (no column of its own)
     rows = [f'b{i // 2 + 1}.{"attn" if i % 2 == 0 else "mlp"}' for i in range(2 * depth)] + ['final']
     if n_sources == 2 * depth + 1: # full: one source per sublayer output
         cols = ['emb'] + rows[:-1]
