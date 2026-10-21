@@ -117,8 +117,10 @@ def instrumented_forward(net, x, t, y, capture_blocks=(), tile=None):
     y_emb = net.y_embedder(y)
     c = t_emb + y_emb
     c_blocks = net.t_block(c) if getattr(net, 'adaln_single', False) else c
-    skip = net.skip_embedder(x) if getattr(net, 'skip_pathway', False) else None
+    skip = net.skip_embedder(x) if getattr(net, 'skip_pathway', False) else None # from the raw noisy input, as in JiT.forward
     skip_ratio = None
+    if getattr(net, 'dcae_stem', False):
+        x = net.input_stem(x, c)
     if getattr(net, 'gated_bottleneck', False):
         # gated bottleneck: how much the full-rank bypass adds relative to the bottleneck path (RMS ratio; 0 = shut)
         base = BottleneckPatchEmbed.forward(net.x_embedder, x) # the bottleneck path alone
@@ -161,9 +163,7 @@ def instrumented_forward(net, x, t, y, capture_blocks=(), tile=None):
             h = h + gated
         for block in net.skip_head:
             h = block(h, c_blocks, net.feat_rope)
-    fl = net.final_layer
-    shift, scale = (m.to(h.dtype) for m in fl.modulation(c))
-    out = net.unpatchify(fl.linear(modulate(fl.norm_final(h), shift, scale)), net.patch_size)
+    out = net.output(h, c) # final layer, unpatchify / overlap-add, DC-AE head
     stats = {k: torch.stack(v) for k, v in stats.items()}
     if bypass_ratio is not None:
         stats['bypass_ratio'] = bypass_ratio.reshape(1)

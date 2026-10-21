@@ -237,6 +237,36 @@ shut. That suggests reconstructing through the bottleneck is part of how the tru
 Evaluation and sampling always use the skip. It's a training setting, not part of the architecture. Diagnostics log
 the gated skip's RMS relative to the trunk output per noise level (`skip_ratio/t*`, `trends/skip_pathway.png`).
 
+## DC-AE conv stem / head and overlapping patches
+
+DC-AE style resampling (Chen et al. 2024) around JiT's patching. At JiT's widths every DC-AE shortcut is an exact
+reshape (3 x 4^2 = 48 channels at the 4px level, 48 x 4^2 = 768 = one 16px patch), so each DC-AE layer is
+shuffle(x + branch(x)). Every branch is a residual: channel RMSNorm, adaLN modulation from the conditioning, 3x3 conv
+(-> `--dcae_width`, default 128), SiLU, `--dcae_kernel2` conv back. Its gate is zero-initialized, so the model starts
+as exactly vanilla JiT.
+- `--dcae_stem`: DC-AE downsampling, convs at the higher resolution of each stage. One branch at full resolution
+  (3 channels, width / 4), PixelUnshuffle(4), one at the 4px level (48 channels), then back to an image for the
+  unchanged bottleneck patch embedding, which does the 4 -> 16 step. The 128-d bottleneck stays; it now compresses
+  nonlinear, cross-patch features. About +0.2M params on JiT-B.
+- `--dcae_head`: DC-AE upsampling, convs at the lower resolution of each stage, on the predicted image. One branch at
+  the token level (768 channels, a 3x3 over neighbouring tokens), PixelShuffle(4), one at the 4px level, PixelShuffle(4).
+  It only sees the trunk's output (no input path), so it can synthesize detail but not copy it. About +2.9M params.
+- `--patch_overlap=o`: each patch also sees o pixels of its neighbours. The patch embedding's first conv becomes
+  (16 + 2o)^2 with stride 16. The final layer predicts (16 + 2o)^2 patches, blended by overlap-add (averaged where
+  they overlap). About +0.9M params for o = 4.
+
+All three combine freely, with each other and with the other options. With token masking, a DC-AE stem or
+overlapping patches would let masked patches' pixels leak into neighbouring tokens. Masked patches are therefore
+zeroed in the input image as well.
+
+## LayerNorm
+
+`--layernorm=True` makes every RMSNorm in the network a LayerNorm with a learnable gain and bias: the blocks'
+pre-norms, QK-norm in attention, the final layer, the AttnRes key norms and the DC-AE branches. The PixelREPA adapter
+is a separate module and keeps its own. Computed in fp32 and returned in the input's dtype like JiT's RMSNorm, so
+activations stay bf16 under autocast. AttnRes scores with LayerNorm keys subtract each source's mean:
+`(v . u - mean(v) sum(u)) / std(v)`. The key norm's bias adds the same constant to every source's score, so it cancels.
+
 ## adaLN-single
 
 `--adaln_single=True` swaps JiT's per-block adaLN projections for PixArt-alpha's adaLN-single. One projection of

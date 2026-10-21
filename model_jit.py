@@ -1,8 +1,9 @@
 # Vendored from https://github.com/LTH14/JiT (commit cbc743a, MIT license, see LICENSE_JiT).
 # Local changes: attn_bias is created on query.device instead of via .cuda(), so the model runs on any device;
 # optional Attention Residuals (attn_res, see AttnResState), adaLN-single (adaln_single), a gated bottleneck
-# (gated_bottleneck, see GatedBottleneckPatchEmbed) and a skip pathway (skip_pathway, see SkipEmbed), all off by
-# default, in which case the model is unchanged.
+# (gated_bottleneck, see GatedBottleneckPatchEmbed), a skip pathway (skip_pathway, see SkipEmbed), DC-AE style conv
+# stem / head (dcae_stem / dcae_head, see DCAEBranch), overlapping patches (patch_overlap) and LayerNorm in place of
+# every RMSNorm (layernorm), all off by default, in which case the model is unchanged.
 # --------------------------------------------------------
 # References:
 # SiT: https://github.com/willisma/SiT
@@ -16,6 +17,26 @@ import torch.nn.functional as F
 from util.model_util import VisionRotaryEmbeddingFast, get_2d_sincos_pos_embed, RMSNorm
 
 
+class LayerNorm(nn.Module):
+    """
+    LayerNorm with a learnable gain and bias, computed in fp32 and returned in the input's dtype like JiT's RMSNorm
+    (nn.LayerNorm under autocast returns fp32, which would promote whatever it feeds). Same eps attribute name as RMSNorm.
+    """
+    def __init__(self, hidden_size, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.bias = nn.Parameter(torch.zeros(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, x):
+        return F.layer_norm(x.float(), self.weight.shape, self.weight, self.bias, self.variance_epsilon).to(x.dtype)
+
+
+def make_norm(dim, layernorm=False):
+    # every norm in the network: RMSNorm (JiT), or LayerNorm with layernorm=True
+    return LayerNorm(dim, eps=1e-6) if layernorm else RMSNorm(dim, eps=1e-6)
+
+
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
@@ -23,7 +44,7 @@ def modulate(x, shift, scale):
 class BottleneckPatchEmbed(nn.Module):
     """ Image to Patch Embedding
     """
-    def __init__(self, img_size=224, patch_size=16, in_chans=3, pca_dim=768, embed_dim=768, bias=True):
+    def __init__(self, img_size=224, patch_size=16, in_chans=3, pca_dim=768, embed_dim=768, bias=True, overlap=0):
         super().__init__()
         img_size = (img_size, img_size)
         patch_size = (patch_size, patch_size)
@@ -32,7 +53,9 @@ class BottleneckPatchEmbed(nn.Module):
         self.patch_size = patch_size
         self.num_patches = num_patches
 
-        self.proj1 = nn.Conv2d(in_chans, pca_dim, kernel_size=patch_size, stride=patch_size, bias=False)
+        # overlap (patch_overlap): each token also sees `overlap` pixels of its neighbours on every side
+        k = (patch_size[0] + 2 * overlap, patch_size[1] + 2 * overlap)
+        self.proj1 = nn.Conv2d(in_chans, pca_dim, kernel_size=k, stride=patch_size, padding=overlap, bias=False)
         self.proj2 = nn.Conv2d(pca_dim, embed_dim, kernel_size=1, stride=1, bias=bias)
 
     def forward(self, x):
@@ -52,8 +75,8 @@ class GatedBottleneckPatchEmbed(BottleneckPatchEmbed):
     Both terms are linear in the patch, so this is one linear embedding whose rank depends on c, not two copies of it.
     Computed inside the embedder so token masking (a hook on its output) replaces the whole embedding.
     """
-    def __init__(self, img_size=224, patch_size=16, in_chans=3, pca_dim=768, embed_dim=768, bias=True):
-        super().__init__(img_size, patch_size, in_chans, pca_dim, embed_dim, bias)
+    def __init__(self, img_size=224, patch_size=16, in_chans=3, pca_dim=768, embed_dim=768, bias=True, overlap=0):
+        super().__init__(img_size, patch_size, in_chans, pca_dim, embed_dim, bias, overlap)
         self.bypass = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size, bias=False)
 
     def bypass_tokens(self, x):
@@ -64,6 +87,60 @@ class GatedBottleneckPatchEmbed(BottleneckPatchEmbed):
         if gate is None:
             return out
         return out + gate.unsqueeze(1) * self.bypass_tokens(x)
+
+
+class DCAEBranch(nn.Module):
+    """
+    Residual conv branch of a DC-AE style resampling layer (Chen et al. 2024, Deep Compression Autoencoder). At JiT's
+    widths every DC-AE shortcut is an exact reshape (3 * 4^2 = 48, 48 * 4^2 = 768 = one 16px patch), so a DC-AE layer
+    is shuffle(x + branch(x)) and the branch is a residual at one resolution:
+        x + gate(c) * conv_k2(SiLU(conv3x3(modulate(RMSNorm_channels(x), shift(c), scale(c)))))   channels -> width -> channels
+    adaLN modulation from the conditioning with a zero-initialized gate, so the branch starts as the identity.
+    """
+    def __init__(self, channels, width, kernel2, cond_dim, layernorm=False):
+        super().__init__()
+        self.norm = make_norm(channels, layernorm)
+        self.conv1 = nn.Conv2d(channels, width, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(width, channels, kernel_size=kernel2, padding=kernel2 // 2)
+        self.modulation = nn.Sequential(nn.SiLU(), nn.Linear(cond_dim, 3 * channels, bias=True))
+
+    def forward(self, x, c):
+        shift, scale, gate = self.modulation(c).to(x.dtype).chunk(3, dim=-1)
+        h = self.norm(x.permute(0, 2, 3, 1)) * (1 + scale[:, None, None]) + shift[:, None, None]
+        h = self.conv2(F.silu(self.conv1(h.permute(0, 3, 1, 2))))
+        return x + gate[:, :, None, None] * h
+
+
+class DCAEStem(nn.Module):
+    """
+    DC-AE downsampling (the conv runs at the higher resolution of each stage) in front of JiT's patch embedding:
+    a branch at full resolution (3 ch), PixelUnshuffle(4), a branch at the 4px level (48 ch), PixelShuffle(4) back to an
+    image for the (unchanged) bottleneck patch embedding, which does the last 4 -> 16 step.
+    """
+    def __init__(self, in_chans, width, kernel2, cond_dim, layernorm=False):
+        super().__init__()
+        self.full = DCAEBranch(in_chans, max(8, width // 4), kernel2, cond_dim, layernorm) # 3 channels at full resolution: kept narrow
+        self.quarter = DCAEBranch(in_chans * 16, width, kernel2, cond_dim, layernorm)
+
+    def forward(self, x, c):
+        x = self.full(x, c)
+        return F.pixel_shuffle(self.quarter(F.pixel_unshuffle(x, 4), c), 4)
+
+
+class DCAEHead(nn.Module):
+    """
+    DC-AE upsampling (the conv runs at the lower resolution of each stage) on the predicted image: a branch at the token
+    level (768 ch, one 16px patch per position), PixelShuffle(4), a branch at the 4px level (48 ch), PixelShuffle(4).
+    """
+    def __init__(self, in_chans, patch_size, width, kernel2, cond_dim, layernorm=False):
+        super().__init__()
+        assert patch_size == 16, 'dcae_head is built for 16px patches (two 4x stages)'
+        self.token = DCAEBranch(in_chans * 256, width, kernel2, cond_dim, layernorm)
+        self.quarter = DCAEBranch(in_chans * 16, width, kernel2, cond_dim, layernorm)
+
+    def forward(self, img, c):
+        t16 = self.token(F.pixel_unshuffle(F.pixel_unshuffle(img, 4), 4), c) # two-stage ordering, so the shuffles invert
+        return F.pixel_shuffle(self.quarter(F.pixel_shuffle(t16, 4), c), 4)
 
 
 class SkipEmbed(nn.Module):
@@ -157,13 +234,13 @@ def scaled_dot_product_attention(query, key, value, dropout_p=0.0) -> torch.Tens
 
 
 class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=True, qk_norm=True, attn_drop=0., proj_drop=0.):
+    def __init__(self, dim, num_heads=8, qkv_bias=True, qk_norm=True, attn_drop=0., proj_drop=0., layernorm=False):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
 
-        self.q_norm = RMSNorm(head_dim) if qk_norm else nn.Identity()
-        self.k_norm = RMSNorm(head_dim) if qk_norm else nn.Identity()
+        self.q_norm = make_norm(head_dim, layernorm) if qk_norm else nn.Identity()
+        self.k_norm = make_norm(head_dim, layernorm) if qk_norm else nn.Identity()
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
@@ -215,9 +292,9 @@ class FinalLayer(nn.Module):
     """
     The final layer of JiT.
     """
-    def __init__(self, hidden_size, patch_size, out_channels, adaln_single=False):
+    def __init__(self, hidden_size, patch_size, out_channels, adaln_single=False, layernorm=False):
         super().__init__()
-        self.norm_final = RMSNorm(hidden_size)
+        self.norm_final = make_norm(hidden_size, layernorm)
         self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
         self.adaln_single = adaln_single
         if adaln_single:
@@ -243,12 +320,12 @@ class FinalLayer(nn.Module):
 
 
 class JiTBlock(nn.Module):
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0, adaln_single=False):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0, adaln_single=False, layernorm=False):
         super().__init__()
-        self.norm1 = RMSNorm(hidden_size, eps=1e-6)
+        self.norm1 = make_norm(hidden_size, layernorm)
         self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=True,
-                              attn_drop=attn_drop, proj_drop=proj_drop)
-        self.norm2 = RMSNorm(hidden_size, eps=1e-6)
+                              attn_drop=attn_drop, proj_drop=proj_drop, layernorm=layernorm)
+        self.norm2 = make_norm(hidden_size, layernorm)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         self.mlp = SwiGLUFFN(hidden_size, mlp_hidden_dim, drop=proj_drop)
         self.adaln_single = adaln_single
@@ -354,6 +431,7 @@ class AttnResState:
         """
         self.queries, self.norms = net.attn_res_queries, net.attn_res_norms
         self.eps = self.norms[0].variance_epsilon
+        self.centered = isinstance(self.norms[0], LayerNorm) # LayerNorm keys: scores need the mean subtracted
         self.group = 1 if net.attn_res == 'full' else 2 * net.attn_res_block_size # sublayers per source
         self.keys = self.make_keys(net, c)
         self.sources, self.logits = [], [] # completed sources and their logits for every sublayer [B, T, 2 * depth + 1]
@@ -387,7 +465,15 @@ class AttnResState:
     def _logits(self, v, keys):
         # v: [B, T, D] -> w . RMSNorm(v) for each row of keys, fp32 [B, T, K]
         ms = torch.linalg.vecdot(v, v).unsqueeze(-1).float() / v.shape[-1] # mean square, [B, T, 1]
-        return (v @ keys.transpose(-1, -2).to(v.dtype)).float() * torch.rsqrt(ms + self.eps)
+        dots = (v @ keys.transpose(-1, -2).to(v.dtype)).float()
+        if not self.centered:
+            return dots * torch.rsqrt(ms + self.eps)
+        # w . LayerNorm(v) = (v . u - mean(v) sum(u)) / std(v) + w . b, with u = g * w; w . b is the same for every source,
+        # so it cancels in the softmax over sources and is left out
+        mean = v.float().mean(-1, keepdim=True)
+        ksum = keys.float().sum(-1)
+        ksum = ksum[:, None, :] if ksum.dim() == 2 else ksum
+        return (dots - mean * ksum) * torch.rsqrt(ms - mean ** 2 + self.eps)
 
     def _append(self, v):
         self.sources.append(v)
@@ -454,7 +540,13 @@ class JiT(nn.Module):
         gated_bottleneck=False,
         skip_pathway=False,
         skip_head_blocks=0,
-        skip_inject_block=0
+        skip_inject_block=0,
+        dcae_stem=False,
+        dcae_head=False,
+        dcae_width=128,
+        dcae_kernel2=1,
+        patch_overlap=0,
+        layernorm=False
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -476,6 +568,9 @@ class JiT(nn.Module):
         self.gated_bottleneck = gated_bottleneck
         assert skip_head_blocks == 0 or skip_pathway, 'skip_head_blocks needs skip_pathway'
         self.skip_pathway = skip_pathway
+        self.dcae_stem, self.dcae_head, self.patch_overlap = dcae_stem, dcae_head, patch_overlap
+        self.layernorm = layernorm
+        assert not dcae_stem or patch_size == 16, 'dcae_stem is built for 16px patches'
         # where the skip enters: after block skip_inject_after (1-indexed); 0 -> after the last block, -k -> before the last k
         self.skip_inject_after = resolve_skip_inject(skip_inject_block, depth)
         # training only (set by train_jit.py, not part of the architecture): fraction of samples whose skip is dropped,
@@ -495,7 +590,9 @@ class JiT(nn.Module):
 
         # linear embed
         embedder = GatedBottleneckPatchEmbed if gated_bottleneck else BottleneckPatchEmbed
-        self.x_embedder = embedder(input_size, patch_size, in_channels, bottleneck_dim, hidden_size, bias=True)
+        self.x_embedder = embedder(input_size, patch_size, in_channels, bottleneck_dim, hidden_size, bias=True, overlap=patch_overlap)
+        if dcae_stem:
+            self.input_stem = DCAEStem(in_channels, dcae_width, dcae_kernel2, hidden_size, layernorm)
         if gated_bottleneck:
             # per-channel gate on the full-rank patch embedding, from the conditioning (adaLN-style, zero-initialized)
             self.bottleneck_gate = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, hidden_size, bias=True))
@@ -527,7 +624,7 @@ class JiT(nn.Module):
         self.blocks = nn.ModuleList([
             JiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio,
                      attn_drop=attn_drop if (depth // 4 * 3 > i >= depth // 4) else 0.0,
-                     proj_drop=proj_drop if (depth // 4 * 3 > i >= depth // 4) else 0.0, adaln_single=adaln_single)
+                     proj_drop=proj_drop if (depth // 4 * 3 > i >= depth // 4) else 0.0, adaln_single=adaln_single, layernorm=layernorm)
             for i in range(depth)
         ])
 
@@ -535,16 +632,19 @@ class JiT(nn.Module):
         if skip_pathway:
             self.skip_embedder = SkipEmbed(patch_size, in_channels, hidden_size)
             self.skip_gate = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, hidden_size, bias=True))
-            self.skip_head = nn.ModuleList([JiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, adaln_single=adaln_single)
+            self.skip_head = nn.ModuleList([JiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, adaln_single=adaln_single, layernorm=layernorm)
                                             for _ in range(skip_head_blocks)])
 
         # linear predict
-        self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels, adaln_single=adaln_single)
+        # with patch_overlap the final layer predicts overlapping (patch + 2 * overlap)^2 patches, blended by overlap-add
+        self.final_layer = FinalLayer(hidden_size, patch_size + 2 * patch_overlap, self.out_channels, adaln_single=adaln_single, layernorm=layernorm)
+        if dcae_head:
+            self.output_head = DCAEHead(self.out_channels, patch_size, dcae_width, dcae_kernel2, hidden_size, layernorm)
 
         # attention residuals: a zero-initialized pseudo-query and a key RMSNorm per sublayer (2 per block) and the final layer
         if self.attn_res != 'none':
             self.attn_res_queries = nn.ParameterList([nn.Parameter(torch.zeros(hidden_size)) for _ in range(2 * depth + 1)])
-            self.attn_res_norms = nn.ModuleList([RMSNorm(hidden_size) for _ in range(2 * depth + 1)])
+            self.attn_res_norms = nn.ModuleList([make_norm(hidden_size, layernorm) for _ in range(2 * depth + 1)])
             if attn_res_adaln:
                 # adaLN on the depth-attention queries: one (shift, scale) projection of c shared by all of them
                 self.attn_res_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size, bias=True))
@@ -587,6 +687,10 @@ class JiT(nn.Module):
             nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
             nn.init.constant_(self.skip_gate[-1].weight, 0)
             nn.init.constant_(self.skip_gate[-1].bias, 0)
+        for branch in [b for m in (getattr(self, 'input_stem', None), getattr(self, 'output_head', None)) if m is not None
+                       for b in m.children()]: # DC-AE branches start as identities
+            nn.init.constant_(branch.modulation[-1].weight, 0)
+            nn.init.constant_(branch.modulation[-1].bias, 0)
         if self.attn_res_adaln: # starts as plain AttnRes
             nn.init.constant_(self.attn_res_modulation[-1].weight, 0)
             nn.init.constant_(self.attn_res_modulation[-1].bias, 0)
@@ -690,8 +794,7 @@ class JiT(nn.Module):
 
         # forward JiT
         skip = self.skip_embedder(x) if self.skip_pathway else None # from the noisy input, before x is reused
-        x = self.x_embedder(x, self.bottleneck_gate(c)) if self.gated_bottleneck else self.x_embedder(x)
-        x += self.pos_embed
+        x = self.embed(x, c)
 
         res = AttnResState(self, x, c) if self.attn_res != 'none' else None
         depth = len(self.blocks)
@@ -721,8 +824,29 @@ class JiT(nn.Module):
         x_trunk = self.run_blocks(x, res, k, depth, c_blocks, y_emb)[:, self.in_context_len:]
         return output, self.output(x_trunk, c)
 
+    def embed(self, x, c):
+        # (DC-AE stem) -> patch embedding (gated bottleneck) -> + position embedding
+        if self.dcae_stem:
+            x = self.input_stem(x, c)
+        x = self.x_embedder(x, self.bottleneck_gate(c)) if self.gated_bottleneck else self.x_embedder(x)
+        x += self.pos_embed # in place, as JiT does: keeps the embedding's dtype (bf16 under autocast), the fp32 table would promote it
+        return x
+
     def output(self, x, c):
-        return self.unpatchify(self.final_layer(x, c), self.patch_size)
+        # final layer -> image (unpatchify, or overlap-add for patch_overlap) -> (DC-AE head)
+        x = self.final_layer(x, c)
+        if self.patch_overlap:
+            o, p = self.patch_overlap, self.patch_size
+            k, size = p + 2 * o, self.input_size
+            cols = x.transpose(1, 2).float() # [N, C * k * k, L], channel-major patches as F.fold expects
+            img = F.fold(cols, size, kernel_size=k, stride=p, padding=o)
+            count = F.fold(torch.ones_like(cols[:1]), size, kernel_size=k, stride=p, padding=o)
+            img = (img / count).to(x.dtype)
+        else:
+            img = self.unpatchify(x, self.patch_size)
+        if self.dcae_head:
+            img = self.output_head(img, c)
+        return img
 
 
 def JiT_B_16(**kwargs):

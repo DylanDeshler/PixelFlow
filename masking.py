@@ -29,11 +29,23 @@ class TokenMasker(nn.Module):
         net.x_embedder.register_forward_hook(self._hook)
         if getattr(net, 'skip_pathway', False): # masked patches must not reach the output through the skip pathway
             net.skip_embedder.register_forward_hook(self._skip_hook)
+        # a DC-AE stem or overlapping patches let a token see its neighbours' pixels: blank masked patches in the image
+        # itself, before either sees it, so their content can't leak into the unmasked tokens next to them
+        if getattr(net, 'dcae_stem', False):
+            net.input_stem.register_forward_pre_hook(self._image_pre_hook)
+        elif getattr(net, 'patch_overlap', 0):
+            net.x_embedder.register_forward_pre_hook(self._image_pre_hook)
 
     def _hook(self, module, inputs, output):
         if self.mask is None:
             return output
         return torch.where(self.mask.unsqueeze(-1), self.mask_token.to(output.dtype), output)
+
+    def _image_pre_hook(self, module, args):
+        if self.mask is None:
+            return None
+        img, *rest = args
+        return (img * (1 - self.pixel_mask(self.mask).to(img.dtype)), *rest)
 
     def _skip_hook(self, module, inputs, output):
         if self.mask is None:

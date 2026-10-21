@@ -73,6 +73,12 @@ in_context_start = -1 # block where the in-context tokens are prepended
 mlp_ratio = -1.0
 attn_res = 'none' # 'full' | 'block': Attention Residuals (arXiv 2603.15031), softmax mixing over depth instead of the plain residual sum
 attn_res_block_size = 0 # block only: JiT blocks per AttnRes block; 0 -> about 8 blocks (the paper's default)
+dcae_stem = False # DC-AE style residual conv branches before the patch embedding (full resolution and the 4px level), zero-init gates
+dcae_head = False # DC-AE style residual conv branches on the predicted image (token level and the 4px level), zero-init gates
+dcae_width = 128 # hidden channels of the DC-AE branches (the full-resolution stem branch uses width / 4)
+dcae_kernel2 = 1 # kernel of each DC-AE branch's second conv (the first is 3x3)
+layernorm = False # every RMSNorm in the network (block pre-norms, QK-norm, final layer, AttnRes keys, DC-AE branches) becomes a LayerNorm
+patch_overlap = 0 # pixels each patch overlaps its neighbours on every side, in the patch embedding and the output (overlap-add)
 skip_pathway = False # full-rank input patches merged into the trunk's output before the final layer, behind a gate from the conditioning (zero-init)
 skip_head_blocks = 0 # skip_pathway only: JiT blocks after the merge, so input detail can be combined with trunk features
 skip_stop_grad = False # skip_pathway only: also train the trunk-only prediction; the skip branch's loss stops at the injection point (trunk trained as vanilla JiT)
@@ -204,7 +210,10 @@ model_name, arch = resolve_arch(model, **{k: (None if v < 0 else v) for k, v in 
     attn_res=None if attn_res == 'none' else attn_res,
     attn_res_block_size=attn_res_block_size if (attn_res == 'block' and attn_res_block_size > 0) else None,
     adaln_single=adaln_single or None, attn_res_adaln=attn_res_adaln or None, gated_bottleneck=gated_bottleneck or None,
-    skip_pathway=skip_pathway or None, skip_head_blocks=skip_head_blocks or None, skip_inject_block=skip_inject_block or None)
+    skip_pathway=skip_pathway or None, skip_head_blocks=skip_head_blocks or None, skip_inject_block=skip_inject_block or None,
+    dcae_stem=dcae_stem or None, dcae_head=dcae_head or None, patch_overlap=patch_overlap or None, layernorm=layernorm or None,
+    dcae_width=dcae_width if (dcae_stem or dcae_head) and dcae_width != 128 else None,
+    dcae_kernel2=dcae_kernel2 if (dcae_stem or dcae_head) and dcae_kernel2 != 1 else None)
 if not out_dir:
     out_dir = run_dir(runs_root, dataset, model, arch, config, _defaults, run_name)
     legacy = legacy_run_dir(runs_root, dataset, model, arch, config, _defaults, run_name)
