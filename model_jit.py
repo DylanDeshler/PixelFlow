@@ -547,7 +547,8 @@ class JiT(nn.Module):
         dcae_kernel2=1,
         patch_overlap=0,
         layernorm=False,
-        skip_final_layer=False
+        skip_final_layer=False,
+        skip_residual=False
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -573,6 +574,10 @@ class JiT(nn.Module):
         self.layernorm = layernorm
         assert not skip_final_layer or skip_pathway, 'skip_final_layer needs skip_pathway'
         self.has_skip_final_layer = skip_final_layer
+        # skip_residual: the with-skip prediction is the trunk's prediction (detached) plus a correction from the skip
+        # branch's own final layer (zero at init), instead of an independent prediction; samples use both final layers
+        assert not skip_residual or skip_final_layer, 'skip_residual needs skip_final_layer'
+        self.skip_residual = skip_residual
         assert not dcae_stem or patch_size == 16, 'dcae_stem is built for 16px patches'
         # where the skip enters: after block skip_inject_after (1-indexed); 0 -> after the last block, -k -> before the last k
         self.skip_inject_after = resolve_skip_inject(skip_inject_block, depth)
@@ -812,7 +817,7 @@ class JiT(nn.Module):
         if not self.skip_pathway:
             return self.output(x[:, self.in_context_len:], c)
 
-        two = return_trunk
+        two = return_trunk or self.skip_residual # skip_residual needs the trunk's prediction at inference too
         if two: # skip branch from a detached copy of the trunk at the injection point
             xs, cs, cbs, ys = x.detach(), c.detach(), c_blocks.detach(), y_emb.detach()
             ress = res.detached(self, cs) if res is not None else None
@@ -826,12 +831,16 @@ class JiT(nn.Module):
             xs = xs[:, self.in_context_len:] + gated
         for block in self.skip_head:
             xs = block(xs, cbs, self.feat_rope)
-        output = self.output(xs, cs, self.prediction_layer())
+        # with skip_residual this is the correction (no DC-AE head: that refines the trunk's image), else the full prediction
+        output = self.output(xs, cs, self.prediction_layer(), head=not self.skip_residual)
         if not two:
             return output
         # trunk-only branch, run last so block hooks (e.g. REPA's capture) see the trunk's own activations
         x_trunk = self.run_blocks(x, res, k, depth, c_blocks, y_emb)[:, self.in_context_len:]
-        return output, self.output(x_trunk, c)
+        trunk_output = self.output(x_trunk, c)
+        if self.skip_residual: # detached: the with-skip loss trains only the correction, never the trunk or final_layer
+            output = trunk_output.detach() + output
+        return (output, trunk_output) if return_trunk else output
 
     def embed(self, x, c):
         # (DC-AE stem) -> patch embedding (gated bottleneck) -> + position embedding
@@ -845,7 +854,7 @@ class JiT(nn.Module):
         # the final layer of the prediction the model is evaluated / sampled with
         return self.skip_final_layer if self.has_skip_final_layer else self.final_layer
 
-    def output(self, x, c, final_layer=None):
+    def output(self, x, c, final_layer=None, head=True):
         # final layer -> image (unpatchify, or overlap-add for patch_overlap) -> (DC-AE head)
         x = (final_layer or self.final_layer)(x, c)
         if self.patch_overlap:
@@ -857,7 +866,7 @@ class JiT(nn.Module):
             img = (img / count).to(x.dtype)
         else:
             img = self.unpatchify(x, self.patch_size)
-        if self.dcae_head:
+        if self.dcae_head and head:
             img = self.output_head(img, c)
         return img
 

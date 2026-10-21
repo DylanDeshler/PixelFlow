@@ -236,6 +236,14 @@ then trained exactly like vanilla JiT, apart from gradient clipping on the combi
 the injection point are still shared. With `--dcae_head`, the DC-AE head after the final layer is shared as well.
 About +0.6M params on JiT-B.
 
+`--skip_residual=True` (with `--skip_final_layer --skip_stop_grad`) makes the with-skip prediction
+`x_trunk.detach() + correction`. The trunk's own prediction (its final layer, DC-AE head if any) is the base, and the
+skip branch's final layer only learns a correction from the gated skip. It is zero at init, so the prediction starts
+exactly at the trunk's. The with-skip loss trains only the correction and the skip modules; detaching keeps it away
+from the trunk and its final layer. Samples and evaluation use trunk + correction, so both final layers contribute.
+With injection after the trunk this costs one extra final-layer pass. Mid-trunk, the blocks after the injection point
+also run twice at sampling time.
+
 `--skip_pathway_drop_prob=p` (default 0, off) drops the skip for a random fraction p of training samples, the way
 label dropout works for CFG. On those samples the trunk has to reconstruct everything through the bottleneck. The
 motivation: with the skip always on, the trunk's probes trailed at every noise level, even where the skip's gate was

@@ -103,13 +103,15 @@ def _block(block, x, c, rope, n_prefix, g, mask=None, res=None, index=None):
     return x, stats
 
 @torch.no_grad()
-def instrumented_forward(net, x, t, y, capture_blocks=(), tile=None):
+def instrumented_forward(net, x, t, y, capture_blocks=(), tile=None, skip_on=True):
     """
     Same output as net(x, t, y), plus per-block attention stats (entropy, spatial distance, mass on in-context tokens),
     |gate| sizes, and the patch tokens (in-context class tokens removed) after the blocks in capture_blocks (1-indexed).
     tile: if set, runs the windowed-attention ablation (see tile_mask) instead of full attention.
+    skip_on: False runs a skip-pathway model without its skip (the trunk-only prediction, used for skip_residual).
     """
     g = int(round(net.x_embedder.num_patches ** 0.5))
+    x_input = x
     masks = {}
     if tile is not None:
         masks = {0: tile_mask(g, tile, 0, x.device), net.in_context_len: tile_mask(g, tile, net.in_context_len, x.device)}
@@ -117,7 +119,7 @@ def instrumented_forward(net, x, t, y, capture_blocks=(), tile=None):
     y_emb = net.y_embedder(y)
     c = t_emb + y_emb
     c_blocks = net.t_block(c) if getattr(net, 'adaln_single', False) else c
-    skip = net.skip_embedder(x) if getattr(net, 'skip_pathway', False) else None # from the raw noisy input, as in JiT.forward
+    skip = net.skip_embedder(x) if getattr(net, 'skip_pathway', False) and skip_on else None # from the raw noisy input, as in JiT.forward
     skip_ratio = None
     if getattr(net, 'dcae_stem', False):
         x = net.input_stem(x, c)
@@ -163,7 +165,13 @@ def instrumented_forward(net, x, t, y, capture_blocks=(), tile=None):
             h = h + gated
         for block in net.skip_head:
             h = block(h, c_blocks, net.feat_rope)
-    out = net.output(h, c, net.prediction_layer()) # final layer (the skip branch's own, if any), unpatchify / overlap-add, DC-AE head
+    if skip is not None and net.skip_residual:
+        # trunk-only prediction (same images, noise and attention masks, skip off) + the skip branch's correction
+        trunk_out, _, _ = instrumented_forward(net, x_input, t, y, tile=tile, skip_on=False)
+        out = trunk_out + net.output(h, c, net.prediction_layer(), head=False)
+    else:
+        # final layer (the skip branch's own when the skip is on), unpatchify / overlap-add, DC-AE head
+        out = net.output(h, c, net.prediction_layer() if skip is not None else None)
     stats = {k: torch.stack(v) for k, v in stats.items()}
     if bypass_ratio is not None:
         stats['bypass_ratio'] = bypass_ratio.reshape(1)
