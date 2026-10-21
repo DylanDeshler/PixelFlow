@@ -221,6 +221,15 @@ AttnRes it is added to the residual stream. With AttnRes it is added into that b
 form of a residual add). A separate source would dilute the other sources' softmax weight even with the gate shut.
 Every variant starts as exactly the model without the skip. Token masking zeroes masked patches in the skip as well.
 
+`--skip_stop_grad=True` keeps the trunk trained exactly like vanilla JiT. Each training step also computes the
+trunk-only prediction (the same network without the skip), and the loss is L(with skip) + L(trunk only), the same
+objective on both. The with-skip branch continues from a detached copy of the trunk's state at the injection point.
+So its loss only trains the skip pathway, the blocks after the injection point (shared with the trunk branch) and
+the final layer, never the embeddings or the blocks before it. Works with every `--skip_inject_block`; repeating the
+blocks after the injection point costs about (12 - k) / 12 extra compute for injection after block k. `train/loss` is
+the with-skip loss (comparable to other runs) and `train/loss_trunk` the trunk-only one. Evaluation and sampling use
+the with-skip prediction.
+
 `--skip_pathway_drop_prob=p` (default 0, off) drops the skip for a random fraction p of training samples, the way
 label dropout works for CFG. On those samples the trunk has to reconstruct everything through the bottleneck. The
 motivation: with the skip always on, the trunk's probes trailed at every noise level, even where the skip's gate was

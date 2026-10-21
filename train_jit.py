@@ -19,6 +19,7 @@ and fid.py's feature files) and writes them to wandb and {out_dir}/diagnostics/.
 """
 
 import os
+import re
 import time
 import math
 import uuid
@@ -74,6 +75,7 @@ attn_res = 'none' # 'full' | 'block': Attention Residuals (arXiv 2603.15031), so
 attn_res_block_size = 0 # block only: JiT blocks per AttnRes block; 0 -> about 8 blocks (the paper's default)
 skip_pathway = False # full-rank input patches merged into the trunk's output before the final layer, behind a gate from the conditioning (zero-init)
 skip_head_blocks = 0 # skip_pathway only: JiT blocks after the merge, so input detail can be combined with trunk features
+skip_stop_grad = False # skip_pathway only: also train the trunk-only prediction; the skip branch's loss stops at the injection point (trunk trained as vanilla JiT)
 skip_pathway_drop_prob = 0.0 # skip_pathway only: in training, drop the skip for this fraction of samples (the trunk then reconstructs them alone)
 skip_inject_block = 0 # skip_pathway only: 0 -> after the trunk; -k -> before the last k blocks; k -> after block k
 gated_bottleneck = False # add a full-rank patch embedding behind a gate from the conditioning (zero-init: starts as the bottleneck)
@@ -216,6 +218,17 @@ if not compile:
     torch._dynamo.config.disable = True
 torch._dynamo.config.cache_size_limit = 128
 os.makedirs(out_dir, exist_ok=True)
+if init_from == 'scratch':
+    # a fresh run in a directory that already holds one: move the old run's outputs aside instead of mixing them (its
+    # diag_*.json would otherwise feed this run's trend plots, and train_log.jsonl would be appended to)
+    old = [n for n in sorted(os.listdir(out_dir)) if n in ('train_log.jsonl', 'config.json', 'ckpt.pt', 'diagnostics', 'samples', 'trends', 'eval')
+           or re.fullmatch(r'ckpt_\d+\.pt', n)]
+    if old:
+        prev = os.path.join(out_dir, 'previous', time.strftime('%Y%m%d-%H%M%S'))
+        os.makedirs(prev)
+        for n in old:
+            os.replace(os.path.join(out_dir, n), os.path.join(prev, n))
+        print(f"{out_dir} already had a run (init_from='scratch'): moved {', '.join(old)} to {prev}")
 samples_dir = os.path.join(out_dir, 'samples') # every generated sample grid
 os.makedirs(samples_dir, exist_ok=True)
 torch.manual_seed(1337)
@@ -255,8 +268,10 @@ denoiser = build_denoiser(**denoiser_args).to(device)
 denoiser.ema_warmup = ema_warmup
 assert skip_pathway_drop_prob == 0 or skip_pathway, 'skip_pathway_drop_prob needs skip_pathway'
 assert 0 <= skip_pathway_drop_prob < 1, 'skip_pathway_drop_prob must be in [0, 1)'
+assert not skip_stop_grad or skip_pathway, 'skip_stop_grad needs skip_pathway'
 if skip_pathway:
     denoiser.net.skip_drop_prob = skip_pathway_drop_prob # training only; evaluation and sampling always use the skip
+    denoiser.net.skip_stop_grad = skip_stop_grad
 assert time_schedule in ('uniform', 'shift', 'train_quantile'), f'unknown time_schedule {time_schedule}'
 denoiser.time_schedule = time_schedule
 summary(denoiser)
@@ -726,12 +741,15 @@ while True:
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     for micro_step in range(gradient_accumulation_steps):
         with ctx:
-            if masker is None and not (encoder is not None and repa_adapter == 'mta'):
+            loss_parts = {}
+            if masker is None and not (encoder is not None and repa_adapter == 'mta') and not skip_stop_grad:
                 loss_fm = denoiser(X, Y) # JiT's own loss
+                loss_parts['skip'] = loss_fm
             else:
                 # same loss, but exposing this forward's t / dropped labels (the PixelREPA adapter is conditioned on them)
+                # and, with skip_stop_grad, adding the trunk-only prediction's loss
                 token_mask = masker.sample(len(X), mask_ratio, mask_prob, device) if masker is not None else None
-                loss_fm, t_used, y_used = flow_loss(denoiser, X, Y, masker, token_mask, mask_weighting, return_aux=True)
+                loss_fm, t_used, y_used = flow_loss(denoiser, X, Y, masker, token_mask, mask_weighting, return_aux=True, parts=loss_parts)
             loss = loss_fm
             if encoder is not None:
                 target = encoder(X, grid)
@@ -769,19 +787,23 @@ while True:
     train_seconds += dt
     if iter_num % log_interval == 0:
         # get loss as float. note: this is a CPU-GPU sync point
-        lossf = loss_fm.item()
+        # with skip_stop_grad, the logged loss is the with-skip prediction's (comparable to other runs); the trunk's separately
+        lossf = loss_parts['skip'].item()
+        loss_trunkf = loss_parts['trunk'].item() if 'trunk' in loss_parts else None
         if not math.isfinite(lossf):
             raise RuntimeError(f"loss is {lossf} at iter {iter_num}, stopping")
         imgs_per_sec = effective_batch_size / dt
         repa_str = f", repa {loss_repa.item():.4f}" if encoder is not None else ""
         grad_str = f", grad norm {math.sqrt(sum(v ** 2 for v in grad_norms.values())):.4f}" if log_opt else ""
-        print(f"iter {iter_num} (epoch {iter_num / iters_per_epoch:.2f}): loss {lossf:.4f}{repa_str}{grad_str}, time {dt*1000:.2f}ms, {imgs_per_sec:.0f} img/s")
+        trunk_str = f", trunk-only loss {loss_trunkf:.4f}" if loss_trunkf is not None else ""
+        print(f"iter {iter_num} (epoch {iter_num / iters_per_epoch:.2f}): loss {lossf:.4f}{trunk_str}{repa_str}{grad_str}, time {dt*1000:.2f}ms, {imgs_per_sec:.0f} img/s")
         if wandb_log:
             log = {
                 "iter": iter_num,
                 "epoch": iter_num / iters_per_epoch,
                 "train_hours": train_seconds / 3600,
                 "train/loss": lossf,
+                **({"train/loss_trunk": loss_trunkf} if loss_trunkf is not None else {}),
                 "lr": lr_now,
                 "imgs_per_sec": imgs_per_sec,
             }
@@ -798,6 +820,8 @@ while True:
         # same stats to a local file, for plot_trends.py (independent of wandb)
         record = {'iter': iter_num, 'epoch': iter_num / iters_per_epoch, 'images': iter_num * effective_batch_size,
                   'loss': lossf, 'lr': lr_now, 'imgs_per_sec': imgs_per_sec}
+        if loss_trunkf is not None:
+            record['loss_trunk'] = loss_trunkf
         if encoder is not None:
             record['repa_loss'] = loss_repa.item()
         if optimizer_type == 'muon':

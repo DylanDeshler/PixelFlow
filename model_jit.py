@@ -8,6 +8,7 @@
 # SiT: https://github.com/willisma/SiT
 # Lightning-DiT: https://github.com/hustvl/LightningDiT
 # --------------------------------------------------------
+import copy
 import torch
 import torch.nn as nn
 import math
@@ -354,17 +355,34 @@ class AttnResState:
         self.queries, self.norms = net.attn_res_queries, net.attn_res_norms
         self.eps = self.norms[0].variance_epsilon
         self.group = 1 if net.attn_res == 'full' else 2 * net.attn_res_block_size # sublayers per source
-        gains = torch.stack([n.weight for n in self.norms]) # [2 * depth + 1, D]
-        queries = torch.stack(list(self.queries))
-        if net.attn_res_adaln:
-            shift, scale = net.attn_res_modulation(c).unsqueeze(1).chunk(2, dim=-1) # [B, 1, D] each
-            queries = queries * (1 + scale) + shift # [B, 2 * depth + 1, D]
-        self.keys = gains * queries # the key norm's gain folded into the queries: [2 * depth + 1, D] or per sample [B, ., D]
+        self.keys = self.make_keys(net, c)
         self.sources, self.logits = [], [] # completed sources and their logits for every sublayer [B, T, 2 * depth + 1]
         self.partial = None
         self.count = 0
         self.weights = None # {sublayer: mean mixing weight per source [S]} when recording (diagnostics only)
         self._append(emb)
+
+    def make_keys(self, net, c):
+        gains = torch.stack([n.weight for n in self.norms]) # [2 * depth + 1, D]
+        queries = torch.stack(list(self.queries))
+        if net.attn_res_adaln:
+            shift, scale = net.attn_res_modulation(c).unsqueeze(1).chunk(2, dim=-1) # [B, 1, D] each
+            queries = queries * (1 + scale) + shift # [B, 2 * depth + 1, D]
+        return gains * queries # the key norm's gain folded into the queries: [2 * depth + 1, D] or per sample [B, ., D]
+
+    def detached(self, net, c):
+        """
+        Copy whose sources (and running block sum) are cut from the autograd graph, for a second branch that continues
+        from the same state without sending gradient back into what produced it (skip_stop_grad). Scores are recomputed
+        so later layers' queries still learn from the copy; c is the (detached) conditioning for attn_res_adaln.
+        """
+        new = copy.copy(self)
+        new.keys = new.make_keys(net, c)
+        new.sources = [s.detach() for s in self.sources]
+        new.logits = [new._logits(s, new.keys) for s in new.sources]
+        new.partial = self.partial.detach() if self.partial is not None else None
+        new.weights = None
+        return new
 
     def _logits(self, v, keys):
         # v: [B, T, D] -> w . RMSNorm(v) for each row of keys, fp32 [B, T, K]
@@ -463,6 +481,9 @@ class JiT(nn.Module):
         # training only (set by train_jit.py, not part of the architecture): fraction of samples whose skip is dropped,
         # so the trunk still has to reconstruct them through the bottleneck
         self.skip_drop_prob = 0.0
+        # training only (set by train_jit.py): also train a trunk-only prediction, with the skip branch's loss stopped
+        # at the injection point (masking.flow_loss asks for both predictions via forward(..., return_trunk=True))
+        self.skip_stop_grad = False
         assert skip_inject_block == 0 or skip_pathway, 'skip_inject_block needs skip_pathway'
 
         # time and class embed
@@ -637,26 +658,9 @@ class JiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def forward(self, x, t, y):
-        """
-        x: (N, C, H, W)
-        t: (N,)
-        y: (N,)
-        """
-        # class and time embeddings
-        t_emb = self.t_embedder(t)
-        y_emb = self.y_embedder(y)
-        c = t_emb + y_emb
-        c_blocks = self.t_block(c) if self.adaln_single else c
-
-        # forward JiT
-        gated_skip = self.gated_skip(self.skip_embedder(x), c) if self.skip_pathway else None # from the noisy input, before x is reused
-        x = self.x_embedder(x, self.bottleneck_gate(c)) if self.gated_bottleneck else self.x_embedder(x)
-        x += self.pos_embed
-
-        res = AttnResState(self, x, c) if self.attn_res != 'none' else None
-        for i, block in enumerate(self.blocks):
-            # in-context
+    def run_blocks(self, x, res, start, end, c_blocks, y_emb):
+        # trunk blocks start..end-1 (0-indexed), with the in-context class tokens prepended at in_context_start
+        for i in range(start, end):
             if self.in_context_len > 0 and i == self.in_context_start:
                 in_context_tokens = y_emb.unsqueeze(1).repeat(1, self.in_context_len, 1)
                 in_context_tokens += self.in_context_posemb
@@ -665,21 +669,60 @@ class JiT(nn.Module):
                 else:
                     res.prepend(in_context_tokens)
                     x = res.mix(2 * i)
-            x = block(x, c_blocks, self.feat_rope if i < self.in_context_start else self.feat_rope_incontext, res=res, index=i)
-            if self.skip_pathway and i + 1 == self.skip_inject_after < len(self.blocks):
-                x = self.inject_skip(x, gated_skip, res, i)
+            x = self.blocks[i](x, c_blocks, self.feat_rope if i < self.in_context_start else self.feat_rope_incontext, res=res, index=i)
+        return x
 
-        x = x[:, self.in_context_len:]
-        if self.skip_pathway:
-            if self.skip_inject_after == len(self.blocks): # after the trunk: added to its output directly
-                x = x + gated_skip
-            for block in self.skip_head:
-                x = block(x, c_blocks, self.feat_rope)
+    def forward(self, x, t, y, return_trunk=False):
+        """
+        x: (N, C, H, W)
+        t: (N,)
+        y: (N,)
+        return_trunk (skip_pathway): also return the trunk-only prediction, i.e. the same network without the skip
+        (skip_stop_grad in training). The skip branch then continues from a detached copy of the trunk's state at the
+        injection point, so its loss trains only the skip pathway, the blocks after the injection point and the final
+        layer, never the embeddings or the blocks before it. Returns (prediction with skip, trunk-only prediction).
+        """
+        # class and time embeddings
+        t_emb = self.t_embedder(t)
+        y_emb = self.y_embedder(y)
+        c = t_emb + y_emb
+        c_blocks = self.t_block(c) if self.adaln_single else c
 
-        x = self.final_layer(x, c)
-        output = self.unpatchify(x, self.patch_size)
+        # forward JiT
+        skip = self.skip_embedder(x) if self.skip_pathway else None # from the noisy input, before x is reused
+        x = self.x_embedder(x, self.bottleneck_gate(c)) if self.gated_bottleneck else self.x_embedder(x)
+        x += self.pos_embed
 
-        return output
+        res = AttnResState(self, x, c) if self.attn_res != 'none' else None
+        depth = len(self.blocks)
+        k = self.skip_inject_after if self.skip_pathway else depth
+        x = self.run_blocks(x, res, 0, k, c_blocks, y_emb)
+        if not self.skip_pathway:
+            return self.output(x[:, self.in_context_len:], c)
+
+        two = return_trunk
+        if two: # skip branch from a detached copy of the trunk at the injection point
+            xs, cs, cbs, ys = x.detach(), c.detach(), c_blocks.detach(), y_emb.detach()
+            ress = res.detached(self, cs) if res is not None else None
+        else:
+            xs, cs, cbs, ys, ress = x, c, c_blocks, y_emb, res
+        gated = self.gated_skip(skip, cs)
+        if k < depth: # mid-trunk: into block k's output, then the remaining blocks
+            xs = self.inject_skip(xs, gated, ress, k - 1)
+            xs = self.run_blocks(xs, ress, k, depth, cbs, ys)[:, self.in_context_len:]
+        else: # after the trunk: added to its output directly
+            xs = xs[:, self.in_context_len:] + gated
+        for block in self.skip_head:
+            xs = block(xs, cbs, self.feat_rope)
+        output = self.output(xs, cs)
+        if not two:
+            return output
+        # trunk-only branch, run last so block hooks (e.g. REPA's capture) see the trunk's own activations
+        x_trunk = self.run_blocks(x, res, k, depth, c_blocks, y_emb)[:, self.in_context_len:]
+        return output, self.output(x_trunk, c)
+
+    def output(self, x, c):
+        return self.unpatchify(self.final_layer(x, c), self.patch_size)
 
 
 def JiT_B_16(**kwargs):

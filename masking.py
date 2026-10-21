@@ -64,27 +64,44 @@ class TokenMasker(nn.Module):
         m = mask.view(-1, 1, g, g).float()
         return m.repeat_interleave(self.patch_size, dim=2).repeat_interleave(self.patch_size, dim=3)
 
-def flow_loss(denoiser, x, labels, masker=None, mask=None, weighting='effective_t', return_aux=False):
+def flow_loss(denoiser, x, labels, masker=None, mask=None, weighting='effective_t', return_aux=False, parts=None):
     """
     JiT's training loss (Denoiser.forward: label dropout, logit-normal t, x-prediction, v-loss), with optional token
     masking. With mask=None this is numerically the same computation as denoiser(x, labels).
     return_aux: also return the t (flattened) and the (possibly dropped) labels this forward used, for auxiliary heads
     that need the same conditioning (PixelREPA's adapter).
+    Skip pathway with skip_stop_grad, in training: the loss is L(with skip) + L(trunk only), the same objective on both
+    predictions (see JiT.forward's return_trunk). parts: optional dict, filled with the two terms for logging.
     """
     labels = denoiser.drop_labels(labels) if denoiser.training else labels
     t = denoiser.sample_t(x.size(0), device=x.device).view(-1, *([1] * (x.ndim - 1)))
     e = torch.randn_like(x) * denoiser.noise_scale
     z = t * x + (1 - t) * e
+    two = denoiser.training and getattr(denoiser.net, 'skip_stop_grad', False)
+    kwargs = {'return_trunk': True} if two else {}
     if mask is None:
-        x_pred = denoiser.net(z, t.flatten(), labels)
+        x_pred = denoiser.net(z, t.flatten(), labels, **kwargs)
     else:
         with masker.active(mask):
-            x_pred = denoiser.net(z, t.flatten(), labels)
-    # v - v_pred = (x - x_pred) / (1 - t), with JiT's clamp
-    err = ((x - x_pred) / (1 - t).clamp_min(denoiser.t_eps)) ** 2
-    if mask is not None and weighting == 'effective_t':
-        pm = masker.pixel_mask(mask)
-        err = err * (1 - pm) + (x - x_pred) ** 2 * pm # masked patches weighted as t=0
+            x_pred = denoiser.net(z, t.flatten(), labels, **kwargs)
+
+    def v_loss(x_pred):
+        # v - v_pred = (x - x_pred) / (1 - t), with JiT's clamp
+        err = ((x - x_pred) / (1 - t).clamp_min(denoiser.t_eps)) ** 2
+        if mask is not None and weighting == 'effective_t':
+            pm = masker.pixel_mask(mask)
+            err = err * (1 - pm) + (x - x_pred) ** 2 * pm # masked patches weighted as t=0
+        return err.mean()
+
+    if two:
+        loss_skip, loss_trunk = v_loss(x_pred[0]), v_loss(x_pred[1])
+        loss = loss_skip + loss_trunk
+        if parts is not None:
+            parts['skip'], parts['trunk'] = loss_skip, loss_trunk
+    else:
+        loss = v_loss(x_pred)
+        if parts is not None:
+            parts['skip'] = loss
     if return_aux:
-        return err.mean(), t.flatten(), labels
-    return err.mean()
+        return loss, t.flatten(), labels
+    return loss
