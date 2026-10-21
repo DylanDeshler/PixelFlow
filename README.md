@@ -219,7 +219,13 @@ attention combine detail with trunk features. `--skip_inject_block` sets where t
 no extra parameters. The probe peak sits around two-thirds depth, and later blocks act more like a decoder. Without
 AttnRes it is added to the residual stream. With AttnRes it is added into that block's output source (the AttnRes
 form of a residual add). A separate source would dilute the other sources' softmax weight even with the gate shut.
-Every variant starts as exactly the model without the skip. Token masking zeroes masked patches in the skip as well. Diagnostics log
+Every variant starts as exactly the model without the skip. Token masking zeroes masked patches in the skip as well.
+
+`--skip_pathway_drop_prob=p` (default 0, off) drops the skip for a random fraction p of training samples, the way
+label dropout works for CFG. On those samples the trunk has to reconstruct everything through the bottleneck. The
+motivation: with the skip always on, the trunk's probes trailed at every noise level, even where the skip's gate was
+shut. That suggests reconstructing through the bottleneck is part of how the trunk learns its representations.
+Evaluation and sampling always use the skip. It's a training setting, not part of the architecture. Diagnostics log
 the gated skip's RMS relative to the trunk output per noise level (`skip_ratio/t*`, `trends/skip_pathway.png`).
 
 ## adaLN-single
@@ -263,6 +269,12 @@ results land in `{run}/eval/results_t{t}.json`.
 python eval_linear.py --ckpt=runs/in100_128/jit-b16_icl0/muon/ckpt.pt --jit_t=1.0
 python eval_linear.py --ckpt=runs/in100_128/jit-b16_icl0/muon/ckpt.pt --jit_t=0.75 --jit_blocks=4,6,8 --knn=False
 ```
+
+`ckpt.pt` is overwritten at every save. With `--keep_ckpt_every_epochs=N`, a milestone `ckpt_{iter}.pt` (EMA1 weights
+plus what's needed to rebuild the model, about 0.5 GB for JiT-B) is kept every N epochs. `eval_jit.py` (e.g. CFG
+sweeps on matched checkpoints of two runs) and `eval_linear.py` both accept it. Setting it equal to
+`eval_every_epochs` lines milestones up with the training-time FIDs. It doesn't affect the run directory name, so it
+can be turned on when resuming.
 
 Training-time FIDs use no CFG, 10k samples and a fixed seed, so the same noise and labels are used at every eval and across runs.
 They're for comparing runs with each other. Paper-comparable numbers need `eval_jit.py` with 50k samples and CFG.

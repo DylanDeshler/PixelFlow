@@ -46,6 +46,7 @@ out_dir = '' # '' -> {runs_root}/{dataset}/{model}/{settings changed from these 
 run_name = '' # optional tag appended to the derived out_dir (e.g. seed2)
 eval_every_epochs = 10 # FID eval
 save_every_epochs = 1 # overwrite ckpt.pt
+keep_ckpt_every_epochs = 0 # also keep ckpt_{iter}.pt (EMA1 weights only, ~0.5 GB for JiT-B) for eval_jit.py / eval_linear.py; 0 = off
 log_interval = 100
 eval_only = False # if True, script exits right after one FID eval (use with init_from='resume')
 init_from = 'scratch' # 'scratch' or 'resume'
@@ -73,6 +74,7 @@ attn_res = 'none' # 'full' | 'block': Attention Residuals (arXiv 2603.15031), so
 attn_res_block_size = 0 # block only: JiT blocks per AttnRes block; 0 -> about 8 blocks (the paper's default)
 skip_pathway = False # full-rank input patches merged into the trunk's output before the final layer, behind a gate from the conditioning (zero-init)
 skip_head_blocks = 0 # skip_pathway only: JiT blocks after the merge, so input detail can be combined with trunk features
+skip_pathway_drop_prob = 0.0 # skip_pathway only: in training, drop the skip for this fraction of samples (the trunk then reconstructs them alone)
 skip_inject_block = 0 # skip_pathway only: 0 -> after the trunk; -k -> before the last k blocks; k -> after block k
 gated_bottleneck = False # add a full-rank patch embedding behind a gate from the conditioning (zero-init: starts as the bottleneck)
 attn_res_adaln = False # adaLN on the AttnRes queries from the conditioning (time + class), one shared projection (~1.2M params on JiT-B)
@@ -251,6 +253,10 @@ denoiser_args = dict(
 )
 denoiser = build_denoiser(**denoiser_args).to(device)
 denoiser.ema_warmup = ema_warmup
+assert skip_pathway_drop_prob == 0 or skip_pathway, 'skip_pathway_drop_prob needs skip_pathway'
+assert 0 <= skip_pathway_drop_prob < 1, 'skip_pathway_drop_prob must be in [0, 1)'
+if skip_pathway:
+    denoiser.net.skip_drop_prob = skip_pathway_drop_prob # training only; evaluation and sampling always use the skip
 assert time_schedule in ('uniform', 'shift', 'train_quantile'), f'unknown time_schedule {time_schedule}'
 denoiser.time_schedule = time_schedule
 summary(denoiser)
@@ -645,6 +651,10 @@ def save_checkpoint():
     tmp_path = os.path.join(out_dir, 'ckpt.pt.tmp')
     torch.save(checkpoint, tmp_path)
     os.replace(tmp_path, os.path.join(out_dir, 'ckpt.pt'))
+    if keep_iters and iter_num % keep_iters == 0:
+        # milestone for eval_jit.py / eval_linear.py: the EMA1 weights and what's needed to rebuild the model
+        torch.save({'model_ema1': ema1, 'denoiser_args': denoiser_args, 'iter_num': iter_num, 'epoch': iter_num / iters_per_epoch,
+                    'config': config}, os.path.join(out_dir, f'ckpt_{iter_num}.pt'))
     print(f"saved checkpoint to {out_dir} at iter {iter_num} (epoch {iter_num / iters_per_epoch:.2f}) in {time.time() - t_save:.1f}s")
 
 # logging
@@ -656,6 +666,7 @@ if wandb_log:
 
 eval_iters = eval_every_epochs * iters_per_epoch
 save_iters = max(1, save_every_epochs * iters_per_epoch)
+keep_iters = keep_ckpt_every_epochs * iters_per_epoch
 
 # training loop
 X, Y = get_batch() # fetch the very first batch
@@ -704,7 +715,7 @@ while True:
     if eval_only:
         break
 
-    if iter_num > 0 and local_iter_num > 0 and (iter_num % save_iters == 0 or iter_num == max_iters):
+    if iter_num > 0 and local_iter_num > 0 and (iter_num % save_iters == 0 or iter_num == max_iters or (keep_iters and iter_num % keep_iters == 0)):
         save_checkpoint()
         t0 = time.time() # don't count the save in the next iteration's timing
 

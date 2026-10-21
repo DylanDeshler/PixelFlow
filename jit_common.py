@@ -254,7 +254,7 @@ def save_labeled_grid(x, names, path, nrow=8):
 _NAME_EXCLUDE = {
     'out_dir', 'runs_root', 'run_name', 'data_root', 'data_dir', 'dataset', 'model', 'depth', 'hidden_size', 'num_heads',
     'patch_size', 'bottleneck_dim', 'in_context_len', 'in_context_start', 'mlp_ratio',
-    'epochs', 'batch_size', 'gradient_accumulation_steps', 'eval_every_epochs', 'save_every_epochs', 'log_interval',
+    'epochs', 'batch_size', 'gradient_accumulation_steps', 'eval_every_epochs', 'save_every_epochs', 'keep_ckpt_every_epochs', 'log_interval',
     'eval_only', 'init_from', 'wandb_log', 'wandb_project', 'wandb_run_name', 'fid_num_images', 'fid_cfg',
     'fid_interval_min', 'fid_interval_max', 'sample_cfg', 'sample_interval_min', 'sample_interval_max',
     'sampling_method', 'num_sampling_steps', 'time_schedule', 'gen_batch_size', 'eval_loss_images',
@@ -274,7 +274,7 @@ _NAME_TOKENS = {
     'beta1': 'beta1-', 'beta2': 'beta2-', 'grad_clip': 'clip', 'ema_decay1': 'ema', 'ema_decay2': 'ema2-', 'ema_warmup': 'emawarmup',
     'attn_dropout': 'attndrop', 'proj_dropout': 'projdrop', 'attn_res': 'attnres-', 'attn_res_block_size': 'attnresbs',
     'adaln_single': 'adalnsingle', 'attn_res_adaln': 'attnresadaln', 'gated_bottleneck': 'gatedbn',
-    'skip_pathway': 'skip', 'skip_head_blocks': 'skiphead', 'skip_inject_block': 'skipat',
+    'skip_pathway': 'skip', 'skip_head_blocks': 'skiphead', 'skip_inject_block': 'skipat', 'skip_pathway_drop_prob': 'skipdrop',
     'repa_encoder': 'repa-', 'repa_adapter': 'adapter-', 'repa_depth': 'repadepth', 'repa_coeff': 'repacoeff', 'repa_proj_dim': 'repaproj',
     'repa_mask_ratio': 'repamask', 'repa_adapter_depth': 'adapterdepth',
     'mask_ratio': 'mask', 'mask_prob': 'maskprob', 'mask_weighting': 'maskweight-',

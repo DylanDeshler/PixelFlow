@@ -460,6 +460,9 @@ class JiT(nn.Module):
         self.skip_pathway = skip_pathway
         # where the skip enters: after block skip_inject_after (1-indexed); 0 -> after the last block, -k -> before the last k
         self.skip_inject_after = resolve_skip_inject(skip_inject_block, depth)
+        # training only (set by train_jit.py, not part of the architecture): fraction of samples whose skip is dropped,
+        # so the trunk still has to reconstruct them through the bottleneck
+        self.skip_drop_prob = 0.0
         assert skip_inject_block == 0 or skip_pathway, 'skip_inject_block needs skip_pathway'
 
         # time and class embed
@@ -588,6 +591,14 @@ class JiT(nn.Module):
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
+    def gated_skip(self, skip, c):
+        # gate(c) * skip; in training, each sample's skip is dropped (gate zeroed) with probability skip_drop_prob, the way
+        # label dropout works for CFG, so the trunk keeps reconstructing those samples through the bottleneck alone
+        gate = self.skip_gate(c)
+        if self.training and self.skip_drop_prob > 0:
+            gate = gate * (torch.rand(gate.shape[0], 1, device=gate.device) >= self.skip_drop_prob).to(gate.dtype)
+        return gate.unsqueeze(1) * skip
+
     def inject_skip(self, x, gated, res, i):
         """
         Mid-trunk skip injection after block i (0-indexed), returning the next block's input. Without AttnRes the gated
@@ -639,7 +650,7 @@ class JiT(nn.Module):
         c_blocks = self.t_block(c) if self.adaln_single else c
 
         # forward JiT
-        skip = self.skip_embedder(x) if self.skip_pathway else None # from the noisy input, before x is reused
+        gated_skip = self.gated_skip(self.skip_embedder(x), c) if self.skip_pathway else None # from the noisy input, before x is reused
         x = self.x_embedder(x, self.bottleneck_gate(c)) if self.gated_bottleneck else self.x_embedder(x)
         x += self.pos_embed
 
@@ -656,12 +667,12 @@ class JiT(nn.Module):
                     x = res.mix(2 * i)
             x = block(x, c_blocks, self.feat_rope if i < self.in_context_start else self.feat_rope_incontext, res=res, index=i)
             if self.skip_pathway and i + 1 == self.skip_inject_after < len(self.blocks):
-                x = self.inject_skip(x, self.skip_gate(c).unsqueeze(1) * skip, res, i)
+                x = self.inject_skip(x, gated_skip, res, i)
 
         x = x[:, self.in_context_len:]
         if self.skip_pathway:
             if self.skip_inject_after == len(self.blocks): # after the trunk: added to its output directly
-                x = x + self.skip_gate(c).unsqueeze(1) * skip
+                x = x + gated_skip
             for block in self.skip_head:
                 x = block(x, c_blocks, self.feat_rope)
 
