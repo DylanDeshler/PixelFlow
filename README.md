@@ -181,6 +181,30 @@ denoiser. In-context class tokens are added to the embedding source, and the oth
 The architecture is stored in the checkpoint, so `eval_jit.py` and `eval_linear.py` rebuild it. Block hooks (REPA,
 probes) see each block's output as the input the next block actually receives.
 
+With diagnostics on, AttnRes runs also log their depth-mixing weights. `diagnostics/attn_res_alpha_{iter}.png`
+shows the layer x source weights at the noisiest, middle and cleanest noise level. `attn_res_emb_weight/t*` is the
+final layer's weight on the patch embedding per noise level, i.e. how much it reads the input directly.
+`trends/attn_res.png` shows both over training. If the final layer's embedding weight already swings with t,
+routing adapts through the content-dependent keys alone.
+
+`--attn_res_adaln=True` conditions the depth mixing on time and class with adaLN on the queries:
+w_l(c) = w_l * (1 + scale(c)) + shift(c). One zero-initialized projection is shared by all queries, about 1.2M
+parameters on JiT-B, and it starts as plain AttnRes. The shift goes on the query side because on the keys it would
+cancel in the softmax over sources. The motivation: the best mixing should depend on the noise level, leaning on the
+embedding near t=1 (keep and edit the input) and on deep outputs at high noise.
+
+## Gated bottleneck
+
+`--gated_bottleneck=True` adds a full-rank patch embedding next to JiT's 128-d bottleneck, behind a per-channel gate
+from the conditioning (time + class), adaLN-style and zero-initialized:
+`embedding = proj2(proj1(patch)) + gate(c) * bypass(patch)`. It starts as exactly the bottleneck model. The gate can
+open where the input's fine detail is useful (low noise) and stay shut where the patch is mostly noise. It adds about
+1.2M parameters on JiT-B. The motivation: with the bottleneck, the model is several times worse than copying its
+input in the finest bands at low noise. Removing the bottleneck (`--bottleneck_dim=768`) fixes that and lowers the
+loss, but costs FID and mid/deep probe accuracy. Token masking replaces the whole embedding, bypass included. The
+diagnostics log the gated path's RMS relative to the bottleneck path per noise level (`bypass_ratio/t*`), plotted
+in `trends/gated_bottleneck.png`.
+
 ## adaLN-single
 
 `--adaln_single=True` swaps JiT's per-block adaLN projections for PixArt-alpha's adaLN-single. One projection of

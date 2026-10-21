@@ -1,7 +1,7 @@
 # Vendored from https://github.com/LTH14/JiT (commit cbc743a, MIT license, see LICENSE_JiT).
 # Local changes: attn_bias is created on query.device instead of via .cuda(), so the model runs on any device;
-# optional Attention Residuals (attn_res, see AttnResState) and adaLN-single (adaln_single), both off by default, in
-# which case the model is unchanged.
+# optional Attention Residuals (attn_res, see AttnResState), adaLN-single (adaln_single) and a gated bottleneck
+# (gated_bottleneck, see GatedBottleneckPatchEmbed), all off by default, in which case the model is unchanged.
 # --------------------------------------------------------
 # References:
 # SiT: https://github.com/willisma/SiT
@@ -39,6 +39,29 @@ class BottleneckPatchEmbed(nn.Module):
             f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
         x = self.proj2(self.proj1(x)).flatten(2).transpose(1, 2)
         return x
+
+
+class GatedBottleneckPatchEmbed(BottleneckPatchEmbed):
+    """
+    JiT's low-rank bottleneck patch embedding plus a full-rank one behind a gate from the conditioning (time + class):
+        embedding = proj2(proj1(patch)) + gate(c) * bypass(patch)
+    The gate (computed by JiT.bottleneck_gate, zero-initialized) starts closed, i.e. exactly JiT's bottleneck, and can
+    open where the input's fine detail is worth having (low noise) while staying shut where the patch is mostly noise.
+    Both terms are linear in the patch, so this is one linear embedding whose rank depends on c, not two copies of it.
+    Computed inside the embedder so token masking (a hook on its output) replaces the whole embedding.
+    """
+    def __init__(self, img_size=224, patch_size=16, in_chans=3, pca_dim=768, embed_dim=768, bias=True):
+        super().__init__(img_size, patch_size, in_chans, pca_dim, embed_dim, bias)
+        self.bypass = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size, bias=False)
+
+    def bypass_tokens(self, x):
+        return self.bypass(x).flatten(2).transpose(1, 2)
+
+    def forward(self, x, gate=None):
+        out = super().forward(x)
+        if gate is None:
+            return out
+        return out + gate.unsqueeze(1) * self.bypass_tokens(x)
 
 
 class TimestepEmbedder(nn.Module):
@@ -296,20 +319,31 @@ class AttnResState:
     paper's two-phase computation does). The weighted sum is accumulated in place in eager mode (_DepthMix) and left to
     the compiler's fusion under whole-model compile. Nothing [S, B, T, D]-sized is saved for backward.
     """
-    def __init__(self, net, emb):
+    def __init__(self, net, emb, c=None):
+        """
+        c: the conditioning vector [B, D], needed with attn_res_adaln: adaLN on the queries,
+        w_l(c) = w_l * (1 + scale(c)) + shift(c), from one zero-initialized projection shared by all of them (as in
+        adaLN-single). On the key side the shift would cancel in the softmax over sources, so it goes on the query.
+        """
         self.queries, self.norms = net.attn_res_queries, net.attn_res_norms
         self.eps = self.norms[0].variance_epsilon
         self.group = 1 if net.attn_res == 'full' else 2 * net.attn_res_block_size # sublayers per source
-        self.keys = torch.stack([n.weight * q for n, q in zip(self.norms, self.queries)]) # [2 * depth + 1, D]
+        gains = torch.stack([n.weight for n in self.norms]) # [2 * depth + 1, D]
+        queries = torch.stack(list(self.queries))
+        if net.attn_res_adaln:
+            shift, scale = net.attn_res_modulation(c).unsqueeze(1).chunk(2, dim=-1) # [B, 1, D] each
+            queries = queries * (1 + scale) + shift # [B, 2 * depth + 1, D]
+        self.keys = gains * queries # the key norm's gain folded into the queries: [2 * depth + 1, D] or per sample [B, ., D]
         self.sources, self.logits = [], [] # completed sources and their logits for every sublayer [B, T, 2 * depth + 1]
         self.partial = None
         self.count = 0
+        self.weights = None # {sublayer: mean mixing weight per source [S]} when recording (diagnostics only)
         self._append(emb)
 
     def _logits(self, v, keys):
         # v: [B, T, D] -> w . RMSNorm(v) for each row of keys, fp32 [B, T, K]
         ms = torch.linalg.vecdot(v, v).unsqueeze(-1).float() / v.shape[-1] # mean square, [B, T, 1]
-        return (v @ keys.t().to(v.dtype)).float() * torch.rsqrt(ms + self.eps)
+        return (v @ keys.transpose(-1, -2).to(v.dtype)).float() * torch.rsqrt(ms + self.eps)
 
     def _append(self, v):
         self.sources.append(v)
@@ -326,10 +360,14 @@ class AttnResState:
         sources, logits = self.sources, [c[..., l] for c in self.logits]
         if self.partial is not None:
             sources = sources + [self.partial]
-            logits.append(self._logits(self.partial, self.keys[l:l + 1])[..., 0])
+            logits.append(self._logits(self.partial, self.keys[..., l:l + 1, :])[..., 0])
         if len(sources) == 1: # the first sublayer only sees the embedding (so its query never trains)
+            if self.weights is not None:
+                self.weights[l] = torch.ones(1, device=sources[0].device)
             return sources[0]
         alpha = torch.stack(logits).softmax(0)
+        if self.weights is not None:
+            self.weights[l] = alpha.float().mean(dim=(1, 2))
         if torch.compiler.is_compiling():
             # whole-model compile unrolls the block loop, so S is fixed here: the plain weighted sum fuses into one
             # kernel and the compiler saves only alpha and the sources for backward
@@ -367,7 +405,9 @@ class JiT(nn.Module):
         in_context_start=8,
         attn_res='none',
         attn_res_block_size=0,
-        adaln_single=False
+        adaln_single=False,
+        attn_res_adaln=False,
+        gated_bottleneck=False
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -384,6 +424,9 @@ class JiT(nn.Module):
         # JiT blocks per Block AttnRes block; 0 -> about 8 blocks, the paper's default
         self.attn_res_block_size = attn_res_block_size or max(1, round(depth / 8))
         self.adaln_single = adaln_single
+        assert not attn_res_adaln or attn_res != 'none', 'attn_res_adaln needs attn_res'
+        self.attn_res_adaln = attn_res_adaln
+        self.gated_bottleneck = gated_bottleneck
 
         # time and class embed
         self.t_embedder = TimestepEmbedder(hidden_size)
@@ -393,7 +436,11 @@ class JiT(nn.Module):
             self.t_block = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size, bias=True))
 
         # linear embed
-        self.x_embedder = BottleneckPatchEmbed(input_size, patch_size, in_channels, bottleneck_dim, hidden_size, bias=True)
+        embedder = GatedBottleneckPatchEmbed if gated_bottleneck else BottleneckPatchEmbed
+        self.x_embedder = embedder(input_size, patch_size, in_channels, bottleneck_dim, hidden_size, bias=True)
+        if gated_bottleneck:
+            # per-channel gate on the full-rank patch embedding, from the conditioning (adaLN-style, zero-initialized)
+            self.bottleneck_gate = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, hidden_size, bias=True))
 
         # use fixed sin-cos embedding
         num_patches = self.x_embedder.num_patches
@@ -433,6 +480,9 @@ class JiT(nn.Module):
         if self.attn_res != 'none':
             self.attn_res_queries = nn.ParameterList([nn.Parameter(torch.zeros(hidden_size)) for _ in range(2 * depth + 1)])
             self.attn_res_norms = nn.ModuleList([RMSNorm(hidden_size) for _ in range(2 * depth + 1)])
+            if attn_res_adaln:
+                # adaLN on the depth-attention queries: one (shift, scale) projection of c shared by all of them
+                self.attn_res_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size, bias=True))
 
         self.initialize_weights()
 
@@ -455,6 +505,11 @@ class JiT(nn.Module):
         w2 = self.x_embedder.proj2.weight.data
         nn.init.xavier_uniform_(w2.view([w2.shape[0], -1]))
         nn.init.constant_(self.x_embedder.proj2.bias, 0)
+        if self.gated_bottleneck: # the bypass like the patch embedding; its gate starts closed (= JiT's bottleneck)
+            w = self.x_embedder.bypass.weight.data
+            nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+            nn.init.constant_(self.bottleneck_gate[-1].weight, 0)
+            nn.init.constant_(self.bottleneck_gate[-1].bias, 0)
 
         # Initialize label embedding table:
         nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
@@ -462,6 +517,9 @@ class JiT(nn.Module):
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
+        if self.attn_res_adaln: # starts as plain AttnRes
+            nn.init.constant_(self.attn_res_modulation[-1].weight, 0)
+            nn.init.constant_(self.attn_res_modulation[-1].bias, 0)
         if self.adaln_single:
             # PixArt-alpha's init: the shared projection starts at zero, so modulation starts at the (random) per-block
             # tables; blocks start as identities through zero-initialized attention / MLP output projections instead of
@@ -511,10 +569,10 @@ class JiT(nn.Module):
         c_blocks = self.t_block(c) if self.adaln_single else c
 
         # forward JiT
-        x = self.x_embedder(x)
+        x = self.x_embedder(x, self.bottleneck_gate(c)) if self.gated_bottleneck else self.x_embedder(x)
         x += self.pos_embed
 
-        res = AttnResState(self, x) if self.attn_res != 'none' else None
+        res = AttnResState(self, x, c) if self.attn_res != 'none' else None
         for i, block in enumerate(self.blocks):
             # in-context
             if self.in_context_len > 0 and i == self.in_context_start:

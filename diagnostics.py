@@ -22,7 +22,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from model_jit import modulate, AttnResState
+from model_jit import modulate, AttnResState, BottleneckPatchEmbed
 from evaluation import knn_classifier
 
 
@@ -117,10 +117,20 @@ def instrumented_forward(net, x, t, y, capture_blocks=(), tile=None):
     y_emb = net.y_embedder(y)
     c = t_emb + y_emb
     c_blocks = net.t_block(c) if getattr(net, 'adaln_single', False) else c
-    h = net.x_embedder(x) + net.pos_embed
+    if getattr(net, 'gated_bottleneck', False):
+        # gated bottleneck: how much the full-rank bypass adds relative to the bottleneck path (RMS ratio; 0 = shut)
+        base = BottleneckPatchEmbed.forward(net.x_embedder, x) # the bottleneck path alone
+        bypass = net.bottleneck_gate(c).unsqueeze(1) * net.x_embedder.bypass_tokens(x)
+        h = base + bypass + net.pos_embed
+        bypass_ratio = bypass.float().pow(2).mean().sqrt() / base.float().pow(2).mean().sqrt().clamp_min(1e-12)
+    else:
+        h = net.x_embedder(x) + net.pos_embed
+        bypass_ratio = None
     stats = {k: [] for k in ('attn_entropy', 'attn_dist', 'attn_prefix_mass', 'gate_msa', 'gate_mlp')}
     feats = {}
-    res = AttnResState(net, h) if getattr(net, 'attn_res', 'none') != 'none' else None
+    res = AttnResState(net, h, c) if getattr(net, 'attn_res', 'none') != 'none' else None
+    if res is not None:
+        res.weights = {0: torch.ones(1, device=x.device)} # record the depth-mixing weights; the first sublayer reads the embedding only
     for i, block in enumerate(net.blocks):
         if net.in_context_len > 0 and i == net.in_context_start:
             ic = y_emb.unsqueeze(1).repeat(1, net.in_context_len, 1) + net.in_context_posemb
@@ -141,7 +151,33 @@ def instrumented_forward(net, x, t, y, capture_blocks=(), tile=None):
     shift, scale = fl.modulation(c)
     out = net.unpatchify(fl.linear(modulate(fl.norm_final(h), shift, scale)), net.patch_size)
     stats = {k: torch.stack(v) for k, v in stats.items()}
+    if bypass_ratio is not None:
+        stats['bypass_ratio'] = bypass_ratio.reshape(1)
+    if res is not None:
+        stats['attn_res_alpha'] = attn_res_matrix(res.weights, x.device)
     return out, stats, feats
+
+def attn_res_matrix(weights, device):
+    """
+    AttnRes mixing weights as [sublayers + final, sources] (mean over batch and tokens). Row l: sublayer l's input
+    (attention / MLP of each block in order, then the final layer). Column 0: the patch embedding, column j: the j-th
+    source (a sublayer output for full, a block sum for block; the current block's partial sum sits at its own index).
+    NaN where a source doesn't exist yet.
+    """
+    rows = max(weights) + 1
+    cols = max(len(w) for w in weights.values())
+    m = torch.full((rows, cols), float('nan'), device=device)
+    for l, w in weights.items():
+        m[l, :len(w)] = w
+    return m
+
+def attn_res_labels(depth, n_sources):
+    rows = [f'b{i // 2 + 1}.{"attn" if i % 2 == 0 else "mlp"}' for i in range(2 * depth)] + ['final']
+    if n_sources == 2 * depth + 1: # full: one source per sublayer output
+        cols = ['emb'] + rows[:-1]
+    else:
+        cols = ['emb'] + [f'group{j}' for j in range(1, n_sources)]
+    return rows, cols
 
 # -----------------------------------------------------------------------------
 # 6. frequency bands
@@ -348,6 +384,29 @@ def heatmap(values, row_labels, col_labels, title, path, log=True):
     fig.colorbar(im, ax=ax, label='log10' if log else None)
     fig.tight_layout()
     fig.savefig(path, dpi=120)
+    plt.close(fig)
+    return path
+
+def attn_res_figure(alpha, rows, cols, t_labels, path, step):
+    """
+    AttnRes mixing weights (rows: each sublayer's input and the final layer, cols: sources, blank = not available yet)
+    at the noisiest, middle and cleanest diagnostic noise level, on a shared color scale.
+    alpha: [t, rows, cols] numpy.
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    picks = sorted({0, len(t_labels) // 2, len(t_labels) - 1})
+    vmax = np.nanmax(alpha)
+    fig, axes = plt.subplots(1, len(picks), figsize=(1.5 + 0.28 * len(cols) * len(picks), 1.5 + 0.22 * len(rows)), squeeze=False)
+    for ax, i in zip(axes[0], picks):
+        im = ax.imshow(np.ma.masked_invalid(alpha[i]), aspect='auto', cmap='viridis', vmin=0, vmax=vmax)
+        ax.set_xticks(range(len(cols)), cols, rotation=90, fontsize=6)
+        ax.set_yticks(range(len(rows)), rows, fontsize=6)
+        ax.set_title(f't={t_labels[i]}', fontsize=9)
+    fig.colorbar(im, ax=axes[0].tolist(), label='mixing weight')
+    fig.suptitle(f'AttnRes depth-mixing weights, rows: input of each sublayer, cols: source (iter {step})', fontsize=9)
+    fig.savefig(path, dpi=120, bbox_inches='tight')
     plt.close(fig)
     return path
 

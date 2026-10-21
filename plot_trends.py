@@ -16,6 +16,8 @@ Figures:
     detail.png              per-band prediction error at low / high noise, sample vs real spectrum
     semantics_locality.png  probe accuracy per block, windowed-attention loss increase, attention distance
     optimization.png        loss, gradient norm, update/weight ratio per parameter group, lr
+    attn_res.png            AttnRes: the final layer's mixing weight on the patch embedding per noise level, and over sources (attn_res runs only)
+    gated_bottleneck.png    how far the gated full-rank patch path is open, per noise level (gated_bottleneck runs only)
     compare.png / .csv      key curves and latest values across runs
 """
 
@@ -228,6 +230,62 @@ def fig_detail(run, out):
     fig.tight_layout(rect=(0, 0, 1, 0.93))
     return save(fig, os.path.join(out, 'detail.png'))
 
+def fig_attn_res(run, out):
+    # how much the final layer reads the patch embedding directly, per noise level, and its weights over all sources
+    diags = [d for d in run['diags'] if 'attn_res_alpha' in d['passes']['val']]
+    if not diags:
+        return None
+    plt = setup()
+    ts = diags[-1]['t']
+    alpha = [np.array(d['passes']['val']['attn_res_alpha'], dtype=float) for d in diags] # each [t, rows, sources]
+    emb = np.array([a[:, -1, 0] for a in alpha]).T # [t, eval]
+    sub = dict(run, diags=diags, x=np.array([run['scale'](d['iter']) for d in diags]))
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.8), facecolor=SURFACE, gridspec_kw={'width_ratios': [1.2, 1]})
+    ax = axes[0]
+    im = ax.imshow(emb, aspect='auto', cmap='Blues', vmin=0, vmax=max(1e-6, np.nanmax(emb)))
+    heatmap_style(ax, im, fig, eval_labels(sub), tlabels(ts), "final layer's weight on the patch embedding, by noise level", 'mixing weight')
+    ax.set_xlabel(run['xlabel'], color=INK_2, fontsize=8)
+    ax = axes[1]
+    last = alpha[-1][:, -1, :] # [t, sources] at the latest eval
+    picks = sorted({0, len(ts) // 2, len(ts) - 1})
+    for color, i in zip(ordinal_blues(len(picks)), picks):
+        line(ax, np.arange(last.shape[1]), last[i], color, label=f't={ts[i]:.2f}')
+    ax.set_ylim(0, 1.1 * max(1e-6, np.nanmax(last)))
+    ax.ticklabel_format(axis='y', useOffset=False)
+    ax.set_xlabel('source (0 = patch embedding, then in depth order)', color=INK_2, fontsize=8)
+    ax.set_ylabel('mixing weight', color=INK_2, fontsize=8)
+    ax.legend(frameon=False, fontsize=8)
+    ax.set_title(f"final layer's weights over sources (iter {diags[-1]['iter']:,})", color=INK, fontsize=9, loc='left')
+    fig.suptitle(f"{run['name']}: attention residuals", color=INK, fontsize=11, x=0.01, ha='left')
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    return save(fig, os.path.join(out, 'attn_res.png'))
+
+def fig_gated_bottleneck(run, out):
+    # RMS of the gated full-rank patch embedding relative to the bottleneck path, per noise level (0 = gate shut)
+    diags = [d for d in run['diags'] if 'bypass_ratio' in d['passes']['val']]
+    if not diags:
+        return None
+    plt = setup()
+    ts = diags[-1]['t']
+    ratio = np.array([np.array(d['passes']['val']['bypass_ratio'])[:, 0] for d in diags]).T # [t, eval]
+    sub = dict(run, diags=diags, x=np.array([run['scale'](d['iter']) for d in diags]))
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.8), facecolor=SURFACE, gridspec_kw={'width_ratios': [1.3, 1]})
+    ax = axes[0]
+    im = ax.imshow(ratio, aspect='auto', cmap='Blues', vmin=0, vmax=max(1e-6, ratio.max()))
+    heatmap_style(ax, im, fig, eval_labels(sub), tlabels(ts), 'full-rank path / bottleneck path (RMS), by noise level', 'ratio')
+    ax.set_xlabel(run['xlabel'], color=INK_2, fontsize=8)
+    ax = axes[1]
+    picks = sorted({0, len(diags) // 2, len(diags) - 1})
+    for color, i in zip(ordinal_blues(len(picks)), picks):
+        line(ax, ts, ratio[:, i], color, label=f"iter {diags[i]['iter']:,}")
+    ax.set_xlabel('t (1 = clean)', color=INK_2, fontsize=8)
+    ax.set_ylabel('full-rank / bottleneck (RMS)', color=INK_2, fontsize=8)
+    ax.legend(frameon=False, fontsize=8)
+    ax.set_title('gate opening vs noise level', color=INK, fontsize=9, loc='left')
+    fig.suptitle(f"{run['name']}: gated bottleneck", color=INK, fontsize=11, x=0.01, ha='left')
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    return save(fig, os.path.join(out, 'gated_bottleneck.png'))
+
 def fig_semantics_locality(run, out):
     plt = setup()
     fig, axes = plt.subplots(2, 2, figsize=(12, 8), facecolor=SURFACE)
@@ -376,7 +434,8 @@ def make_run_figures(run_dir):
     os.makedirs(out, exist_ok=True)
     figures = {}
     for name, fn in (('convergence', fig_convergence), ('noise_levels', fig_noise_levels), ('detail', fig_detail),
-                     ('semantics_locality', fig_semantics_locality), ('optimization', fig_optimization)):
+                     ('semantics_locality', fig_semantics_locality), ('optimization', fig_optimization),
+                     ('attn_res', fig_attn_res), ('gated_bottleneck', fig_gated_bottleneck)):
         path = fn(run, out)
         if path:
             figures[name] = path

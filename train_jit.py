@@ -71,6 +71,8 @@ in_context_start = -1 # block where the in-context tokens are prepended
 mlp_ratio = -1.0
 attn_res = 'none' # 'full' | 'block': Attention Residuals (arXiv 2603.15031), softmax mixing over depth instead of the plain residual sum
 attn_res_block_size = 0 # block only: JiT blocks per AttnRes block; 0 -> about 8 blocks (the paper's default)
+gated_bottleneck = False # add a full-rank patch embedding behind a gate from the conditioning (zero-init: starts as the bottleneck)
+attn_res_adaln = False # adaLN on the AttnRes queries from the conditioning (time + class), one shared projection (~1.2M params on JiT-B)
 adaln_single = False # adaLN-single (PixArt-alpha): one modulation projection shared by all blocks + a learned table per block (~40M fewer params on JiT-B)
 attn_dropout = 0.0
 proj_dropout = 0.0
@@ -194,7 +196,7 @@ model_name, arch = resolve_arch(model, **{k: (None if v < 0 else v) for k, v in 
     in_context_len=in_context_len, in_context_start=in_context_start, mlp_ratio=mlp_ratio).items()},
     attn_res=None if attn_res == 'none' else attn_res,
     attn_res_block_size=attn_res_block_size if (attn_res == 'block' and attn_res_block_size > 0) else None,
-    adaln_single=adaln_single or None)
+    adaln_single=adaln_single or None, attn_res_adaln=attn_res_adaln or None, gated_bottleneck=gated_bottleneck or None)
 if not out_dir:
     out_dir = run_dir(runs_root, dataset, model, arch, config, _defaults, run_name)
     legacy = legacy_run_dir(runs_root, dataset, model, arch, config, _defaults, run_name)
@@ -300,12 +302,20 @@ def muon_split(name):
         return 2
     if name.endswith('adaLN_modulation.1.weight') or name.endswith('t_block.1.weight'):
         return 6
+    if name.endswith('attn_res_modulation.1.weight'):
+        return 2
     return 1
 
+# (adaln_single's per-block scale_shift_table is 2D but is 6 per-channel vectors, like gains / biases: AdamW)
 muon_named = {id(p): (n, p) for n, p in denoiser.net.blocks.named_parameters()
-              if optimizer_type == 'muon' and p.ndim >= 2 and p.requires_grad and (muon_adaln or 'adaLN_modulation' not in n)}
+              if optimizer_type == 'muon' and p.ndim >= 2 and p.requires_grad and (muon_adaln or 'adaLN_modulation' not in n)
+              and 'scale_shift_table' not in n}
 if optimizer_type == 'muon' and muon_adaln and adaln_single: # the shared adaLN projection is the blocks' adaLN matrix
     muon_named[id(denoiser.net.t_block[1].weight)] = ('t_block.1.weight', denoiser.net.t_block[1].weight)
+if optimizer_type == 'muon' and muon_adaln and gated_bottleneck: # an adaLN-style gate projection
+    muon_named[id(denoiser.net.bottleneck_gate[1].weight)] = ('bottleneck_gate.1.weight', denoiser.net.bottleneck_gate[1].weight)
+if optimizer_type == 'muon' and muon_adaln and attn_res_adaln: # an adaLN projection like the blocks'
+    muon_named[id(denoiser.net.attn_res_modulation[1].weight)] = ('attn_res_modulation.1.weight', denoiser.net.attn_res_modulation[1].weight)
 muon_params = {} # split -> params
 for name, p in trainable:
     if not p.requires_grad:
@@ -313,7 +323,7 @@ for name, p in trainable:
     if id(p) in muon_named:
         muon_params.setdefault(muon_split(muon_named[id(p)][0]), []).append(p)
     else:
-        (no_decay if p.ndim == 1 or name.endswith('.bias') else decay).append(p)
+        (no_decay if p.ndim == 1 or name.endswith('.bias') or 'scale_shift_table' in name else decay).append(p)
 # every group stores its peak lr; the schedule scales all of them by the same factor
 adamw = torch.optim.AdamW(
     [{'params': no_decay, 'weight_decay': 0.0, 'peak_lr': lr}, {'params': decay, 'weight_decay': weight_decay, 'peak_lr': lr}],
@@ -537,6 +547,18 @@ def evaluate(step):
     for k, inc in window_increase.items():
         for i, tl in enumerate(t_labels):
             log[f'window_loss_increase/tile{k}_t{tl}'] = inc[i].item()
+    if 'attn_res_alpha' in pv:
+        # AttnRes: the final layer's mixing weight on the patch embedding per noise level (how much it reads the input
+        # directly), and the full layer x source weights at the noisiest, middle and cleanest noise level
+        alpha = pv['attn_res_alpha'] # [t, sublayers + final, sources]
+        for i, tl in enumerate(t_labels):
+            log[f'attn_res_emb_weight/t{tl}'] = alpha[i, -1, 0].item()
+        rows, cols = diag_lib.attn_res_labels(arch['depth'], alpha.shape[2])
+        images['attn_res_alpha'] = diag_lib.attn_res_figure(alpha.numpy(), rows, cols, t_labels,
+                                                            os.path.join(out_dir, 'diagnostics', f'attn_res_alpha_{step}.png'), step)
+    if 'bypass_ratio' in pv: # gated bottleneck: RMS of the gated full-rank path / the bottleneck path, per noise level
+        for i, tl in enumerate(t_labels):
+            log[f'bypass_ratio/t{tl}'] = pv['bypass_ratio'][i, 0].item()
     band_labels = [f'band{k}' for k in range(diag_freq_bands)]
     for k, bl in enumerate(band_labels):
         log[f'freq_err/{bl}'] = pv['freq_rel_err'][:, k].mean().item()
