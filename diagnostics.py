@@ -163,7 +163,7 @@ def instrumented_forward(net, x, t, y, capture_blocks=(), tile=None):
             h = h + gated
         for block in net.skip_head:
             h = block(h, c_blocks, net.feat_rope)
-    out = net.output(h, c) # final layer, unpatchify / overlap-add, DC-AE head
+    out = net.output(h, c, net.prediction_layer()) # final layer (the skip branch's own, if any), unpatchify / overlap-add, DC-AE head
     stats = {k: torch.stack(v) for k, v in stats.items()}
     if bypass_ratio is not None:
         stats['bypass_ratio'] = bypass_ratio.reshape(1)

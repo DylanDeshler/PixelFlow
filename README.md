@@ -230,6 +230,12 @@ blocks after the injection point costs about (12 - k) / 12 extra compute for inj
 the with-skip loss (comparable to other runs) and `train/loss_trunk` the trunk-only one. Evaluation and sampling use
 the with-skip prediction.
 
+`--skip_final_layer=True` (with `--skip_stop_grad`) gives the with-skip prediction its own final layer, starting as an
+exact copy. JiT's final layer then serves only the trunk-only branch. With injection after the trunk, the trunk is
+then trained exactly like vanilla JiT, apart from gradient clipping on the combined norm. Mid-trunk, the blocks after
+the injection point are still shared. With `--dcae_head`, the DC-AE head after the final layer is shared as well.
+About +0.6M params on JiT-B.
+
 `--skip_pathway_drop_prob=p` (default 0, off) drops the skip for a random fraction p of training samples, the way
 label dropout works for CFG. On those samples the trunk has to reconstruct everything through the bottleneck. The
 motivation: with the skip always on, the trunk's probes trailed at every noise level, even where the skip's gate was

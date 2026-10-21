@@ -546,7 +546,8 @@ class JiT(nn.Module):
         dcae_width=128,
         dcae_kernel2=1,
         patch_overlap=0,
-        layernorm=False
+        layernorm=False,
+        skip_final_layer=False
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -570,6 +571,8 @@ class JiT(nn.Module):
         self.skip_pathway = skip_pathway
         self.dcae_stem, self.dcae_head, self.patch_overlap = dcae_stem, dcae_head, patch_overlap
         self.layernorm = layernorm
+        assert not skip_final_layer or skip_pathway, 'skip_final_layer needs skip_pathway'
+        self.has_skip_final_layer = skip_final_layer
         assert not dcae_stem or patch_size == 16, 'dcae_stem is built for 16px patches'
         # where the skip enters: after block skip_inject_after (1-indexed); 0 -> after the last block, -k -> before the last k
         self.skip_inject_after = resolve_skip_inject(skip_inject_block, depth)
@@ -638,6 +641,10 @@ class JiT(nn.Module):
         # linear predict
         # with patch_overlap the final layer predicts overlapping (patch + 2 * overlap)^2 patches, blended by overlap-add
         self.final_layer = FinalLayer(hidden_size, patch_size + 2 * patch_overlap, self.out_channels, adaln_single=adaln_single, layernorm=layernorm)
+        if skip_final_layer:
+            # the with-skip prediction (what evaluation and sampling use) gets its own final layer; final_layer then only
+            # serves the trunk-only branch of skip_stop_grad, so nothing the skip branch trains is shared with the trunk
+            self.skip_final_layer = FinalLayer(hidden_size, patch_size + 2 * patch_overlap, self.out_channels, adaln_single=adaln_single, layernorm=layernorm)
         if dcae_head:
             self.output_head = DCAEHead(self.out_channels, patch_size, dcae_width, dcae_kernel2, hidden_size, layernorm)
 
@@ -715,6 +722,8 @@ class JiT(nn.Module):
 
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
+        if self.has_skip_final_layer: # starts as an exact copy, so both predictions start identical
+            self.skip_final_layer.load_state_dict(self.final_layer.state_dict())
 
     def gated_skip(self, skip, c):
         # gate(c) * skip; in training, each sample's skip is dropped (gate zeroed) with probability skip_drop_prob, the way
@@ -817,7 +826,7 @@ class JiT(nn.Module):
             xs = xs[:, self.in_context_len:] + gated
         for block in self.skip_head:
             xs = block(xs, cbs, self.feat_rope)
-        output = self.output(xs, cs)
+        output = self.output(xs, cs, self.prediction_layer())
         if not two:
             return output
         # trunk-only branch, run last so block hooks (e.g. REPA's capture) see the trunk's own activations
@@ -832,9 +841,13 @@ class JiT(nn.Module):
         x += self.pos_embed # in place, as JiT does: keeps the embedding's dtype (bf16 under autocast), the fp32 table would promote it
         return x
 
-    def output(self, x, c):
+    def prediction_layer(self):
+        # the final layer of the prediction the model is evaluated / sampled with
+        return self.skip_final_layer if self.has_skip_final_layer else self.final_layer
+
+    def output(self, x, c, final_layer=None):
         # final layer -> image (unpatchify, or overlap-add for patch_overlap) -> (DC-AE head)
-        x = self.final_layer(x, c)
+        x = (final_layer or self.final_layer)(x, c)
         if self.patch_overlap:
             o, p = self.patch_overlap, self.patch_size
             k, size = p + 2 * o, self.input_size

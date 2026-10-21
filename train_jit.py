@@ -81,6 +81,7 @@ layernorm = False # every RMSNorm in the network (block pre-norms, QK-norm, fina
 patch_overlap = 0 # pixels each patch overlaps its neighbours on every side, in the patch embedding and the output (overlap-add)
 skip_pathway = False # full-rank input patches merged into the trunk's output before the final layer, behind a gate from the conditioning (zero-init)
 skip_head_blocks = 0 # skip_pathway only: JiT blocks after the merge, so input detail can be combined with trunk features
+skip_final_layer = False # skip_pathway + skip_stop_grad: the with-skip prediction gets its own final layer (trunk trained exactly as vanilla when injected after the trunk)
 skip_stop_grad = False # skip_pathway only: also train the trunk-only prediction; the skip branch's loss stops at the injection point (trunk trained as vanilla JiT)
 skip_pathway_drop_prob = 0.0 # skip_pathway only: in training, drop the skip for this fraction of samples (the trunk then reconstructs them alone)
 skip_inject_block = 0 # skip_pathway only: 0 -> after the trunk; -k -> before the last k blocks; k -> after block k
@@ -211,6 +212,7 @@ model_name, arch = resolve_arch(model, **{k: (None if v < 0 else v) for k, v in 
     attn_res_block_size=attn_res_block_size if (attn_res == 'block' and attn_res_block_size > 0) else None,
     adaln_single=adaln_single or None, attn_res_adaln=attn_res_adaln or None, gated_bottleneck=gated_bottleneck or None,
     skip_pathway=skip_pathway or None, skip_head_blocks=skip_head_blocks or None, skip_inject_block=skip_inject_block or None,
+    skip_final_layer=skip_final_layer or None,
     dcae_stem=dcae_stem or None, dcae_head=dcae_head or None, patch_overlap=patch_overlap or None, layernorm=layernorm or None,
     dcae_width=dcae_width if (dcae_stem or dcae_head) and dcae_width != 128 else None,
     dcae_kernel2=dcae_kernel2 if (dcae_stem or dcae_head) and dcae_kernel2 != 1 else None)
@@ -278,6 +280,7 @@ denoiser.ema_warmup = ema_warmup
 assert skip_pathway_drop_prob == 0 or skip_pathway, 'skip_pathway_drop_prob needs skip_pathway'
 assert 0 <= skip_pathway_drop_prob < 1, 'skip_pathway_drop_prob must be in [0, 1)'
 assert not skip_stop_grad or skip_pathway, 'skip_stop_grad needs skip_pathway'
+assert not skip_final_layer or skip_stop_grad, 'skip_final_layer needs skip_stop_grad (otherwise the original final layer is never used)'
 if skip_pathway:
     denoiser.net.skip_drop_prob = skip_pathway_drop_prob # training only; evaluation and sampling always use the skip
     denoiser.net.skip_stop_grad = skip_stop_grad
