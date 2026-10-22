@@ -14,6 +14,11 @@ sweep). A single scale is scored with --final_num_images directly.
 $ python eval_jit.py --ckpt=runs/in100_128/<model>/<run> --data_dir=/data/in100_128 --cfgs=1.0:4.0:0.25   # sweep at 10k, picks at 50k
 $ python eval_jit.py --ckpt=... --data_dir=/data/in100_128 --cfgs=1.0:4.0:0.25 --sweep_num_images=0      # sweep at 50k, no re-scoring
 --ckpt takes a checkpoint file (ckpt.pt, a milestone ckpt_{iter}.pt, or a released JiT .pth) or a run directory (its ckpt.pt).
+Every network call uses --gen_batch_size samples (it must be even), so the compiled model is built once per run: CFG 1
+generates gen_batch_size images per batch, CFG > 1 gen_batch_size / 2 (conditional + unconditional together), and the
+last batch is padded to full size with the extra samples discarded. Steps outside the guidance interval
+(--interval_min / --interval_max: CFG is only applied for t inside it, as in JiT's evaluation) keep the batched call
+with scale 1, so they need no other shape.
 
 --save_samples keeps every generated image of the final --final_num_images evaluation (one output per re-scored cfg, or
 the single cfg), in {out_dir}/samples/ in a standard format:
@@ -134,7 +139,7 @@ interval_max = 1.0
 sampling_method = 'heun'
 num_sampling_steps = 50
 time_schedule = 'uniform' # 'uniform' (JiT), 'shift' (FLUX/SD3-style, uses the checkpoint's P_mean), 'train_quantile'
-gen_batch_size = 256
+gen_batch_size = 256 # samples per network call (even: halved into conditional + unconditional under CFG)
 ema = 1 # which EMA to sample with (JiT uses the first, decay 0.9999)
 seed = 0
 save_samples = '' # '', 'png' or 'npz'
@@ -148,6 +153,7 @@ config = {k: globals()[k] for k in config_keys}
 # -----------------------------------------------------------------------------
 
 assert ckpt and data_dir, 'pass --ckpt and --data_dir'
+assert gen_batch_size % 2 == 0, f'gen_batch_size is the network batch, half conditional and half unconditional under CFG: must be even, got {gen_batch_size}'
 if os.path.isdir(ckpt): # a run directory: its latest checkpoint
     ckpt = os.path.join(ckpt, 'ckpt.pt')
 if not os.path.isfile(ckpt): # fail before creating anything next to a wrong path
@@ -174,7 +180,9 @@ else:
                          t_eps=a.t_eps, noise_scale=a.noise_scale)
 denoiser = build_denoiser(**denoiser_args).to(device)
 denoiser.load_state_dict(checkpoint[f'model_ema{ema}'])
+denoiser.eval() # inference only (also keeps the compiled graph from being rebuilt for a train-mode call)
 if compile:
+    # every sampling call has the same batch (fixed_shape below), so one static graph serves the whole evaluation
     denoiser.net.compile()
 denoiser.time_schedule = time_schedule
 print(f"loaded EMA{ema} weights of {denoiser_args['model']} from {ckpt}")
@@ -260,7 +268,7 @@ def evaluate_cfg(cfg, n, real, save=True):
     out = generate_and_score(
         denoiser, metrics, ref_stats, n, data.num_classes, device, ctx,
         cfg=cfg, interval=(interval_min, interval_max), steps=num_sampling_steps,
-        method=sampling_method, batch_size=gen_batch_size, seed=seed, on_batch=writer,
+        method=sampling_method, batch_size=gen_batch_size, seed=seed, on_batch=writer, fixed_shape=True,
     )
     if writer is not None:
         writer.close()
@@ -309,12 +317,15 @@ if rescore:
              f"; trade-off pick cfg {tradeoff_cfg:g} -> {f[str(tradeoff_cfg)]['fid']:.3f} (IS {f[str(tradeoff_cfg)]['is']:.1f})"))
 
 best_cfg = best_fid_cfg
-# a sample grid at the best cfg
+# a sample grid at the best cfg, generated at the sweep's batch shape (padded, extras discarded) so it needs no new graph
 denoiser.cfg_scale = float(best_cfg)
 labels = torch.linspace(0, data.num_classes - 1, 64).long().to(device)
+grid_batch = max(64, gen_batch_size // (1 if best_cfg == 1.0 else 2))
 torch.manual_seed(seed)
+denoiser.fixed_shape = True
 with torch.no_grad(), ctx:
-    x = denoiser.generate(labels)
+    x = denoiser.generate(torch.cat([labels, labels.new_zeros(grid_batch - 64)]))[:64]
+denoiser.fixed_shape = False
 tag = f"{final_num_images / 1000:g}k_{sampling_method}{num_sampling_steps}" + ('' if time_schedule == 'uniform' else f'_{time_schedule}')
 save_labeled_grid(x, [class_names[i] for i in labels.tolist()], os.path.join(samples_dir, f'eval_samples_{tag}.png'))
 with open(os.path.join(out_dir, f'eval_{tag}.json'), 'w') as f:

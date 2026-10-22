@@ -92,10 +92,15 @@ class FastDenoiser(Denoiser):
         low, high = self.cfg_interval
         # same interval rule as JiT's Denoiser._forward_sample
         in_interval = (t < high) & ((low == 0) | (t > low))
-        if self.cfg_scale == 1.0 or not bool(in_interval.any()):
-            x_cond = self.net(z, t.flatten(), labels)
+        # contiguous: the timesteps are an expand (stride 0 over the batch), and a compiled network guards on strides, so
+        # the conditional-only and the batched-CFG calls would otherwise need separate graphs
+        t_flat = t.flatten().contiguous()
+        # outside the guidance interval only the conditional forward is needed, unless every call must keep one batch
+        # shape (fixed_shape, for a single compiled graph): then the batched call runs with scale 1 there
+        if self.cfg_scale == 1.0 or (not self.fixed_shape and not bool(in_interval.any())):
+            x_cond = self.net(z, t_flat, labels)
             return (x_cond - z) / (1.0 - t).clamp_min(self.t_eps)
-        x_both = self.net(torch.cat([z, z]), torch.cat([t.flatten(), t.flatten()]),
+        x_both = self.net(torch.cat([z, z]), torch.cat([t_flat, t_flat]),
                           torch.cat([labels, torch.full_like(labels, self.num_classes)]))
         x_cond, x_uncond = x_both.chunk(2)
         v_cond = (x_cond - z) / (1.0 - t).clamp_min(self.t_eps)
@@ -104,6 +109,7 @@ class FastDenoiser(Denoiser):
         return v_uncond + scale * (v_cond - v_uncond)
 
     time_schedule = 'uniform'
+    fixed_shape = False # set by generate_and_score(fixed_shape=True)
 
     def sampling_timesteps(self, device):
         """
@@ -204,11 +210,16 @@ def ema_weights(model, which=1):
 
 @torch.no_grad()
 def generate_and_score(model, metrics, ref_stats, num_images, num_classes, device, ctx,
-                       cfg=1.0, interval=(0.0, 1.0), steps=50, method='heun', batch_size=256, seed=0, on_batch=None):
+                       cfg=1.0, interval=(0.0, 1.0), steps=50, method='heun', batch_size=256, seed=0, on_batch=None,
+                       fixed_shape=False):
     """
     Class-balanced generation (num_images / num_classes per class, as in JiT) and FID/IS against ref_stats.
     A fixed seed gives every evaluation the same noise and labels, so FID differences between runs
     aren't just sampling noise. on_batch(x_uint8, labels) sees every generated batch (e.g. for spectra / saving).
+    fixed_shape: every network call has batch_size samples, so a compiled network needs one graph (eval_jit.py):
+    batch_size images per batch without CFG, batch_size / 2 with batched CFG (conditional + unconditional), and the last
+    batch padded to full size with the extra samples discarded. batch_size must be even.
+    Changes which noise each sample gets, so it's off for training-time evals (comparable across runs).
     Returns {'fid', 'is', 'features'} where features are the samples' Inception pool features.
     """
     assert num_images % num_classes == 0, 'number of images per class must be the same'
@@ -216,21 +227,30 @@ def generate_and_score(model, metrics, ref_stats, num_images, num_classes, devic
     model.eval()
     model.cfg_scale, model.cfg_interval, model.steps, model.method = cfg, interval, steps, method
     labels_all = np.arange(num_classes).repeat(num_images // num_classes)
+    if fixed_shape and cfg != 1.0: # batched CFG doubles every network call
+        assert batch_size % 2 == 0, f'batch_size must be even with fixed_shape, got {batch_size}'
+        batch_size //= 2
+    model.fixed_shape = fixed_shape
 
     feats, logits = [], []
     with torch.random.fork_rng(devices=[device] if 'cuda' in str(device) else []):
         torch.manual_seed(seed)
         for start in tqdm(range(0, num_images, batch_size), desc=f'sampling (cfg {cfg})'):
-            labels = torch.from_numpy(labels_all[start:start + batch_size]).long().to(device)
+            batch_labels = labels_all[start:start + batch_size]
+            n = len(batch_labels)
+            if fixed_shape and n < batch_size: # pad the last batch; the extra samples are discarded below
+                batch_labels = np.concatenate([batch_labels, labels_all[:batch_size - n]])
+            labels = torch.from_numpy(batch_labels).long().to(device)
             with ctx:
                 x = model.generate(labels)
-            x = to_uint8(x)
+            x, labels = to_uint8(x[:n]), labels[:n]
             if on_batch is not None:
                 on_batch(x, labels)
             f, l = metrics.features(x)
             feats.append(f)
             logits.append(l)
     model.train(was_training)
+    model.fixed_shape = False
     feats = torch.cat(feats)
     fid, isc = metrics.compute(feats, torch.cat(logits), ref_stats)
     return {'fid': fid, 'is': isc, 'features': feats}
