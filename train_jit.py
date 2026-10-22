@@ -76,6 +76,7 @@ attn_res_block_size = 0 # block only: JiT blocks per AttnRes block; 0 -> about 8
 dcae_stem = False # DC-AE style residual conv branches before the patch embedding (full resolution and the 4px level), zero-init gates
 dcae_head = False # DC-AE style residual conv branches on the predicted image (token level and the 4px level), zero-init gates
 dcae_trunk_head = False # with skip_final_layer: the trunk-only prediction gets its own DC-AE head (dcae_head is the sampled path's)
+dcae_norm = 'channel' # DC-AE branch norm: 'channel' (per pixel across channels; drops pixel brightness in the 3-channel stem branch) or 'group' (GroupNorm, as DC-AE)
 dcae_width = 128 # hidden channels of the DC-AE branches (the full-resolution stem branch uses width / 4)
 dcae_kernel2 = 1 # kernel of each DC-AE branch's second conv (the first is 3x3)
 layernorm = False # every RMSNorm in the network (block pre-norms, QK-norm, final layer, AttnRes keys, DC-AE branches) becomes a LayerNorm
@@ -219,7 +220,8 @@ model_name, arch = resolve_arch(model, **{k: (None if v < 0 else v) for k, v in 
     dcae_stem=dcae_stem or None, dcae_head=dcae_head or None, dcae_trunk_head=dcae_trunk_head or None,
     patch_overlap=patch_overlap or None, layernorm=layernorm or None, gate_init=None if gate_init == 'zero' else gate_init,
     dcae_width=dcae_width if (dcae_stem or dcae_head or dcae_trunk_head) and dcae_width != 128 else None,
-    dcae_kernel2=dcae_kernel2 if (dcae_stem or dcae_head or dcae_trunk_head) and dcae_kernel2 != 1 else None)
+    dcae_kernel2=dcae_kernel2 if (dcae_stem or dcae_head or dcae_trunk_head) and dcae_kernel2 != 1 else None,
+    dcae_norm=dcae_norm if (dcae_stem or dcae_head or dcae_trunk_head) and dcae_norm != 'channel' else None)
 if not out_dir:
     out_dir = run_dir(runs_root, dataset, model, arch, config, _defaults, run_name)
     legacy = legacy_run_dir(runs_root, dataset, model, arch, config, _defaults, run_name)

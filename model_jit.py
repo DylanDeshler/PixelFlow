@@ -96,18 +96,27 @@ class DCAEBranch(nn.Module):
     is shuffle(x + branch(x)) and the branch is a residual at one resolution:
         x + gate(c) * conv_k2(SiLU(conv3x3(modulate(RMSNorm_channels(x), shift(c), scale(c)))))   channels -> width -> channels
     adaLN modulation from the conditioning with a zero-initialized gate, so the branch starts as the identity.
+    norm: 'channel' normalizes each pixel across its channels (RMSNorm, or LayerNorm with layernorm). For the 3-channel
+    full-resolution branch that keeps only each pixel's colour direction and throws away its brightness. 'group' is
+    GroupNorm over channel groups and space (gcd(32, channels) groups, as DC-AE's GroupNorm(32) where it divides), which
+    keeps relative brightness.
     """
-    def __init__(self, channels, width, kernel2, cond_dim, layernorm=False):
+    def __init__(self, channels, width, kernel2, cond_dim, layernorm=False, norm='channel'):
         super().__init__()
-        self.norm = make_norm(channels, layernorm)
+        assert norm in ('channel', 'group'), f'dcae_norm must be channel or group, got {norm}'
+        self.group_norm = norm == 'group'
+        self.norm = nn.GroupNorm(math.gcd(32, channels), channels, eps=1e-6) if self.group_norm else make_norm(channels, layernorm)
         self.conv1 = nn.Conv2d(channels, width, kernel_size=3, padding=1)
         self.conv2 = nn.Conv2d(width, channels, kernel_size=kernel2, padding=kernel2 // 2)
         self.modulation = nn.Sequential(nn.SiLU(), nn.Linear(cond_dim, 3 * channels, bias=True))
 
     def forward(self, x, c):
         shift, scale, gate = self.modulation(c).to(x.dtype).chunk(3, dim=-1)
-        h = self.norm(x.permute(0, 2, 3, 1)) * (1 + scale[:, None, None]) + shift[:, None, None]
-        h = self.conv2(F.silu(self.conv1(h.permute(0, 3, 1, 2))))
+        if self.group_norm: # NCHW, computed in fp32 and returned in x's dtype like the other norms
+            h = self.norm(x.float()).to(x.dtype) * (1 + scale[:, :, None, None]) + shift[:, :, None, None]
+        else:
+            h = (self.norm(x.permute(0, 2, 3, 1)) * (1 + scale[:, None, None]) + shift[:, None, None]).permute(0, 3, 1, 2)
+        h = self.conv2(F.silu(self.conv1(h)))
         return x + gate[:, :, None, None] * h
 
 
@@ -117,10 +126,10 @@ class DCAEStem(nn.Module):
     a branch at full resolution (3 ch), PixelUnshuffle(4), a branch at the 4px level (48 ch), PixelShuffle(4) back to an
     image for the (unchanged) bottleneck patch embedding, which does the last 4 -> 16 step.
     """
-    def __init__(self, in_chans, width, kernel2, cond_dim, layernorm=False):
+    def __init__(self, in_chans, width, kernel2, cond_dim, layernorm=False, norm='channel'):
         super().__init__()
-        self.full = DCAEBranch(in_chans, max(8, width // 4), kernel2, cond_dim, layernorm) # 3 channels at full resolution: kept narrow
-        self.quarter = DCAEBranch(in_chans * 16, width, kernel2, cond_dim, layernorm)
+        self.full = DCAEBranch(in_chans, max(8, width // 4), kernel2, cond_dim, layernorm, norm) # 3 channels at full resolution: kept narrow
+        self.quarter = DCAEBranch(in_chans * 16, width, kernel2, cond_dim, layernorm, norm)
 
     def forward(self, x, c):
         x = self.full(x, c)
@@ -132,11 +141,11 @@ class DCAEHead(nn.Module):
     DC-AE upsampling (the conv runs at the lower resolution of each stage) on the predicted image: a branch at the token
     level (768 ch, one 16px patch per position), PixelShuffle(4), a branch at the 4px level (48 ch), PixelShuffle(4).
     """
-    def __init__(self, in_chans, patch_size, width, kernel2, cond_dim, layernorm=False):
+    def __init__(self, in_chans, patch_size, width, kernel2, cond_dim, layernorm=False, norm='channel'):
         super().__init__()
         assert patch_size == 16, 'dcae_head is built for 16px patches (two 4x stages)'
-        self.token = DCAEBranch(in_chans * 256, width, kernel2, cond_dim, layernorm)
-        self.quarter = DCAEBranch(in_chans * 16, width, kernel2, cond_dim, layernorm)
+        self.token = DCAEBranch(in_chans * 256, width, kernel2, cond_dim, layernorm, norm)
+        self.quarter = DCAEBranch(in_chans * 16, width, kernel2, cond_dim, layernorm, norm)
 
     def forward(self, img, c):
         t16 = self.token(F.pixel_unshuffle(F.pixel_unshuffle(img, 4), 4), c) # two-stage ordering, so the shuffles invert
@@ -550,7 +559,8 @@ class JiT(nn.Module):
         skip_final_layer=False,
         skip_residual=False,
         dcae_trunk_head=False,
-        gate_init='zero'
+        gate_init='zero',
+        dcae_norm='channel'
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -610,7 +620,7 @@ class JiT(nn.Module):
         embedder = GatedBottleneckPatchEmbed if gated_bottleneck else BottleneckPatchEmbed
         self.x_embedder = embedder(input_size, patch_size, in_channels, bottleneck_dim, hidden_size, bias=True, overlap=patch_overlap)
         if dcae_stem:
-            self.input_stem = DCAEStem(in_channels, dcae_width, dcae_kernel2, hidden_size, layernorm)
+            self.input_stem = DCAEStem(in_channels, dcae_width, dcae_kernel2, hidden_size, layernorm, dcae_norm)
         if gated_bottleneck:
             # per-channel gate on the full-rank patch embedding, from the conditioning (adaLN-style, zero-initialized)
             self.bottleneck_gate = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, hidden_size, bias=True))
@@ -661,9 +671,9 @@ class JiT(nn.Module):
             # serves the trunk-only branch of skip_stop_grad, so nothing the skip branch trains is shared with the trunk
             self.skip_final_layer = FinalLayer(hidden_size, patch_size + 2 * patch_overlap, self.out_channels, adaln_single=adaln_single, layernorm=layernorm)
         if dcae_head:
-            self.output_head = DCAEHead(self.out_channels, patch_size, dcae_width, dcae_kernel2, hidden_size, layernorm)
+            self.output_head = DCAEHead(self.out_channels, patch_size, dcae_width, dcae_kernel2, hidden_size, layernorm, dcae_norm)
         if dcae_trunk_head:
-            self.trunk_output_head = DCAEHead(self.out_channels, patch_size, dcae_width, dcae_kernel2, hidden_size, layernorm)
+            self.trunk_output_head = DCAEHead(self.out_channels, patch_size, dcae_width, dcae_kernel2, hidden_size, layernorm, dcae_norm)
 
         # attention residuals: a zero-initialized pseudo-query and a key RMSNorm per sublayer (2 per block) and the final layer
         if self.attn_res != 'none':

@@ -50,10 +50,10 @@ def describe_arch(model, arch):
     """
     preset = dict(JIT_PRESETS[model], mlp_ratio=4.0, attn_res='none', attn_res_block_size=0, attn_res_adaln=False, adaln_single=False, gated_bottleneck=False,
                   skip_pathway=False, skip_head_blocks=0, skip_inject_block=0, dcae_stem=False, dcae_head=False, dcae_width=128,
-                  dcae_kernel2=1, patch_overlap=0, layernorm=False, skip_final_layer=False, skip_residual=False, dcae_trunk_head=False, gate_init='zero')
+                  dcae_kernel2=1, patch_overlap=0, layernorm=False, skip_final_layer=False, skip_residual=False, dcae_trunk_head=False, gate_init='zero', dcae_norm='channel')
     full = dict(preset, **arch)
     parts = []
-    for k in ('depth', 'hidden_size', 'num_heads', 'patch_size', 'layernorm', 'bottleneck_dim', 'gated_bottleneck', 'patch_overlap', 'dcae_stem', 'dcae_head', 'dcae_trunk_head', 'dcae_width', 'dcae_kernel2',
+    for k in ('depth', 'hidden_size', 'num_heads', 'patch_size', 'layernorm', 'bottleneck_dim', 'gated_bottleneck', 'patch_overlap', 'dcae_stem', 'dcae_head', 'dcae_trunk_head', 'dcae_norm', 'dcae_width', 'dcae_kernel2',
               'skip_pathway', 'skip_head_blocks', 'skip_inject_block', 'skip_final_layer', 'skip_residual', 'mlp_ratio', 'in_context_len', 'in_context_start',
               'attn_res', 'attn_res_block_size', 'attn_res_adaln', 'adaln_single', 'gate_init'):
         v = full[k]
@@ -61,7 +61,7 @@ def describe_arch(model, arch):
             continue # unused without in-context tokens
         if (k == 'attn_res_block_size' and full['attn_res'] != 'block') or (k == 'attn_res_adaln' and full['attn_res'] == 'none') \
                 or (k in ('skip_head_blocks', 'skip_inject_block', 'skip_final_layer', 'skip_residual') and not full['skip_pathway']) \
-                or (k in ('dcae_width', 'dcae_kernel2') and not (full['dcae_stem'] or full['dcae_head'] or full['dcae_trunk_head'])) \
+                or (k in ('dcae_width', 'dcae_kernel2', 'dcae_norm') and not (full['dcae_stem'] or full['dcae_head'] or full['dcae_trunk_head'])) \
                 or (k == 'dcae_trunk_head' and not full['skip_final_layer']):
             continue
         if k == 'skip_inject_block': # resolved as in model_jit.JiT
@@ -279,7 +279,7 @@ _NAME_TOKENS = {
     'attn_dropout': 'attndrop', 'proj_dropout': 'projdrop', 'attn_res': 'attnres-', 'attn_res_block_size': 'attnresbs',
     'adaln_single': 'adalnsingle', 'attn_res_adaln': 'attnresadaln', 'gated_bottleneck': 'gatedbn',
     'skip_pathway': 'skip', 'skip_head_blocks': 'skiphead', 'skip_inject_block': 'skipat', 'skip_pathway_drop_prob': 'skipdrop', 'skip_stop_grad': 'skipsg', 'skip_final_layer': 'skipfl', 'skip_residual': 'skipres',
-    'dcae_stem': 'dcaestem', 'dcae_head': 'dcaehead', 'dcae_trunk_head': 'dcaetrunkhead', 'gate_init': 'gateinit-', 'dcae_width': 'dcaew', 'dcae_kernel2': 'dcaek', 'patch_overlap': 'overlap', 'layernorm': 'layernorm',
+    'dcae_stem': 'dcaestem', 'dcae_head': 'dcaehead', 'dcae_trunk_head': 'dcaetrunkhead', 'gate_init': 'gateinit-', 'dcae_norm': 'dcaenorm-', 'dcae_width': 'dcaew', 'dcae_kernel2': 'dcaek', 'patch_overlap': 'overlap', 'layernorm': 'layernorm',
     'repa_encoder': 'repa-', 'repa_adapter': 'adapter-', 'repa_depth': 'repadepth', 'repa_coeff': 'repacoeff', 'repa_proj_dim': 'repaproj',
     'repa_mask_ratio': 'repamask', 'repa_adapter_depth': 'adapterdepth',
     'mask_ratio': 'mask', 'mask_prob': 'maskprob', 'mask_weighting': 'maskweight-',
