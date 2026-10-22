@@ -4,14 +4,19 @@ JiT's released checkpoints (checkpoint-*.pth from their README), so the pipeline
 against the paper before trusting it on your own runs.
 
 $ python eval_jit.py --ckpt=runs/in100_128/jit-b16/base/ckpt.pt --data_dir=/data/in100_128 --cfgs=1.0,1.5,2.0,2.5,3.0
-$ python eval_jit.py --ckpt=/path/to/jit-b-16/checkpoint-last.pth --data_dir=/data/in1k_256 --cfgs=3.0 --interval_min=0.1 --num_images=50000
+$ python eval_jit.py --ckpt=/path/to/jit-b-16/checkpoint-last.pth --data_dir=/data/in1k_256 --cfgs=3.0 --interval_min=0.1 --final_num_images=50000
 
-CFG sweep: --cfgs takes a comma list or an inclusive start:stop:step range. It reports the best-FID scale and a
-trade-off pick (highest IS among scales within --fid_tolerance of the best FID), the FID/IS Pareto frontier, and
-plots FID, IS, precision/recall vs CFG and the FID-IS trade-off curve. Sweep cheaply, then re-score the picks:
-$ python eval_jit.py --ckpt=... --data_dir=/data/in100_128 --cfgs=1.0:4.0:0.25 --num_images=10000 --final_num_images=50000
+CFG sweep: --cfgs takes a comma list or an inclusive start:stop:step range. Every scale is scored with
+--sweep_num_images (default 10k), then the best-FID scale and the trade-off pick (highest IS among scales within
+--fid_tolerance of the best FID) are re-scored with --final_num_images (default 50k), the number to report. It also
+gives the FID/IS Pareto frontier and plots FID, IS, precision/recall vs CFG and the FID-IS trade-off curve (from the
+sweep). A single scale is scored with --final_num_images directly.
+$ python eval_jit.py --ckpt=runs/in100_128/<model>/<run> --data_dir=/data/in100_128 --cfgs=1.0:4.0:0.25   # sweep at 10k, picks at 50k
+$ python eval_jit.py --ckpt=... --data_dir=/data/in100_128 --cfgs=1.0:4.0:0.25 --sweep_num_images=0      # sweep at 50k, no re-scoring
+--ckpt takes a checkpoint file (ckpt.pt, a milestone ckpt_{iter}.pt, or a released JiT .pth) or a run directory (its ckpt.pt).
 
---save_samples keeps every generated image, one output per cfg, in {out_dir}/samples/ in a standard format:
+--save_samples keeps every generated image of the final --final_num_images evaluation (one output per re-scored cfg, or
+the single cfg), in {out_dir}/samples/ in a standard format:
     png   folder of PNGs named {index}_class{label}.png, as JiT's evaluation writes (works with their torch-fidelity CLI)
     npz   uint8 'arr_0' [N, H, W, 3] (OpenAI's ADM evaluator format) plus int 'labels' [N]
 and a {name}_classes.json mapping label -> ImageNet-1k index and class name.
@@ -119,10 +124,10 @@ def plot_cfg_sweep(results, cfgs, path, title):
 ckpt = ''
 data_dir = '' # prepared dataset dir, used for the FID reference stats and class count
 out_dir = '' # defaults to the checkpoint's dir
-num_images = 50000
+sweep_num_images = 10000 # images per scale during a CFG sweep; 0 (or >= final_num_images) sweeps at final_num_images, no re-scoring
+final_num_images = 50000 # final count: the best-FID and trade-off scales (or the single scale) are scored with this many
 cfgs = '1.0' # guidance scales: comma list (1.0,2.0,3.0) or inclusive range start:stop:step (1.0:4.0:0.25)
 fid_tolerance = 0.05 # trade-off pick: highest IS among scales with FID <= (1 + tol) * best FID
-final_num_images = 0 # > 0: re-score the best-FID and trade-off scales with this many images (e.g. 50000)
 plot = True # save the CFG sweep plot (needs >= 2 scales)
 interval_min = 0.0
 interval_max = 1.0
@@ -143,6 +148,11 @@ config = {k: globals()[k] for k in config_keys}
 # -----------------------------------------------------------------------------
 
 assert ckpt and data_dir, 'pass --ckpt and --data_dir'
+if os.path.isdir(ckpt): # a run directory: its latest checkpoint
+    ckpt = os.path.join(ckpt, 'ckpt.pt')
+if not os.path.isfile(ckpt): # fail before creating anything next to a wrong path
+    raise FileNotFoundError(f"checkpoint not found: {ckpt} (relative paths are from {os.getcwd()}). Pass a run directory or a "
+                            f"ckpt.pt / ckpt_{{iter}}.pt file, e.g. --ckpt=runs/in100_128/jit-b16_icl0/<run>")
 if not compile:
     torch._dynamo.config.disable = True
 out_dir = out_dir or os.path.dirname(os.path.abspath(ckpt))
@@ -196,9 +206,13 @@ def parse_cfgs(spec):
         return [float(round(v, 6)) for v in np.arange(start, stop + step / 2, step)]
     return [float(c) for c in spec.split(',')]
 
-real_feats = real_features(num_images)
+cfg_list = parse_cfgs(cfgs)
+sweeping = len(cfg_list) > 1
+sweep_n = sweep_num_images if sweeping and 0 < sweep_num_images < final_num_images else final_num_images
+rescore = sweeping and sweep_n < final_num_images
+real_feats = real_features(sweep_n)
 
-results = {'ckpt': ckpt, 'num_images': num_images, 'steps': num_sampling_steps, 'method': sampling_method, 'time_schedule': time_schedule,
+results = {'ckpt': ckpt, 'final_num_images': final_num_images, 'sweep_num_images': sweep_n, 'steps': num_sampling_steps, 'method': sampling_method, 'time_schedule': time_schedule,
            'interval': [interval_min, interval_max], 'fid': {}, 'is': {}, 'precision': {}, 'recall': {}}
 class SampleWriter:
     """
@@ -257,9 +271,10 @@ def evaluate_cfg(cfg, n, real, save=True):
     print(f"cfg {cfg}: FID-{n / 1000:g}k {r['fid']:.3f}, IS {r['is']:.1f}{pr_str}")
     return r
 
-cfg_list = parse_cfgs(cfgs)
+if rescore:
+    print(f"CFG sweep over {len(cfg_list)} scales at {sweep_n:,} images each; the picks are re-scored at {final_num_images:,}")
 for cfg in cfg_list:
-    r = evaluate_cfg(cfg, num_images, real_feats)
+    r = evaluate_cfg(cfg, sweep_n, real_feats, save=not rescore) # samples are saved by the final evaluation
     for k, v in r.items():
         results[k][str(cfg)] = v
 
@@ -281,12 +296,17 @@ for c in cfg_list:
 print(f"best FID: cfg {best_fid_cfg:g} (FID {fids[best_fid_cfg]:.3f}, IS {iss[best_fid_cfg]:.1f}); "
       f"trade-off: cfg {tradeoff_cfg:g} (FID {fids[tradeoff_cfg]:.3f}, IS {iss[tradeoff_cfg]:.1f})")
 
-# optional final re-scoring of the picks with more samples
-if final_num_images > 0:
+# re-score the picks with the final number of images
+if rescore:
+    print(f"\nre-scoring the picks at {final_num_images:,} images")
     final_real = real_features(final_num_images)
     results['final'] = {'num_images': final_num_images}
     for c in sorted({best_fid_cfg, tradeoff_cfg}):
-        results['final'][str(c)] = evaluate_cfg(c, final_num_images, final_real, save=False)
+        results['final'][str(c)] = evaluate_cfg(c, final_num_images, final_real)
+    f = results['final']
+    print(f"FID-{final_num_images / 1000:g}k: best-FID pick cfg {best_fid_cfg:g} -> {f[str(best_fid_cfg)]['fid']:.3f} (IS {f[str(best_fid_cfg)]['is']:.1f})"
+          + ('' if tradeoff_cfg == best_fid_cfg else
+             f"; trade-off pick cfg {tradeoff_cfg:g} -> {f[str(tradeoff_cfg)]['fid']:.3f} (IS {f[str(tradeoff_cfg)]['is']:.1f})"))
 
 best_cfg = best_fid_cfg
 # a sample grid at the best cfg
@@ -295,13 +315,13 @@ labels = torch.linspace(0, data.num_classes - 1, 64).long().to(device)
 torch.manual_seed(seed)
 with torch.no_grad(), ctx:
     x = denoiser.generate(labels)
-tag = f"{num_images / 1000:g}k_{sampling_method}{num_sampling_steps}" + ('' if time_schedule == 'uniform' else f'_{time_schedule}')
+tag = f"{final_num_images / 1000:g}k_{sampling_method}{num_sampling_steps}" + ('' if time_schedule == 'uniform' else f'_{time_schedule}')
 save_labeled_grid(x, [class_names[i] for i in labels.tolist()], os.path.join(samples_dir, f'eval_samples_{tag}.png'))
 with open(os.path.join(out_dir, f'eval_{tag}.json'), 'w') as f:
     json.dump(results, f, indent=2)
 print(f"results written to {os.path.join(out_dir, f'eval_{tag}.json')}")
 if plot and len(cfg_list) >= 2:
     path = plot_cfg_sweep(results, cfg_list, os.path.join(out_dir, f'cfg_sweep_{tag}.png'),
-                          f"{os.path.basename(os.path.dirname(os.path.abspath(ckpt)))}: CFG sweep, FID-{num_images / 1000:g}k, "
+                          f"{os.path.basename(os.path.dirname(os.path.abspath(ckpt)))}: CFG sweep, FID-{sweep_n / 1000:g}k, "
                           f"{sampling_method} {num_sampling_steps} steps, interval [{interval_min}, {interval_max}]")
     print(f"plot saved to {path}")

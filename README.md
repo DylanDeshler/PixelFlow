@@ -130,9 +130,10 @@ python eval_jit.py --ckpt=runs/in100_128/jit-b16/base/ckpt.pt --data_dir=/data/i
 
 `eval_jit.py --cfgs=1.0:4.0:0.25` sweeps guidance (comma lists work too). It reports the best-FID scale, a trade-off pick (highest IS
 with FID within `--fid_tolerance`, default 5%, of the best) and the FID/IS Pareto frontier, and saves `cfg_sweep_*.png`: FID, IS and
-precision/recall vs CFG, plus the FID-IS trade-off curve. Sweep at 10k images, then re-score the picks with `--final_num_images=50000`.
+precision/recall vs CFG, plus the FID-IS trade-off curve. Each scale is swept at `--sweep_num_images` (default 10k). The best-FID and
+trade-off picks are then re-scored at `--final_num_images` (default 50k), the number to report. `--sweep_num_images=0` sweeps at the full count.
 
-`eval_jit.py --save_samples=png|npz` keeps every generated image in `{out_dir}/samples/`, as a PNG folder (`{index}_class{label}.png`, JiT's own format)
+`eval_jit.py --save_samples=png|npz` keeps every generated image of the final `--final_num_images` evaluation in `{out_dir}/samples/`, as a PNG folder (`{index}_class{label}.png`, JiT's own format)
 or an ADM-evaluator `.npz` (`arr_0` images plus `labels`), with a `_classes.json` mapping labels to ImageNet indices and names.
 Training saves fixed-noise 8x8 sample grids, captioned with class names, to `samples/` at every eval, and rebuilds
 `samples/progress.gif` / `samples/progress_cfg3.gif` (one frame per eval, same seed and classes; also logged to wandb) so you can flip
@@ -270,6 +271,12 @@ as exactly vanilla JiT.
 - `--patch_overlap=o`: each patch also sees o pixels of its neighbours. The patch embedding's first conv becomes
   (16 + 2o)^2 with stride 16. The final layer predicts (16 + 2o)^2 patches, blended by overlap-add (averaged where
   they overlap). About +0.9M params for o = 4.
+
+`--dcae_norm=group` replaces each branch's per-pixel channel norm with GroupNorm (gcd(32, C) groups: 1 for the
+3-channel stem branch, 16 for the 48-channel branches, 32 for the token-level head branch), as DC-AE uses. The
+default `channel` normalizes each pixel across its channels. For the 3-channel full-resolution stem branch that keeps
+only each pixel's colour direction and drops its brightness, which likely hurt the stem once its branches became
+active. It stays the default only so existing DC-AE checkpoints keep loading.
 
 All three combine freely, with each other and with the other options. With token masking, a DC-AE stem or
 overlapping patches would let masked patches' pixels leak into neighbouring tokens. Masked patches are therefore
