@@ -549,7 +549,8 @@ class JiT(nn.Module):
         layernorm=False,
         skip_final_layer=False,
         skip_residual=False,
-        dcae_trunk_head=False
+        dcae_trunk_head=False,
+        gate_init='zero'
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -583,6 +584,10 @@ class JiT(nn.Module):
         # each branch has its own head and nothing in the decoder is shared
         assert not dcae_trunk_head or (skip_final_layer and not skip_residual), 'dcae_trunk_head needs skip_final_layer (not skip_residual)'
         self.dcae_trunk_head = dcae_trunk_head
+        # how gated branches start as identities: 'zero' gates (JiT's adaLN-Zero) or 'pixart' (small random gates / shifts /
+        # scales and a zero-initialized output weight, as adaln_single's blocks), see initialize_weights
+        assert gate_init in ('zero', 'pixart'), f'gate_init must be zero or pixart, got {gate_init}'
+        self.gate_init = gate_init
         assert not dcae_stem or patch_size == 16, 'dcae_stem is built for 16px patches'
         # where the skip enters: after block skip_inject_after (1-indexed); 0 -> after the last block, -k -> before the last k
         self.skip_inject_after = resolve_skip_inject(skip_inject_block, depth)
@@ -734,8 +739,39 @@ class JiT(nn.Module):
 
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
+        if self.gate_init == 'pixart':
+            self.init_gates_pixart()
         if self.has_skip_final_layer: # starts as an exact copy, so both predictions start identical
             self.skip_final_layer.load_state_dict(self.final_layer.state_dict())
+
+    def init_gates_pixart(self):
+        """
+        gate_init='pixart': every gated branch starts as an identity through a zero-initialized output weight instead of a
+        zero gate, with its gates / shifts / scales at small random values (normal / sqrt(hidden), PixArt-alpha's table
+        init). With a zero gate only the gate learns at first (the branch's own weights get no gradient); here the output
+        weight learns from the start. adaln_single's blocks already start this way.
+        """
+        std = self.hidden_size ** -0.5
+        def random_bias(linear): # a modulation projection: weight 0, bias random, so it starts at a fixed random value
+            nn.init.constant_(linear.weight, 0)
+            nn.init.normal_(linear.bias, std=std)
+        if not self.adaln_single: # per-block adaLN: the bias plays the per-block table's role
+            for block in self.all_blocks():
+                random_bias(block.adaLN_modulation[-1])
+                nn.init.constant_(block.attn.proj.weight, 0)
+                nn.init.constant_(block.mlp.w3.weight, 0)
+            random_bias(self.final_layer.adaLN_modulation[-1]) # its linear is zero-initialized in every mode
+        for branch in [b for m in (getattr(self, 'input_stem', None), getattr(self, 'output_head', None), getattr(self, 'trunk_output_head', None))
+                       if m is not None for b in m.children()]: # DC-AE branches
+            random_bias(branch.modulation[-1])
+            nn.init.constant_(branch.conv2.weight, 0)
+            nn.init.constant_(branch.conv2.bias, 0)
+        if self.skip_pathway:
+            random_bias(self.skip_gate[-1])
+            nn.init.constant_(self.skip_embedder.proj.weight, 0)
+        if self.gated_bottleneck:
+            random_bias(self.bottleneck_gate[-1])
+            nn.init.constant_(self.x_embedder.bypass.weight, 0)
 
     def gated_skip(self, skip, c):
         # gate(c) * skip; in training, each sample's skip is dropped (gate zeroed) with probability skip_drop_prob, the way

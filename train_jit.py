@@ -89,6 +89,7 @@ skip_pathway_drop_prob = 0.0 # skip_pathway only: in training, drop the skip for
 skip_inject_block = 0 # skip_pathway only: 0 -> after the trunk; -k -> before the last k blocks; k -> after block k
 gated_bottleneck = False # add a full-rank patch embedding behind a gate from the conditioning (zero-init: starts as the bottleneck)
 attn_res_adaln = False # adaLN on the AttnRes queries from the conditioning (time + class), one shared projection (~1.2M params on JiT-B)
+gate_init = 'zero' # 'zero' (JiT's adaLN-Zero) or 'pixart': gated branches start as identities via zero output weights and small random gates
 adaln_single = False # adaLN-single (PixArt-alpha): one modulation projection shared by all blocks + a learned table per block (~40M fewer params on JiT-B)
 attn_dropout = 0.0
 proj_dropout = 0.0
@@ -216,7 +217,7 @@ model_name, arch = resolve_arch(model, **{k: (None if v < 0 else v) for k, v in 
     skip_pathway=skip_pathway or None, skip_head_blocks=skip_head_blocks or None, skip_inject_block=skip_inject_block or None,
     skip_final_layer=skip_final_layer or None, skip_residual=skip_residual or None,
     dcae_stem=dcae_stem or None, dcae_head=dcae_head or None, dcae_trunk_head=dcae_trunk_head or None,
-    patch_overlap=patch_overlap or None, layernorm=layernorm or None,
+    patch_overlap=patch_overlap or None, layernorm=layernorm or None, gate_init=None if gate_init == 'zero' else gate_init,
     dcae_width=dcae_width if (dcae_stem or dcae_head or dcae_trunk_head) and dcae_width != 128 else None,
     dcae_kernel2=dcae_kernel2 if (dcae_stem or dcae_head or dcae_trunk_head) and dcae_kernel2 != 1 else None)
 if not out_dir:

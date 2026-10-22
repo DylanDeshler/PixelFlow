@@ -233,8 +233,9 @@ the with-skip prediction.
 `--skip_final_layer=True` (with `--skip_stop_grad`) gives the with-skip prediction its own final layer, starting as an
 exact copy. JiT's final layer then serves only the trunk-only branch. With injection after the trunk, the trunk is
 then trained exactly like vanilla JiT, apart from gradient clipping on the combined norm. Mid-trunk, the blocks after
-the injection point are still shared. With `--dcae_head`, the DC-AE head belongs to the sampled (with-skip) path only.
-The trunk-only prediction gets no head, so nothing in the decoder is shared.
+the injection point are still shared. With `--dcae_head`, the DC-AE head belongs to the sampled (with-skip) path only,
+and the trunk-only prediction stays exactly vanilla JiT. `--dcae_trunk_head` gives the trunk-only prediction its own,
+separate DC-AE head. With both flags each branch has its own head and nothing in the decoder is shared.
 About +0.6M params on JiT-B.
 
 `--skip_residual=True` (with `--skip_final_layer --skip_stop_grad`) makes the with-skip prediction
@@ -290,6 +291,16 @@ uses a table plus the conditioning itself. JiT-B/16 goes from 131M to 91M parame
 the shared projection starts at zero, and blocks start as identities through zero-initialized attention / MLP output
 projections, since the gates now start at the random tables rather than at zero. With Muon, the shared projection is
 orthogonalized per component, like the per-block adaLN matrices.
+
+## Gate initialization
+
+`--gate_init=pixart` (default `zero`) changes how gated branches start as identities. With JiT's adaLN-Zero every gate
+starts at exactly 0, so at first only the gates learn; the branch's own weights get no gradient. With `pixart`, as
+adaLN-single's blocks already do, gates, shifts and scales start at small random values (normal / sqrt(hidden)) and
+each branch's output weight starts at zero, so the output weight learns from the first step. It applies to per-block
+adaLN (blocks, skip head blocks, final layer), the DC-AE branches (zero-initialized second conv), the skip gate
+(zero-initialized skip projection) and the gated bottleneck. `--adaln_single` blocks are PixArt-style either way. Run
+with per-block adaLN, it separates adaLN-single's two changes: shared modulation vs initialization.
 
 ## Token masking
 
