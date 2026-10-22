@@ -14,6 +14,7 @@ from tqdm import tqdm
 from denoiser import Denoiser
 from fid import to_uint8
 import model_jit
+from model_pixeldit import PixelDiT, PIXELDIT_PRESETS
 
 # architecture of each JiT preset, as defined in model_jit.py (mlp_ratio is the JiT default for all of them)
 JIT_PRESETS = {
@@ -24,6 +25,10 @@ JIT_PRESETS = {
     'JiT-H/16': dict(depth=32, hidden_size=1280, num_heads=16, bottleneck_dim=256, in_context_len=32, in_context_start=10, patch_size=16),
     'JiT-H/32': dict(depth=32, hidden_size=1280, num_heads=16, bottleneck_dim=256, in_context_len=32, in_context_start=10, patch_size=32),
 }
+# PixelDiT (model_pixeldit.py) shares the denoiser and training stack; registered under its own names
+for _name, _arch in PIXELDIT_PRESETS.items():
+    JIT_PRESETS[_name] = dict(_arch, in_context_len=0, in_context_start=0, family='pixeldit')
+    model_jit.JiT_models[_name] = (lambda arch: lambda **kwargs: PixelDiT(**arch, **kwargs))(JIT_PRESETS[_name])
 for _name, _arch in JIT_PRESETS.items():
     assert _name in model_jit.JiT_models, f'{_name} missing from model_jit.JiT_models'
 
@@ -48,19 +53,30 @@ def describe_arch(model, arch):
     One line with every architecture field as actually built, marking the ones that differ from the preset, e.g.
     'arch: depth 12, hidden_size 768, ..., in_context_len 0* (preset 32), ... (preset JiT-B/16, * = overridden)'.
     """
+    if JIT_PRESETS[model].get('family') == 'pixeldit':
+        preset = dict(JIT_PRESETS[model], mlp_ratio=4.0, prediction='x')
+        full = dict(preset, **arch)
+        parts = [f"{k} {full[k]:g}" if isinstance(full[k], float) else f"{k} {full[k]}" for k in
+                 ('depth', 'pixel_depth', 'hidden_size', 'num_heads', 'pixel_dim', 'patch_size', 'mlp_ratio', 'prediction')]
+        parts = [p_ + (f"* (preset {preset[k]})" if full[k] != preset[k] else '') for p_, k in
+                 zip(parts, ('depth', 'pixel_depth', 'hidden_size', 'num_heads', 'pixel_dim', 'patch_size', 'mlp_ratio', 'prediction'))]
+        return f"arch: {', '.join(parts)} (preset {model}, * = overridden)"
     preset = dict(JIT_PRESETS[model], mlp_ratio=4.0, attn_res='none', attn_res_block_size=0, attn_res_adaln=False, adaln_single=False, gated_bottleneck=False,
                   skip_pathway=False, skip_head_blocks=0, skip_inject_block=0, dcae_stem=False, dcae_head=False, dcae_width=128,
-                  dcae_kernel2=1, patch_overlap=0, layernorm=False, skip_final_layer=False, skip_residual=False, dcae_trunk_head=False, gate_init='zero', dcae_norm='channel')
+                  dcae_kernel2=1, patch_overlap=0, layernorm=False, skip_final_layer=False, skip_residual=False, dcae_trunk_head=False, gate_init='zero', dcae_norm='channel',
+                  skip_decoder='linear', skip_decoder_dim=0, skip_decoder_blocks=2, skip_decoder_rank=0, skip_decoder_conv=False, skip_decoder_attnres=False)
     full = dict(preset, **arch)
     parts = []
     for k in ('depth', 'hidden_size', 'num_heads', 'patch_size', 'layernorm', 'bottleneck_dim', 'gated_bottleneck', 'patch_overlap', 'dcae_stem', 'dcae_head', 'dcae_trunk_head', 'dcae_norm', 'dcae_width', 'dcae_kernel2',
-              'skip_pathway', 'skip_head_blocks', 'skip_inject_block', 'skip_final_layer', 'skip_residual', 'mlp_ratio', 'in_context_len', 'in_context_start',
+              'skip_pathway', 'skip_decoder', 'skip_decoder_dim', 'skip_decoder_blocks', 'skip_decoder_rank', 'skip_decoder_conv', 'skip_decoder_attnres',
+              'skip_head_blocks', 'skip_inject_block', 'skip_final_layer', 'skip_residual', 'mlp_ratio', 'in_context_len', 'in_context_start',
               'attn_res', 'attn_res_block_size', 'attn_res_adaln', 'adaln_single', 'gate_init'):
         v = full[k]
         if k == 'in_context_start' and full['in_context_len'] == 0:
             continue # unused without in-context tokens
         if (k == 'attn_res_block_size' and full['attn_res'] != 'block') or (k == 'attn_res_adaln' and full['attn_res'] == 'none') \
-                or (k in ('skip_head_blocks', 'skip_inject_block', 'skip_final_layer', 'skip_residual') and not full['skip_pathway']) \
+                or (k in ('skip_head_blocks', 'skip_inject_block', 'skip_final_layer', 'skip_residual', 'skip_decoder') and not full['skip_pathway']) \
+                or (k.startswith('skip_decoder_') and full['skip_decoder'] == 'linear') \
                 or (k in ('dcae_width', 'dcae_kernel2', 'dcae_norm') and not (full['dcae_stem'] or full['dcae_head'] or full['dcae_trunk_head'])) \
                 or (k == 'dcae_trunk_head' and not full['skip_final_layer']):
             continue
@@ -78,7 +94,8 @@ def describe_arch(model, arch):
 def _register(name, arch):
     # JiT's Denoiser looks the network up in model_jit.JiT_models by name, so custom architectures get registered there
     if name not in model_jit.JiT_models:
-        model_jit.JiT_models[name] = lambda **kwargs: model_jit.JiT(**arch, **kwargs)
+        cls = PixelDiT if arch.get('family') == 'pixeldit' else model_jit.JiT
+        model_jit.JiT_models[name] = lambda **kwargs: cls(**arch, **kwargs)
 
 
 class FastDenoiser(Denoiser):
@@ -277,7 +294,7 @@ def save_labeled_grid(x, names, path, nrow=8):
 # diag* (diagnostics) settings are excluded too
 _NAME_EXCLUDE = {
     'out_dir', 'runs_root', 'run_name', 'data_root', 'data_dir', 'dataset', 'model', 'depth', 'hidden_size', 'num_heads',
-    'patch_size', 'bottleneck_dim', 'in_context_len', 'in_context_start', 'mlp_ratio',
+    'patch_size', 'bottleneck_dim', 'in_context_len', 'in_context_start', 'mlp_ratio', 'pixel_depth', 'pixel_dim',
     'epochs', 'batch_size', 'gradient_accumulation_steps', 'eval_every_epochs', 'save_every_epochs', 'keep_ckpt_every_epochs', 'log_interval',
     'eval_only', 'init_from', 'wandb_log', 'wandb_project', 'wandb_run_name', 'fid_num_images', 'fid_cfg',
     'fid_interval_min', 'fid_interval_max', 'sample_cfg', 'sample_interval_min', 'sample_interval_max',
@@ -285,7 +302,7 @@ _NAME_EXCLUDE = {
     'device', 'dtype', 'compile', 'trend_plots', 'progress_gif',
 }
 _ARCH_SHORT = {'depth': 'd', 'hidden_size': 'w', 'num_heads': 'h', 'patch_size': 'p', 'bottleneck_dim': 'bn',
-               'in_context_len': 'icl', 'in_context_start': 'ics', 'mlp_ratio': 'mlp'}
+               'in_context_len': 'icl', 'in_context_start': 'ics', 'mlp_ratio': 'mlp', 'pixel_depth': 'pd', 'pixel_dim': 'pdim'}
 
 # short, shell-friendly name tokens for the settings that change training. A value is appended to the prefix
 # ('noise' + 0.75 -> noise0.75); string settings use their value ('muon', 'repa-dino_vitb16'); booleans name the change
@@ -299,7 +316,9 @@ _NAME_TOKENS = {
     'attn_dropout': 'attndrop', 'proj_dropout': 'projdrop', 'attn_res': 'attnres-', 'attn_res_block_size': 'attnresbs',
     'adaln_single': 'adalnsingle', 'attn_res_adaln': 'attnresadaln', 'gated_bottleneck': 'gatedbn',
     'skip_pathway': 'skip', 'skip_head_blocks': 'skiphead', 'skip_inject_block': 'skipat', 'skip_pathway_drop_prob': 'skipdrop', 'skip_stop_grad': 'skipsg', 'skip_final_layer': 'skipfl', 'skip_residual': 'skipres',
-    'dcae_stem': 'dcaestem', 'dcae_head': 'dcaehead', 'dcae_trunk_head': 'dcaetrunkhead', 'gate_init': 'gateinit-', 'dcae_norm': 'dcaenorm-', 'dcae_width': 'dcaew', 'dcae_kernel2': 'dcaek', 'patch_overlap': 'overlap', 'layernorm': 'layernorm',
+    'dcae_stem': 'dcaestem', 'dcae_head': 'dcaehead', 'dcae_trunk_head': 'dcaetrunkhead', 'gate_init': 'gateinit-', 'dcae_norm': 'dcaenorm-', 'pixeldit_prediction': 'pred-',
+    'skip_decoder': 'skipdec-', 'skip_decoder_dim': 'skipdecdim', 'skip_decoder_blocks': 'skipdecblocks', 'skip_decoder_rank': 'skipdecrank',
+    'skip_decoder_conv': 'skipdecconv', 'skip_decoder_attnres': 'skipdecattnres', 'dcae_width': 'dcaew', 'dcae_kernel2': 'dcaek', 'patch_overlap': 'overlap', 'layernorm': 'layernorm',
     'repa_encoder': 'repa-', 'repa_adapter': 'adapter-', 'repa_depth': 'repadepth', 'repa_coeff': 'repacoeff', 'repa_proj_dim': 'repaproj',
     'repa_mask_ratio': 'repamask', 'repa_adapter_depth': 'adapterdepth',
     'mask_ratio': 'mask', 'mask_prob': 'maskprob', 'mask_weighting': 'maskweight-',
@@ -320,7 +339,7 @@ def _name_token(key, value):
 
 def _model_part(model, arch):
     preset = dict(JIT_PRESETS[model], mlp_ratio=4.0)
-    return model.lower().replace('/', '') + ''.join(f'_{_ARCH_SHORT[k]}{arch[k]:g}' for k in _ARCH_SHORT if arch[k] != preset[k])
+    return model.lower().replace('/', '') + ''.join(f'_{_ARCH_SHORT[k]}{arch[k]:g}' for k in _ARCH_SHORT if k in arch and arch[k] != preset.get(k))
 
 def _changed(config, defaults):
     # in _NAME_TOKENS order (optimizer first, then noise schedule, ...), settings not in the table after, alphabetically

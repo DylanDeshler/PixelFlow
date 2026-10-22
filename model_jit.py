@@ -175,6 +175,90 @@ def resolve_skip_inject(skip_inject_block, depth):
     return after
 
 
+class SkipDecoderBlock(nn.Module):
+    """
+    One block of the skip pixel decoder. x: decoder tokens [B, L, n, dim] (n per patch); s: the patch's conditioning
+    token [B, L, cond_dim]. Every token gets its own shift / scale / gate from its patch's conditioning token (PixelDiT's
+    pixel-wise adaLN, optionally through a rank-`rank` bottleneck), then a SwiGLU MLP behind the gate. conv: a 3x3 conv
+    over neighbouring tokens before the MLP, the only path that crosses patch boundaries.
+    """
+    def __init__(self, n_tokens, dim, cond_dim, rank=0, conv=False, mlp_ratio=4.0, layernorm=False):
+        super().__init__()
+        self.n, self.dim = n_tokens, dim
+        self.norm = make_norm(dim, layernorm)
+        self.mlp = SwiGLUFFN(dim, int(dim * mlp_ratio))
+        out = n_tokens * 3 * dim
+        proj = [nn.Linear(cond_dim, rank, bias=False), nn.Linear(rank, out)] if rank else [nn.Linear(cond_dim, out)]
+        self.modulation = nn.Sequential(nn.SiLU(), *proj)
+        self.conv = nn.Conv2d(dim, dim, kernel_size=3, padding=1) if conv else None
+
+    def forward(self, x, s, decoder):
+        B, L = x.shape[:2]
+        shift, scale, gate = self.modulation(s).to(x.dtype).view(B, L, self.n, 3, self.dim).unbind(3)
+        h = self.norm(x) * (1 + scale) + shift
+        if self.conv is not None:
+            h = decoder.from_grid(self.conv(decoder.to_grid(h)))
+        return x + gate * self.mlp(h)
+
+
+class SkipPixelDecoder(nn.Module):
+    """
+    skip_decoder='pixel' / 'subpatch': the with-skip branch's decoder, replacing its linear final layer. The raw noisy
+    image is split into tokens of unit x unit pixels (unit 1: one token per pixel, PixelDiT's pixel pathway without its
+    attention; unit 4: one token per 4x4 pixel block, 16 per 16px patch), embedded to dim channels, modulated per token
+    by the conditioning token of the patch it lies in (the detached trunk output + the timestep embedding, or with
+    attnres an AttnRes mix of the detached trunk sources with a learned query per block), and mapped back to pixels.
+    With skip_stop_grad its loss never reaches the trunk. Zero-initialized gates and output: it starts as a zero
+    prediction, like the trunk's own final layer.
+    """
+    def __init__(self, input_size, patch_size, in_chans, unit, dim, blocks, cond_dim, rank=0, conv=False, attnres=False,
+                 layernorm=False):
+        super().__init__()
+        assert patch_size % unit == 0, f'patch size {patch_size} must be a multiple of the decoder unit {unit}'
+        self.p, self.u, self.g = patch_size, unit, input_size // patch_size
+        self.s = patch_size // unit # tokens per patch side
+        raw = in_chans * unit * unit
+        self.embed = nn.Linear(raw, dim)
+        self.blocks = nn.ModuleList([SkipDecoderBlock(self.s * self.s, dim, cond_dim, rank, conv, layernorm=layernorm) for _ in range(blocks)])
+        self.norm = make_norm(dim, layernorm)
+        self.out = nn.Linear(dim, raw)
+        if attnres: # one depth-mixing query (and key norm) per block, zero-initialized: uniform over the sources at first
+            self.queries = nn.ParameterList([nn.Parameter(torch.zeros(cond_dim)) for _ in range(blocks)])
+            self.key_norms = nn.ModuleList([make_norm(cond_dim, layernorm) for _ in range(blocks)])
+
+    def tokens(self, img):
+        # [B, C, H, W] -> [B, L, s*s, C*u*u]: patches row-major, tokens row-major within a patch, (C, u, u) within a token
+        B, C, H, W = img.shape
+        g, s, u = self.g, self.s, self.u
+        x = img.reshape(B, C, g, s, u, g, s, u).permute(0, 2, 5, 3, 6, 1, 4, 7)
+        return x.reshape(B, g * g, s * s, C * u * u)
+
+    def image(self, x):
+        # inverse of tokens
+        B, C = x.shape[0], x.shape[-1] // (self.u * self.u)
+        g, s, u = self.g, self.s, self.u
+        x = x.reshape(B, g, g, s, s, C, u, u).permute(0, 5, 1, 3, 6, 2, 4, 7)
+        return x.reshape(B, C, g * s * u, g * s * u)
+
+    def to_grid(self, h):
+        # [B, L, s*s, d] -> [B, d, g*s, g*s] (the image-shaped grid of tokens, for the conv)
+        B, d = h.shape[0], h.shape[-1]
+        g, s = self.g, self.s
+        return h.reshape(B, g, g, s, s, d).permute(0, 5, 1, 3, 2, 4).reshape(B, d, g * s, g * s)
+
+    def from_grid(self, h):
+        B, d = h.shape[:2]
+        g, s = self.g, self.s
+        return h.reshape(B, d, g, s, g, s).permute(0, 2, 4, 3, 5, 1).reshape(B, g * g, s * s, d)
+
+    def forward(self, img, conds):
+        # img: the raw noisy image [B, C, H, W]; conds: one conditioning tensor [B, L, cond_dim] per block
+        x = self.embed(self.tokens(img))
+        for block, s in zip(self.blocks, conds):
+            x = block(x, s, self)
+        return self.image(self.out(self.norm(x)))
+
+
 class TimestepEmbedder(nn.Module):
     """
     Embeds scalar timesteps into vector representations.
@@ -513,6 +597,21 @@ class AttnResState:
             return sum(alpha[i].unsqueeze(-1).to(v.dtype) * v for i, v in enumerate(sources))
         return _DepthMix.apply(alpha, *sources)
 
+    def mix_query(self, query, norm):
+        """
+        Depth mix of the current sources (and running block sum) with a query that isn't one of the trunk's sublayers
+        (the skip decoder's): softmax_i(query . norm(v_i)), the same scoring as mix(). Its scores aren't among the cached
+        ones, so they're computed here (one per-token reduction per source).
+        """
+        sources = self.sources + ([self.partial] if self.partial is not None else [])
+        if len(sources) == 1:
+            return sources[0]
+        keys = (norm.weight * query)[None] # [1, D]
+        alpha = torch.stack([self._logits(v, keys)[..., 0] for v in sources]).softmax(0)
+        if torch.compiler.is_compiling():
+            return sum(alpha[i].unsqueeze(-1).to(v.dtype) * v for i, v in enumerate(sources))
+        return _DepthMix.apply(alpha, *sources)
+
     def prepend(self, prefix):
         # in-context tokens: the embedding source gets them, every other source zeros at those positions
         zeros = torch.zeros_like(prefix)
@@ -560,7 +659,13 @@ class JiT(nn.Module):
         skip_residual=False,
         dcae_trunk_head=False,
         gate_init='zero',
-        dcae_norm='channel'
+        dcae_norm='channel',
+        skip_decoder='linear',
+        skip_decoder_dim=0,
+        skip_decoder_blocks=2,
+        skip_decoder_rank=0,
+        skip_decoder_conv=False,
+        skip_decoder_attnres=False
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -582,6 +687,16 @@ class JiT(nn.Module):
         self.gated_bottleneck = gated_bottleneck
         assert skip_head_blocks == 0 or skip_pathway, 'skip_head_blocks needs skip_pathway'
         self.skip_pathway = skip_pathway
+        # skip_decoder: 'linear' merges the gated skip into the trunk tokens for a linear final layer (default);
+        # 'pixel' / 'subpatch' decode the raw noisy pixels with a SkipPixelDecoder conditioned on the trunk's tokens
+        assert skip_decoder in ('linear', 'pixel', 'subpatch'), f'skip_decoder must be linear, pixel or subpatch, got {skip_decoder}'
+        self.skip_decoder = skip_decoder
+        if skip_decoder != 'linear':
+            assert skip_pathway, 'skip_decoder needs skip_pathway'
+            assert not skip_final_layer and not skip_residual, 'skip_decoder replaces the linear skip decoder: no skip_final_layer / skip_residual'
+            assert skip_inject_block == 0 and skip_head_blocks == 0, 'skip_decoder decodes after the trunk: no skip_inject_block / skip_head_blocks'
+        assert not skip_decoder_attnres or (skip_decoder != 'linear' and attn_res != 'none'), 'skip_decoder_attnres needs a skip_decoder and attn_res'
+        self.skip_decoder_attnres = skip_decoder_attnres
         self.dcae_stem, self.dcae_head, self.patch_overlap = dcae_stem, dcae_head, patch_overlap
         self.layernorm = layernorm
         assert not skip_final_layer or skip_pathway, 'skip_final_layer needs skip_pathway'
@@ -592,7 +707,8 @@ class JiT(nn.Module):
         self.skip_residual = skip_residual
         # dcae_trunk_head: the trunk-only prediction (skip_final_layer) gets its own DC-AE head; with dcae_head as well,
         # each branch has its own head and nothing in the decoder is shared
-        assert not dcae_trunk_head or (skip_final_layer and not skip_residual), 'dcae_trunk_head needs skip_final_layer (not skip_residual)'
+        assert not dcae_trunk_head or ((skip_final_layer or skip_decoder != 'linear') and not skip_residual), \
+            'dcae_trunk_head needs skip_final_layer or a skip_decoder (not skip_residual)'
         self.dcae_trunk_head = dcae_trunk_head
         # how gated branches start as identities: 'zero' gates (JiT's adaLN-Zero) or 'pixart' (small random gates / shifts /
         # scales and a zero-initialized output weight, as adaln_single's blocks), see initialize_weights
@@ -657,11 +773,17 @@ class JiT(nn.Module):
         ])
 
         # skip pathway: full-rank input patches merged into the trunk's output (gated), then optional head blocks
-        if skip_pathway:
+        if skip_pathway and skip_decoder == 'linear':
             self.skip_embedder = SkipEmbed(patch_size, in_channels, hidden_size)
             self.skip_gate = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, hidden_size, bias=True))
             self.skip_head = nn.ModuleList([JiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, adaln_single=adaln_single, layernorm=layernorm)
                                             for _ in range(skip_head_blocks)])
+        elif skip_pathway: # pixel / subpatch decoder of the raw noisy pixels
+            unit = 1 if skip_decoder == 'pixel' else 4
+            self.skip_head = nn.ModuleList()
+            self.skip_decoder_module = SkipPixelDecoder(input_size, patch_size, in_channels, unit,
+                                                        skip_decoder_dim or (16 if unit == 1 else 64), skip_decoder_blocks,
+                                                        hidden_size, skip_decoder_rank, skip_decoder_conv, skip_decoder_attnres, layernorm)
 
         # linear predict
         # with patch_overlap the final layer predicts overlapping (patch + 2 * overlap)^2 patches, blended by overlap-add
@@ -716,7 +838,13 @@ class JiT(nn.Module):
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
-        if self.skip_pathway: # the skip embedding like the patch embedding; its gate starts closed (= no skip)
+        if self.skip_pathway and self.skip_decoder != 'linear': # skip decoder: zero gates and output (starts as a zero prediction)
+            for block in self.skip_decoder_module.blocks:
+                nn.init.constant_(block.modulation[-1].weight, 0)
+                nn.init.constant_(block.modulation[-1].bias, 0)
+            nn.init.constant_(self.skip_decoder_module.out.weight, 0)
+            nn.init.constant_(self.skip_decoder_module.out.bias, 0)
+        if self.skip_pathway and self.skip_decoder == 'linear': # the skip embedding like the patch embedding; its gate starts closed (= no skip)
             w = self.skip_embedder.proj.weight.data
             nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
             nn.init.constant_(self.skip_gate[-1].weight, 0)
@@ -776,9 +904,13 @@ class JiT(nn.Module):
             random_bias(branch.modulation[-1])
             nn.init.constant_(branch.conv2.weight, 0)
             nn.init.constant_(branch.conv2.bias, 0)
-        if self.skip_pathway:
+        if self.skip_pathway and self.skip_decoder == 'linear':
             random_bias(self.skip_gate[-1])
             nn.init.constant_(self.skip_embedder.proj.weight, 0)
+        if self.skip_pathway and self.skip_decoder != 'linear':
+            for block in self.skip_decoder_module.blocks:
+                random_bias(block.modulation[-1])
+                nn.init.constant_(block.mlp.w3.weight, 0)
         if self.gated_bottleneck:
             random_bias(self.bottleneck_gate[-1])
             nn.init.constant_(self.x_embedder.bypass.weight, 0)
@@ -860,7 +992,8 @@ class JiT(nn.Module):
         c_blocks = self.t_block(c) if self.adaln_single else c
 
         # forward JiT
-        skip = self.skip_embedder(x) if self.skip_pathway else None # from the noisy input, before x is reused
+        skip = self.skip_embedder(x) if self.skip_pathway and self.skip_decoder == 'linear' else None # from the noisy input
+        x_input = x # the raw noisy image, for a skip_decoder
         x = self.embed(x, c)
 
         res = AttnResState(self, x, c) if self.attn_res != 'none' else None
@@ -876,16 +1009,19 @@ class JiT(nn.Module):
             ress = res.detached(self, cs) if res is not None else None
         else:
             xs, cs, cbs, ys, ress = x, c, c_blocks, y_emb, res
-        gated = self.gated_skip(skip, cs)
-        if k < depth: # mid-trunk: into block k's output, then the remaining blocks
-            xs = self.inject_skip(xs, gated, ress, k - 1)
-            xs = self.run_blocks(xs, ress, k, depth, cbs, ys)[:, self.in_context_len:]
-        else: # after the trunk: added to its output directly
-            xs = xs[:, self.in_context_len:] + gated
-        for block in self.skip_head:
-            xs = block(xs, cbs, self.feat_rope)
-        # with skip_residual this is the correction (no DC-AE head: that refines the trunk's image), else the full prediction
-        output = self.output(xs, cs, self.prediction_layer(), head=None if self.skip_residual else self.sampled_head())
+        if self.skip_decoder != 'linear': # the raw noisy pixels decoded under the (detached) trunk's tokens
+            output = self.decoder_output(x_input, xs[:, self.in_context_len:], t_emb.detach() if two else t_emb, ress, cs)
+        else:
+            gated = self.gated_skip(skip, cs)
+            if k < depth: # mid-trunk: into block k's output, then the remaining blocks
+                xs = self.inject_skip(xs, gated, ress, k - 1)
+                xs = self.run_blocks(xs, ress, k, depth, cbs, ys)[:, self.in_context_len:]
+            else: # after the trunk: added to its output directly
+                xs = xs[:, self.in_context_len:] + gated
+            for block in self.skip_head:
+                xs = block(xs, cbs, self.feat_rope)
+            # with skip_residual this is the correction (no DC-AE head: that refines the trunk's image), else the full prediction
+            output = self.output(xs, cs, self.prediction_layer(), head=None if self.skip_residual else self.sampled_head())
         if not two:
             return output
         # trunk-only branch, run last so block hooks (e.g. REPA's capture) see the trunk's own activations
@@ -903,6 +1039,22 @@ class JiT(nn.Module):
         x += self.pos_embed # in place, as JiT does: keeps the embedding's dtype (bf16 under autocast), the fp32 table would promote it
         return x
 
+    def decoder_output(self, img, tokens, t_emb, res, c):
+        """
+        skip_decoder's prediction. img: the raw noisy image; tokens: the trunk's output tokens [B, L, D] (in-context
+        tokens removed); res: the trunk's AttnRes state at its end (for skip_decoder_attnres); with skip_stop_grad all of
+        them come from the detached copy of the trunk. Each decoder block's conditioning token is the trunk output (or
+        its own AttnRes mix of the trunk's sources) plus the timestep embedding, as PixelDiT's s_cond.
+        """
+        dec = self.skip_decoder_module
+        if self.skip_decoder_attnres:
+            conds = [res.mix_query(q, n)[:, self.in_context_len:] + t_emb.unsqueeze(1) for q, n in zip(dec.queries, dec.key_norms)]
+        else:
+            conds = [tokens + t_emb.unsqueeze(1)] * len(dec.blocks)
+        img = dec(img, conds)
+        head = self.sampled_head()
+        return head(img, c) if head is not None else img
+
     def prediction_layer(self):
         # the final layer of the prediction the model is evaluated / sampled with
         return self.skip_final_layer if self.has_skip_final_layer else self.final_layer
@@ -915,7 +1067,7 @@ class JiT(nn.Module):
         # DC-AE head of the trunk-only prediction. With a separate final layer (not residual) the sampled path's head is
         # never shared: the trunk branch gets its own (dcae_trunk_head) or none, i.e. exactly vanilla JiT. Otherwise the
         # trunk's prediction is (part of) the sampled one and uses the same head.
-        if self.has_skip_final_layer and not self.skip_residual:
+        if (self.has_skip_final_layer or self.skip_decoder != 'linear') and not self.skip_residual:
             return self.trunk_output_head if self.dcae_trunk_head else None
         return self.sampled_head()
 

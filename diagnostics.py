@@ -110,6 +110,8 @@ def instrumented_forward(net, x, t, y, capture_blocks=(), tile=None, skip_on=Tru
     tile: if set, runs the windowed-attention ablation (see tile_mask) instead of full attention.
     skip_on: False runs a skip-pathway model without its skip (the trunk-only prediction, used for skip_residual).
     """
+    if getattr(net, 'family', 'jit') == 'pixeldit':
+        return _pixeldit_forward(net, x, t, y, capture_blocks, tile)
     g = int(round(net.x_embedder.num_patches ** 0.5))
     x_input = x
     masks = {}
@@ -119,7 +121,8 @@ def instrumented_forward(net, x, t, y, capture_blocks=(), tile=None, skip_on=Tru
     y_emb = net.y_embedder(y)
     c = t_emb + y_emb
     c_blocks = net.t_block(c) if getattr(net, 'adaln_single', False) else c
-    skip = net.skip_embedder(x) if getattr(net, 'skip_pathway', False) and skip_on else None # from the raw noisy input, as in JiT.forward
+    decoder = getattr(net, 'skip_decoder', 'linear') != 'linear' and skip_on # skip pathway as a pixel / subpatch decoder
+    skip = net.skip_embedder(x) if getattr(net, 'skip_pathway', False) and skip_on and not decoder else None # from the raw noisy input, as in JiT.forward
     skip_ratio = None
     if getattr(net, 'dcae_stem', False):
         x = net.input_stem(x, c)
@@ -165,7 +168,9 @@ def instrumented_forward(net, x, t, y, capture_blocks=(), tile=None, skip_on=Tru
             h = h + gated
         for block in net.skip_head:
             h = block(h, c_blocks, net.feat_rope)
-    if skip is not None and net.skip_residual:
+    if decoder: # the raw noisy pixels decoded under the trunk's tokens (and its AttnRes state), as JiT.forward does
+        out = net.decoder_output(x_input, h, t_emb, res, c)
+    elif skip is not None and net.skip_residual:
         # trunk-only prediction (same images, noise and attention masks, skip off) + the skip branch's correction
         trunk_out, _, _ = instrumented_forward(net, x_input, t, y, tile=tile, skip_on=False)
         out = trunk_out + net.output(h, c, net.prediction_layer())
@@ -181,6 +186,20 @@ def instrumented_forward(net, x, t, y, capture_blocks=(), tile=None, skip_on=Tru
     if res is not None:
         stats['attn_res_alpha'] = attn_res_matrix(res.weights, x.device)
     return out, stats, feats
+
+def _pixeldit_forward(net, x, t, y, capture_blocks=(), tile=None):
+    # PixelDiT: the model's own forward, with the patch-level blocks' tokens captured by hooks for the probes; the attention
+    # statistics and the windowed-attention ablation are JiT-specific and not computed
+    assert tile is None, 'the windowed-attention ablation is only implemented for JiT'
+    feats, hooks = {}, []
+    for b in capture_blocks:
+        hooks.append(net.blocks[b - 1].register_forward_hook(lambda m, i, o, b=b: feats.__setitem__(b, o)))
+    try:
+        out = net(x, t, y)
+    finally:
+        for h in hooks:
+            h.remove()
+    return out, {}, feats
 
 def attn_res_matrix(weights, device):
     """

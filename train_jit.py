@@ -62,7 +62,7 @@ data_dir = '' # '' -> {data_root}/{dataset}; set it to use a dataset outside dat
 gradient_accumulation_steps = 1
 batch_size = 1024 # micro batch; effective batch = batch_size * gradient_accumulation_steps (JiT uses 1024)
 # model: a JiT preset, optionally with any architecture field overridden (-1 keeps the preset's value)
-model = 'JiT-B/16' # JiT-B/16, JiT-B/32, JiT-L/16, JiT-L/32, JiT-H/16, JiT-H/32
+model = 'JiT-B/16' # JiT-B/16, JiT-B/32, JiT-L/16, JiT-L/32, JiT-H/16, JiT-H/32, or PixelDiT-B/16, -L/16, -XL/16 (model_pixeldit.py)
 depth = -1
 hidden_size = -1
 num_heads = -1
@@ -71,6 +71,9 @@ bottleneck_dim = -1 # width of the low-rank patch embedding
 in_context_len = -1 # number of in-context class tokens (0 disables them)
 in_context_start = -1 # block where the in-context tokens are prepended
 mlp_ratio = -1.0
+pixel_depth = -1 # PixelDiT: number of pixel-level (PiT) blocks
+pixel_dim = -1 # PixelDiT: per-pixel token width
+pixeldit_prediction = 'x' # PixelDiT: 'x' (this repo's x-prediction) or 'v' (the paper's velocity output)
 attn_res = 'none' # 'full' | 'block': Attention Residuals (arXiv 2603.15031), softmax mixing over depth instead of the plain residual sum
 attn_res_block_size = 0 # block only: JiT blocks per AttnRes block; 0 -> about 8 blocks (the paper's default)
 dcae_stem = False # DC-AE style residual conv branches before the patch embedding (full resolution and the 4px level), zero-init gates
@@ -87,6 +90,12 @@ skip_residual = False # with skip_final_layer: the with-skip prediction = trunk 
 skip_final_layer = False # skip_pathway + skip_stop_grad: the with-skip prediction gets its own final layer (trunk trained exactly as vanilla when injected after the trunk)
 skip_stop_grad = False # skip_pathway only: also train the trunk-only prediction; the skip branch's loss stops at the injection point (trunk trained as vanilla JiT)
 skip_pathway_drop_prob = 0.0 # skip_pathway only: in training, drop the skip for this fraction of samples (the trunk then reconstructs them alone)
+skip_decoder = 'linear' # skip_pathway: 'linear' (gated skip tokens + a linear final layer) or 'pixel' / 'subpatch' (a decoder of the raw noisy pixels, one token per pixel / per 4x4 block, modulated per token by its patch's trunk token; needs skip_stop_grad)
+skip_decoder_dim = 0 # decoder token width; 0 -> 16 for pixel, 64 for subpatch
+skip_decoder_blocks = 2 # decoder blocks (PixelDiT-B uses 2 pixel-level blocks)
+skip_decoder_rank = 0 # > 0: low-rank (cond -> rank -> per-token modulation) projections, instead of full ones
+skip_decoder_conv = False # a 3x3 conv over neighbouring decoder tokens in each block (crosses patch boundaries)
+skip_decoder_attnres = False # each decoder block conditions on its own AttnRes mix of the (detached) trunk sources instead of the trunk output (needs attn_res)
 skip_inject_block = 0 # skip_pathway only: 0 -> after the trunk; -k -> before the last k blocks; k -> after block k
 gated_bottleneck = False # add a full-rank patch embedding behind a gate from the conditioning (zero-init: starts as the bottleneck)
 attn_res_adaln = False # adaLN on the AttnRes queries from the conditioning (time + class), one shared projection (~1.2M params on JiT-B)
@@ -209,14 +218,31 @@ def check_prepared(data_dir, diag):
                                 '\nrun:\n  ' + '\n  '.join(steps) + ('\nor pass --diag=False to train without diagnostics (needs only fid.py)' if diag else ''))
 
 check_prepared(data_dir, diag)
+is_pixeldit = model.startswith('PixelDiT')
+if is_pixeldit: # the JiT-specific options don't exist in PixelDiT
+    jit_only = dict(bottleneck_dim=bottleneck_dim < 0, attn_res=attn_res == 'none', adaln_single=not adaln_single, gated_bottleneck=not gated_bottleneck,
+                    skip_pathway=not skip_pathway, dcae_stem=not dcae_stem, dcae_head=not dcae_head, patch_overlap=patch_overlap == 0,
+                    layernorm=not layernorm, gate_init=gate_init == 'zero', attn_res_adaln=not attn_res_adaln,
+                    in_context_len=in_context_len <= 0, masking=mask_ratio == 0)
+    bad = [k for k, ok in jit_only.items() if not ok]
+    assert not bad, f'not available for PixelDiT: {bad}'
+else:
+    assert pixel_depth < 0 and pixel_dim < 0 and pixeldit_prediction == 'x', 'pixel_depth / pixel_dim / pixeldit_prediction are PixelDiT options'
 model_name, arch = resolve_arch(model, **{k: (None if v < 0 else v) for k, v in dict(
     depth=depth, hidden_size=hidden_size, num_heads=num_heads, patch_size=patch_size, bottleneck_dim=bottleneck_dim,
-    in_context_len=in_context_len, in_context_start=in_context_start, mlp_ratio=mlp_ratio).items()},
+    in_context_len=in_context_len, in_context_start=in_context_start, mlp_ratio=mlp_ratio, pixel_depth=pixel_depth, pixel_dim=pixel_dim).items()},
+    prediction=pixeldit_prediction if is_pixeldit and pixeldit_prediction != 'x' else None,
     attn_res=None if attn_res == 'none' else attn_res,
     attn_res_block_size=attn_res_block_size if (attn_res == 'block' and attn_res_block_size > 0) else None,
     adaln_single=adaln_single or None, attn_res_adaln=attn_res_adaln or None, gated_bottleneck=gated_bottleneck or None,
     skip_pathway=skip_pathway or None, skip_head_blocks=skip_head_blocks or None, skip_inject_block=skip_inject_block or None,
     skip_final_layer=skip_final_layer or None, skip_residual=skip_residual or None,
+    skip_decoder=None if skip_decoder == 'linear' else skip_decoder,
+    skip_decoder_dim=skip_decoder_dim if skip_decoder != 'linear' and skip_decoder_dim > 0 else None,
+    skip_decoder_blocks=skip_decoder_blocks if skip_decoder != 'linear' and skip_decoder_blocks != 2 else None,
+    skip_decoder_rank=skip_decoder_rank if skip_decoder != 'linear' and skip_decoder_rank > 0 else None,
+    skip_decoder_conv=skip_decoder_conv if skip_decoder != 'linear' and skip_decoder_conv else None,
+    skip_decoder_attnres=skip_decoder_attnres if skip_decoder != 'linear' and skip_decoder_attnres else None,
     dcae_stem=dcae_stem or None, dcae_head=dcae_head or None, dcae_trunk_head=dcae_trunk_head or None,
     patch_overlap=patch_overlap or None, layernorm=layernorm or None, gate_init=None if gate_init == 'zero' else gate_init,
     dcae_width=dcae_width if (dcae_stem or dcae_head or dcae_trunk_head) and dcae_width != 128 else None,
@@ -287,6 +313,12 @@ assert skip_pathway_drop_prob == 0 or skip_pathway, 'skip_pathway_drop_prob need
 assert 0 <= skip_pathway_drop_prob < 1, 'skip_pathway_drop_prob must be in [0, 1)'
 assert not skip_stop_grad or skip_pathway, 'skip_stop_grad needs skip_pathway'
 assert not skip_final_layer or skip_stop_grad, 'skip_final_layer needs skip_stop_grad (otherwise the original final layer is never used)'
+if skip_decoder != 'linear':
+    assert skip_stop_grad, 'skip_decoder needs skip_stop_grad (the decoder is the with-skip branch; the trunk keeps its own final layer)'
+    assert mask_ratio == 0, 'token masking would leak masked patches through the skip decoder, which reads raw pixels'
+else:
+    assert skip_decoder_dim == 0 and skip_decoder_blocks == 2 and skip_decoder_rank == 0 and not skip_decoder_conv and not skip_decoder_attnres, \
+        'skip_decoder_* options need --skip_decoder=pixel or subpatch'
 assert not skip_residual or skip_final_layer, 'skip_residual needs skip_final_layer (and skip_stop_grad)'
 assert not dcae_trunk_head or (skip_final_layer and not skip_residual), 'dcae_trunk_head needs skip_final_layer (not skip_residual)'
 if skip_pathway:
@@ -355,7 +387,13 @@ def muon_split(name):
 muon_named = {id(p): (n, p) for n, p in denoiser.net.blocks.named_parameters()
               if optimizer_type == 'muon' and p.ndim >= 2 and p.requires_grad and (muon_adaln or 'adaLN_modulation' not in n)
               and 'scale_shift_table' not in n}
-if optimizer_type == 'muon' and skip_pathway: # the head blocks' hidden matrices, like the trunk's; the gate like adaLN
+if optimizer_type == 'muon' and is_pixeldit: # the PiT blocks' hidden matrices, like the patch-level blocks'
+    muon_named.update({id(p): ('pixel_blocks.' + n, p) for n, p in denoiser.net.pixel_blocks.named_parameters()
+                       if p.ndim >= 2 and p.requires_grad and (muon_adaln or 'modulation' not in n)})
+if optimizer_type == 'muon' and skip_pathway and skip_decoder != 'linear': # decoder blocks: MLP matrices; modulation like adaLN
+    muon_named.update({id(p): ('skip_decoder.' + n, p) for n, p in denoiser.net.skip_decoder_module.blocks.named_parameters()
+                       if p.ndim == 2 and p.requires_grad and (muon_adaln or 'modulation' not in n)})
+if optimizer_type == 'muon' and skip_pathway and skip_decoder == 'linear': # the head blocks' hidden matrices, like the trunk's; the gate like adaLN
     muon_named.update({id(p): ('skip_head.' + n, p) for n, p in denoiser.net.skip_head.named_parameters()
                        if p.ndim >= 2 and p.requires_grad and (muon_adaln or 'adaLN_modulation' not in n) and 'scale_shift_table' not in n})
     if muon_adaln:
@@ -481,6 +519,8 @@ if diag:
     assert all(1 <= b <= n_blocks for b in probe_blocks), f'diag_probe_blocks {probe_blocks} outside 1..{n_blocks}'
     probe_ts = [float(t) for t in diag_probe_ts.split(',')]
     window_tiles = [k for k in (int(v) for v in diag_window_tiles.split(',') if v) if k < grid]
+    if is_pixeldit: # the windowed-attention ablation (and attention stats) reimplement JiT's forward
+        window_tiles = []
     probe_train_x, probe_train_y = data.get(spaced(len(data), diag_probe_train_images))
     probe_val_x, probe_val_y = val_data.get(spaced(len(val_data), diag_probe_val_images))
     probe_train_y, probe_val_y = torch.from_numpy(probe_train_y).to(device), torch.from_numpy(probe_val_y).to(device)
@@ -585,7 +625,7 @@ def evaluate(step):
             log[f'noise_xmse/{split}_t{tl}'] = passes[split]['x_mse'][i].item()
         log[f'noise_gap/t{tl}'] = (passes['val']['v_loss'][i] - passes['train']['v_loss'][i]).item()
     pv = passes['val']
-    for b in range(pv['attn_entropy'].shape[1]):
+    for b in range(pv['attn_entropy'].shape[1] if 'attn_entropy' in pv else 0): # not for PixelDiT
         log[f'attn_entropy/block{b + 1:02d}'] = pv['attn_entropy'][:, b].mean().item()
         log[f'gate_msa/block{b + 1:02d}'] = pv['gate_msa'][:, b].mean().item()
         log[f'gate_mlp/block{b + 1:02d}'] = pv['gate_mlp'][:, b].mean().item()
@@ -626,10 +666,11 @@ def evaluate(step):
     d = os.path.join(out_dir, 'diagnostics')
     images['freq_err'] = diag_lib.heatmap(pv['freq_rel_err'].numpy(), [f't={tl}' for tl in t_labels], band_labels,
                                           f'held-out relative prediction error by frequency band (iter {step})', os.path.join(d, f'freq_err_{step}.png'))
-    images['attn_entropy'] = diag_lib.heatmap(pv['attn_entropy'].numpy(), [f't={tl}' for tl in t_labels], [f'b{b + 1}' for b in range(pv['attn_entropy'].shape[1])],
+    if 'attn_entropy' in pv:
+        images['attn_entropy'] = diag_lib.heatmap(pv['attn_entropy'].numpy(), [f't={tl}' for tl in t_labels], [f'b{b + 1}' for b in range(pv['attn_entropy'].shape[1])],
                                               f'attention entropy, normalized (iter {step})', os.path.join(d, f'attn_entropy_{step}.png'), log=False)
-    images['attn_dist'] = diag_lib.heatmap(pv['attn_dist'].numpy(), [f't={tl}' for tl in t_labels], [f'b{b + 1}' for b in range(pv['attn_dist'].shape[1])],
-                                           f'mean attention distance / uniform (iter {step})', os.path.join(d, f'attn_dist_{step}.png'), log=False)
+        images['attn_dist'] = diag_lib.heatmap(pv['attn_dist'].numpy(), [f't={tl}' for tl in t_labels], [f'b{b + 1}' for b in range(pv['attn_dist'].shape[1])],
+                                               f'mean attention distance / uniform (iter {step})', os.path.join(d, f'attn_dist_{step}.png'), log=False)
     if window_increase:
         images['window_loss_increase'] = diag_lib.heatmap(
             torch.stack([window_increase[k] for k in window_tiles]).numpy(), [f'tile {k}x{k} ({k * arch["patch_size"]}px)' for k in window_tiles],

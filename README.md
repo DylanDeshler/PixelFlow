@@ -247,6 +247,20 @@ from the trunk and its final layer. Samples and evaluation use trunk + correctio
 With injection after the trunk this costs one extra final-layer pass. Mid-trunk, the blocks after the injection point
 also run twice at sampling time.
 
+`--skip_decoder=pixel|subpatch` (with `--skip_stop_grad`; default `linear`) replaces the with-skip branch's linear
+decoder with a PixelDiT-style decoder of the raw noisy pixels. Tokens are single pixels (`pixel`, 256 per patch,
+width 16) or 4x4 pixel blocks (`subpatch`, 16 per patch, width 64; `--skip_decoder_dim`). Each block gives every token
+its own shift / scale / gate from the conditioning token of its patch (PixelDiT's pixel-wise adaLN), then a gated
+SwiGLU MLP (`--skip_decoder_blocks`, default 2). The conditioning token is the detached trunk output plus the
+timestep embedding.
+- `--skip_decoder_rank=r` makes the modulation projections low-rank (768 -> r -> per-token values). Full rank costs
+  +17M params for `pixel`.
+- `--skip_decoder_conv` adds a 3x3 conv over neighbouring tokens, the only path across patch boundaries.
+- `--skip_decoder_attnres` (needs `--attn_res`) lets each decoder block condition on its own AttnRes mix of the
+  detached trunk sources, with a learned query, instead of the trunk output only. It costs < 1% memory.
+- The trunk stays exactly vanilla-trained; the decoder is trained only by the with-skip loss.
+- Activation memory vs the linear decoder: about +8% for `subpatch`, +35% for `pixel` (16k tokens per image).
+
 `--skip_pathway_drop_prob=p` (default 0, off) drops the skip for a random fraction p of training samples, the way
 label dropout works for CFG. On those samples the trunk has to reconstruct everything through the bottleneck. The
 motivation: with the skip always on, the trunk's probes trailed at every noise level, even where the skip's gate was
@@ -289,6 +303,24 @@ pre-norms, QK-norm in attention, the final layer, the AttnRes key norms and the 
 is a separate module and keeps its own. Computed in fp32 and returned in the input's dtype like JiT's RMSNorm, so
 activations stay bf16 under autocast. AttnRes scores with LayerNorm keys subtract each source's mean:
 `(v . u - mean(v) sum(u)) / std(v)`. The key norm's bias adds the same constant to every source's score, so it cancels.
+
+## PixelDiT baseline
+
+`--model=PixelDiT-B/16` (also `-L/16`, `-XL/16`) trains PixelDiT (Yu et al. 2025, arXiv 2511.20645), implemented in
+`model_pixeldit.py` as a drop-in network for the same denoiser, losses, EMA, Muon, FID evals, `eval_jit.py` and
+`eval_linear.py`.
+- **Patch level:** N DiT blocks (RMSNorm, RoPE, adaLN-Zero) on 16px tokens.
+- **Pixel level:** M PiT blocks on 16-dim per-pixel tokens of the noisy image. Each has pixel-wise adaLN from the
+  semantic tokens, token compaction (patch pixels flattened to the hidden width for global attention, then expanded
+  back) and a per-pixel FFN.
+- **Size:** parameter counts match the paper's B / L / XL (185 / 570 / 798M at 256px vs 184 / 569 / 797M).
+- **Objective:** the default is this repo's x-prediction, for an apples-to-apples comparison with the JiT runs.
+  `--pixeldit_prediction=v` uses the paper's velocity output.
+- **REPA:** the paper trains with DINOv2 REPA (block 8, weight 0.5); the `--repa_*` flags reproduce that.
+- **Diagnostics:** the attention statistics and windowed-attention ablation are JiT-only and skipped. Per-noise-level
+  losses, band errors and probes on the patch-level blocks work. JiT-only options (AttnRes, adaLN-single, skip, DC-AE,
+  masking, ...) are rejected.
+- **Cost:** PixelDiT-B has 2x the parameters of the best JiT setup (184M vs 92M) and +85% activation memory at 128px.
 
 ## adaLN-single
 
