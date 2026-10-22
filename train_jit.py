@@ -75,6 +75,7 @@ attn_res = 'none' # 'full' | 'block': Attention Residuals (arXiv 2603.15031), so
 attn_res_block_size = 0 # block only: JiT blocks per AttnRes block; 0 -> about 8 blocks (the paper's default)
 dcae_stem = False # DC-AE style residual conv branches before the patch embedding (full resolution and the 4px level), zero-init gates
 dcae_head = False # DC-AE style residual conv branches on the predicted image (token level and the 4px level), zero-init gates
+dcae_trunk_head = False # with skip_final_layer: the trunk-only prediction gets its own DC-AE head (dcae_head is the sampled path's)
 dcae_width = 128 # hidden channels of the DC-AE branches (the full-resolution stem branch uses width / 4)
 dcae_kernel2 = 1 # kernel of each DC-AE branch's second conv (the first is 3x3)
 layernorm = False # every RMSNorm in the network (block pre-norms, QK-norm, final layer, AttnRes keys, DC-AE branches) becomes a LayerNorm
@@ -214,9 +215,10 @@ model_name, arch = resolve_arch(model, **{k: (None if v < 0 else v) for k, v in 
     adaln_single=adaln_single or None, attn_res_adaln=attn_res_adaln or None, gated_bottleneck=gated_bottleneck or None,
     skip_pathway=skip_pathway or None, skip_head_blocks=skip_head_blocks or None, skip_inject_block=skip_inject_block or None,
     skip_final_layer=skip_final_layer or None, skip_residual=skip_residual or None,
-    dcae_stem=dcae_stem or None, dcae_head=dcae_head or None, patch_overlap=patch_overlap or None, layernorm=layernorm or None,
-    dcae_width=dcae_width if (dcae_stem or dcae_head) and dcae_width != 128 else None,
-    dcae_kernel2=dcae_kernel2 if (dcae_stem or dcae_head) and dcae_kernel2 != 1 else None)
+    dcae_stem=dcae_stem or None, dcae_head=dcae_head or None, dcae_trunk_head=dcae_trunk_head or None,
+    patch_overlap=patch_overlap or None, layernorm=layernorm or None,
+    dcae_width=dcae_width if (dcae_stem or dcae_head or dcae_trunk_head) and dcae_width != 128 else None,
+    dcae_kernel2=dcae_kernel2 if (dcae_stem or dcae_head or dcae_trunk_head) and dcae_kernel2 != 1 else None)
 if not out_dir:
     out_dir = run_dir(runs_root, dataset, model, arch, config, _defaults, run_name)
     legacy = legacy_run_dir(runs_root, dataset, model, arch, config, _defaults, run_name)
@@ -283,6 +285,7 @@ assert 0 <= skip_pathway_drop_prob < 1, 'skip_pathway_drop_prob must be in [0, 1
 assert not skip_stop_grad or skip_pathway, 'skip_stop_grad needs skip_pathway'
 assert not skip_final_layer or skip_stop_grad, 'skip_final_layer needs skip_stop_grad (otherwise the original final layer is never used)'
 assert not skip_residual or skip_final_layer, 'skip_residual needs skip_final_layer (and skip_stop_grad)'
+assert not dcae_trunk_head or (skip_final_layer and not skip_residual), 'dcae_trunk_head needs skip_final_layer (not skip_residual)'
 if skip_pathway:
     denoiser.net.skip_drop_prob = skip_pathway_drop_prob # training only; evaluation and sampling always use the skip
     denoiser.net.skip_stop_grad = skip_stop_grad

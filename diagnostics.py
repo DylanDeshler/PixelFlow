@@ -168,10 +168,11 @@ def instrumented_forward(net, x, t, y, capture_blocks=(), tile=None, skip_on=Tru
     if skip is not None and net.skip_residual:
         # trunk-only prediction (same images, noise and attention masks, skip off) + the skip branch's correction
         trunk_out, _, _ = instrumented_forward(net, x_input, t, y, tile=tile, skip_on=False)
-        out = trunk_out + net.output(h, c, net.prediction_layer(), head=False)
+        out = trunk_out + net.output(h, c, net.prediction_layer())
     else:
         # final layer (the skip branch's own when the skip is on), unpatchify / overlap-add, DC-AE head
-        out = net.output(h, c, net.prediction_layer() if skip is not None else None)
+        out = net.output(h, c, net.prediction_layer() if skip is not None else None,
+                         head=net.sampled_head() if skip is not None or not getattr(net, 'skip_pathway', False) else net.trunk_head())
     stats = {k: torch.stack(v) for k, v in stats.items()}
     if bypass_ratio is not None:
         stats['bypass_ratio'] = bypass_ratio.reshape(1)

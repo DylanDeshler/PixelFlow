@@ -233,7 +233,8 @@ the with-skip prediction.
 `--skip_final_layer=True` (with `--skip_stop_grad`) gives the with-skip prediction its own final layer, starting as an
 exact copy. JiT's final layer then serves only the trunk-only branch. With injection after the trunk, the trunk is
 then trained exactly like vanilla JiT, apart from gradient clipping on the combined norm. Mid-trunk, the blocks after
-the injection point are still shared. With `--dcae_head`, the DC-AE head after the final layer is shared as well.
+the injection point are still shared. With `--dcae_head`, the DC-AE head belongs to the sampled (with-skip) path only.
+The trunk-only prediction gets no head, so nothing in the decoder is shared.
 About +0.6M params on JiT-B.
 
 `--skip_residual=True` (with `--skip_final_layer --skip_stop_grad`) makes the with-skip prediction
