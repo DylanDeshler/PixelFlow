@@ -170,6 +170,9 @@ def instrumented_forward(net, x, t, y, capture_blocks=(), tile=None, skip_on=Tru
             h = block(h, c_blocks, net.feat_rope)
     if decoder: # the raw noisy pixels decoded under the trunk's tokens (and its AttnRes state), as JiT.forward does
         out = net.decoder_output(x_input, h, t_emb, res, c)
+        # how far the decoder's input gate is open: RMS of the gated noisy pixels relative to the trunk readout
+        readout, gated = net.skip_decoder_module.initial_tokens(x_input, h, c)
+        skip_ratio = gated.float().pow(2).mean().sqrt() / readout.float().pow(2).mean().sqrt().clamp_min(1e-12)
     elif skip is not None and net.skip_residual:
         # trunk-only prediction (same images, noise and attention masks, skip off) + the skip branch's correction
         trunk_out, _, _ = instrumented_forward(net, x_input, t, y, tile=tile, skip_on=False)

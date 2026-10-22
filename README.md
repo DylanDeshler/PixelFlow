@@ -248,18 +248,24 @@ With injection after the trunk this costs one extra final-layer pass. Mid-trunk,
 also run twice at sampling time.
 
 `--skip_decoder=pixel|subpatch` (with `--skip_stop_grad`; default `linear`) replaces the with-skip branch's linear
-decoder with a PixelDiT-style decoder of the raw noisy pixels. Tokens are single pixels (`pixel`, 256 per patch,
-width 16) or 4x4 pixel blocks (`subpatch`, 16 per patch, width 64; `--skip_decoder_dim`). Each block gives every token
-its own shift / scale / gate from the conditioning token of its patch (PixelDiT's pixel-wise adaLN), then a gated
-SwiGLU MLP (`--skip_decoder_blocks`, default 2). The conditioning token is the detached trunk output plus the
-timestep embedding.
-- `--skip_decoder_rank=r` makes the modulation projections low-rank (768 -> r -> per-token values). Full rank costs
-  +17M params for `pixel`.
+decoder with a decoder over units of the image: single pixels (`pixel`, 256 per patch, width 16) or 4x4 pixel blocks
+(`subpatch`, 16 per patch, width 64; `--skip_decoder_dim`). It keeps the structure that makes `--skip_final_layer` work
+and adds PixelDiT's per-token modulation:
+- **Start:** `tokens = readout(norm(h)) + gate(c) * embed(noisy pixels)`. The readout is a linear decode of each
+  patch's detached trunk token into its decoder tokens. The noisy pixels sit behind a zero-initialized gate from the
+  conditioning, as the skip pathway's. So the decoder starts as a linear decode of the trunk, like `skip_final_layer`.
+- **Refinement:** `--skip_decoder_blocks` (default 2) blocks each give every token its own shift / scale / gate from
+  the conditioning token of its patch, then a gated SwiGLU MLP. With 0 blocks it is the linear skip decoder at unit
+  granularity: a control for what the per-token modulation adds.
+- An earlier version without the readout learned very slowly (with-skip loss 0.15 vs the trunk's 0.06 at 5k
+  iterations): with modulation as the only route for the trunk's content, it first learns a local denoiser of each
+  unit's noisy pixels.
+- `--skip_decoder_rank=r` makes the modulation projections low-rank. `subpatch` with rank 112 matches the best linear
+  setup's parameter count. `pixel`'s readout alone is 3.1M.
 - `--skip_decoder_conv` adds a 3x3 conv over neighbouring tokens, the only path across patch boundaries.
-- `--skip_decoder_attnres` (needs `--attn_res`) lets each decoder block condition on its own AttnRes mix of the
-  detached trunk sources, with a learned query, instead of the trunk output only. It costs < 1% memory.
-- The trunk stays exactly vanilla-trained; the decoder is trained only by the with-skip loss.
-- Activation memory vs the linear decoder: about +8% for `subpatch`, +35% for `pixel` (16k tokens per image).
+- `--skip_decoder_attnres` (needs `--attn_res`) lets each block condition on its own AttnRes mix of the detached trunk
+  sources, with a learned query, instead of the trunk output only.
+- Diagnostics log the gated noisy-pixel input relative to the readout as `skip_ratio/t*`.
 
 `--skip_pathway_drop_prob=p` (default 0, off) drops the skip for a random fraction p of training samples, the way
 label dropout works for CFG. On those samples the trunk has to reconstruct everything through the bottleneck. The

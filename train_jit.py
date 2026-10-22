@@ -393,6 +393,9 @@ if optimizer_type == 'muon' and is_pixeldit: # the PiT blocks' hidden matrices, 
 if optimizer_type == 'muon' and skip_pathway and skip_decoder != 'linear': # decoder blocks: MLP matrices; modulation like adaLN
     muon_named.update({id(p): ('skip_decoder.' + n, p) for n, p in denoiser.net.skip_decoder_module.blocks.named_parameters()
                        if p.ndim == 2 and p.requires_grad and (muon_adaln or 'modulation' not in n)})
+    if muon_adaln: # the input gate like the skip pathway's gate; the readout stays on AdamW like the final layer it mirrors
+        g = denoiser.net.skip_decoder_module.input_gate[1].weight
+        muon_named[id(g)] = ('skip_decoder.input_gate.1.weight', g)
 if optimizer_type == 'muon' and skip_pathway and skip_decoder == 'linear': # the head blocks' hidden matrices, like the trunk's; the gate like adaLN
     muon_named.update({id(p): ('skip_head.' + n, p) for n, p in denoiser.net.skip_head.named_parameters()
                        if p.ndim >= 2 and p.requires_grad and (muon_adaln or 'adaLN_modulation' not in n) and 'scale_shift_table' not in n})

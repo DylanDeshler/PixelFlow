@@ -203,13 +203,19 @@ class SkipDecoderBlock(nn.Module):
 
 class SkipPixelDecoder(nn.Module):
     """
-    skip_decoder='pixel' / 'subpatch': the with-skip branch's decoder, replacing its linear final layer. The raw noisy
-    image is split into tokens of unit x unit pixels (unit 1: one token per pixel, PixelDiT's pixel pathway without its
-    attention; unit 4: one token per 4x4 pixel block, 16 per 16px patch), embedded to dim channels, modulated per token
-    by the conditioning token of the patch it lies in (the detached trunk output + the timestep embedding, or with
-    attnres an AttnRes mix of the detached trunk sources with a learned query per block), and mapped back to pixels.
-    With skip_stop_grad its loss never reaches the trunk. Zero-initialized gates and output: it starts as a zero
-    prediction, like the trunk's own final layer.
+    skip_decoder='pixel' / 'subpatch': the with-skip branch's decoder, replacing its linear final layer. Tokens are units
+    of unit x unit pixels (unit 1: one per pixel; unit 4: one per 4x4 pixel block, 16 per 16px patch). It follows the
+    linear skip decoder (skip_final_layer) and adds PixelDiT's per-token modulation on top:
+        tokens = readout(norm(h))  +  gate(c) * embed(noisy pixels)      readout: a linear decode of each patch's
+                                                                          trunk token into its decoder tokens
+        tokens = [norm -> per-token shift / scale -> MLP -> per-token gate -> residual] x blocks
+        prediction = out(norm(tokens))
+    The trunk's content arrives directly through the readout (with only modulation, the decoder first learns a local
+    denoiser of each unit's noisy pixels and the content path is slow to form). The noisy pixels come in behind a
+    zero-initialized gate from c (time + class), as the skip pathway's. Each block's per-token modulation comes from the
+    conditioning token of the unit's patch: the detached trunk output + the timestep embedding, or with attnres an
+    AttnRes mix of the detached trunk sources with a learned query per block. With blocks=0 it is the linear skip
+    decoder at unit granularity. With skip_stop_grad its loss never reaches the trunk.
     """
     def __init__(self, input_size, patch_size, in_chans, unit, dim, blocks, cond_dim, rank=0, conv=False, attnres=False,
                  layernorm=False):
@@ -219,6 +225,9 @@ class SkipPixelDecoder(nn.Module):
         self.s = patch_size // unit # tokens per patch side
         raw = in_chans * unit * unit
         self.embed = nn.Linear(raw, dim)
+        self.readout_norm = make_norm(cond_dim, layernorm)
+        self.readout = nn.Linear(cond_dim, self.s * self.s * dim) # trunk token -> its decoder tokens' starting state
+        self.input_gate = nn.Sequential(nn.SiLU(), nn.Linear(cond_dim, dim)) # on the embedded noisy pixels, from c
         self.blocks = nn.ModuleList([SkipDecoderBlock(self.s * self.s, dim, cond_dim, rank, conv, layernorm=layernorm) for _ in range(blocks)])
         self.norm = make_norm(dim, layernorm)
         self.out = nn.Linear(dim, raw)
@@ -251,9 +260,18 @@ class SkipPixelDecoder(nn.Module):
         g, s = self.g, self.s
         return h.reshape(B, d, g, s, g, s).permute(0, 2, 4, 3, 5, 1).reshape(B, g * g, s * s, d)
 
-    def forward(self, img, conds):
-        # img: the raw noisy image [B, C, H, W]; conds: one conditioning tensor [B, L, cond_dim] per block
-        x = self.embed(self.tokens(img))
+    def initial_tokens(self, img, h, c):
+        # (readout of the trunk tokens, gated embedded noisy pixels), each [B, L, s*s, dim]
+        B, L = h.shape[:2]
+        readout = self.readout(self.readout_norm(h)).view(B, L, self.s * self.s, -1)
+        gated = self.input_gate(c)[:, None, None, :] * self.embed(self.tokens(img))
+        return readout, gated
+
+    def forward(self, img, h, c, conds):
+        # img: the raw noisy image [B, C, H, W]; h: the trunk's output tokens [B, L, cond_dim]; c: the conditioning
+        # vector [B, cond_dim]; conds: one per-token conditioning tensor [B, L, cond_dim] per block
+        readout, gated = self.initial_tokens(img, h, c)
+        x = readout + gated.to(readout.dtype)
         for block, s in zip(self.blocks, conds):
             x = block(x, s, self)
         return self.image(self.out(self.norm(x)))
@@ -838,7 +856,9 @@ class JiT(nn.Module):
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
-        if self.skip_pathway and self.skip_decoder != 'linear': # skip decoder: zero gates and output (starts as a zero prediction)
+        if self.skip_pathway and self.skip_decoder != 'linear': # skip decoder: input gate shut, zero block gates and output
+            nn.init.constant_(self.skip_decoder_module.input_gate[-1].weight, 0)
+            nn.init.constant_(self.skip_decoder_module.input_gate[-1].bias, 0)
             for block in self.skip_decoder_module.blocks:
                 nn.init.constant_(block.modulation[-1].weight, 0)
                 nn.init.constant_(block.modulation[-1].bias, 0)
@@ -908,6 +928,8 @@ class JiT(nn.Module):
             random_bias(self.skip_gate[-1])
             nn.init.constant_(self.skip_embedder.proj.weight, 0)
         if self.skip_pathway and self.skip_decoder != 'linear':
+            random_bias(self.skip_decoder_module.input_gate[-1])
+            nn.init.constant_(self.skip_decoder_module.embed.weight, 0)
             for block in self.skip_decoder_module.blocks:
                 random_bias(block.modulation[-1])
                 nn.init.constant_(block.mlp.w3.weight, 0)
@@ -1051,7 +1073,7 @@ class JiT(nn.Module):
             conds = [res.mix_query(q, n)[:, self.in_context_len:] + t_emb.unsqueeze(1) for q, n in zip(dec.queries, dec.key_norms)]
         else:
             conds = [tokens + t_emb.unsqueeze(1)] * len(dec.blocks)
-        img = dec(img, conds)
+        img = dec(img, tokens, c, conds)
         head = self.sampled_head()
         return head(img, c) if head is not None else img
 
