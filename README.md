@@ -260,6 +260,8 @@ and adds PixelDiT's per-token modulation:
 - An earlier version without the readout learned very slowly (with-skip loss 0.15 vs the trunk's 0.06 at 5k
   iterations): with modulation as the only route for the trunk's content, it first learns a local denoiser of each
   unit's noisy pixels.
+- `--skip_decoder_modulation=False` turns the blocks into plain residual MLP blocks (no per-token adaLN from the
+  trunk tokens), isolating what the modulation adds.
 - `--skip_decoder_rank=r` makes the modulation projections low-rank. `subpatch` with rank 112 matches the best linear
   setup's parameter count. `pixel`'s readout alone is 3.1M.
 - `--skip_decoder_conv` adds a 3x3 conv over neighbouring tokens, the only path across patch boundaries.

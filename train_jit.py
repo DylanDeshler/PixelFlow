@@ -95,6 +95,7 @@ skip_decoder_dim = 0 # decoder token width; 0 -> 16 for pixel, 64 for subpatch
 skip_decoder_blocks = 2 # decoder blocks (PixelDiT-B uses 2 pixel-level blocks)
 skip_decoder_rank = 0 # > 0: low-rank (cond -> rank -> per-token modulation) projections, instead of full ones
 skip_decoder_conv = False # a 3x3 conv over neighbouring decoder tokens in each block (crosses patch boundaries)
+skip_decoder_modulation = True # False: decoder blocks are plain residual MLP blocks, without the per-token adaLN from the trunk tokens
 skip_decoder_attnres = False # each decoder block conditions on its own AttnRes mix of the (detached) trunk sources instead of the trunk output (needs attn_res)
 skip_inject_block = 0 # skip_pathway only: 0 -> after the trunk; -k -> before the last k blocks; k -> after block k
 gated_bottleneck = False # add a full-rank patch embedding behind a gate from the conditioning (zero-init: starts as the bottleneck)
@@ -243,6 +244,7 @@ model_name, arch = resolve_arch(model, **{k: (None if v < 0 else v) for k, v in 
     skip_decoder_rank=skip_decoder_rank if skip_decoder != 'linear' and skip_decoder_rank > 0 else None,
     skip_decoder_conv=skip_decoder_conv if skip_decoder != 'linear' and skip_decoder_conv else None,
     skip_decoder_attnres=skip_decoder_attnres if skip_decoder != 'linear' and skip_decoder_attnres else None,
+    skip_decoder_modulation=False if skip_decoder != 'linear' and not skip_decoder_modulation else None,
     dcae_stem=dcae_stem or None, dcae_head=dcae_head or None, dcae_trunk_head=dcae_trunk_head or None,
     patch_overlap=patch_overlap or None, layernorm=layernorm or None, gate_init=None if gate_init == 'zero' else gate_init,
     dcae_width=dcae_width if (dcae_stem or dcae_head or dcae_trunk_head) and dcae_width != 128 else None,
@@ -317,7 +319,8 @@ if skip_decoder != 'linear':
     assert skip_stop_grad, 'skip_decoder needs skip_stop_grad (the decoder is the with-skip branch; the trunk keeps its own final layer)'
     assert mask_ratio == 0, 'token masking would leak masked patches through the skip decoder, which reads raw pixels'
 else:
-    assert skip_decoder_dim == 0 and skip_decoder_blocks == 2 and skip_decoder_rank == 0 and not skip_decoder_conv and not skip_decoder_attnres, \
+    assert skip_decoder_dim == 0 and skip_decoder_blocks == 2 and skip_decoder_rank == 0 and not skip_decoder_conv and not skip_decoder_attnres \
+        and skip_decoder_modulation, \
         'skip_decoder_* options need --skip_decoder=pixel or subpatch'
 assert not skip_residual or skip_final_layer, 'skip_residual needs skip_final_layer (and skip_stop_grad)'
 assert not dcae_trunk_head or (skip_final_layer and not skip_residual), 'dcae_trunk_head needs skip_final_layer (not skip_residual)'

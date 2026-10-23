@@ -181,21 +181,28 @@ class SkipDecoderBlock(nn.Module):
     token [B, L, cond_dim]. Every token gets its own shift / scale / gate from its patch's conditioning token (PixelDiT's
     pixel-wise adaLN, optionally through a rank-`rank` bottleneck), then a SwiGLU MLP behind the gate. conv: a 3x3 conv
     over neighbouring tokens before the MLP, the only path that crosses patch boundaries.
+    modulation=False: a plain residual MLP block (norm -> MLP -> residual, MLP output zero-initialized), no conditioning.
     """
-    def __init__(self, n_tokens, dim, cond_dim, rank=0, conv=False, mlp_ratio=4.0, layernorm=False):
+    def __init__(self, n_tokens, dim, cond_dim, rank=0, conv=False, mlp_ratio=4.0, layernorm=False, modulation=True):
         super().__init__()
         self.n, self.dim = n_tokens, dim
         self.norm = make_norm(dim, layernorm)
         self.mlp = SwiGLUFFN(dim, int(dim * mlp_ratio))
-        out = n_tokens * 3 * dim
-        proj = [nn.Linear(cond_dim, rank, bias=False), nn.Linear(rank, out)] if rank else [nn.Linear(cond_dim, out)]
-        self.modulation = nn.Sequential(nn.SiLU(), *proj)
+        if modulation:
+            out = n_tokens * 3 * dim
+            proj = [nn.Linear(cond_dim, rank, bias=False), nn.Linear(rank, out)] if rank else [nn.Linear(cond_dim, out)]
+            self.modulation = nn.Sequential(nn.SiLU(), *proj)
+        else:
+            self.modulation = None
         self.conv = nn.Conv2d(dim, dim, kernel_size=3, padding=1) if conv else None
 
     def forward(self, x, s, decoder):
-        B, L = x.shape[:2]
-        shift, scale, gate = self.modulation(s).to(x.dtype).view(B, L, self.n, 3, self.dim).unbind(3)
-        h = self.norm(x) * (1 + scale) + shift
+        if self.modulation is None:
+            h, gate = self.norm(x), 1.0
+        else:
+            B, L = x.shape[:2]
+            shift, scale, gate = self.modulation(s).to(x.dtype).view(B, L, self.n, 3, self.dim).unbind(3)
+            h = self.norm(x) * (1 + scale) + shift
         if self.conv is not None:
             h = decoder.from_grid(self.conv(decoder.to_grid(h)))
         return x + gate * self.mlp(h)
@@ -218,8 +225,10 @@ class SkipPixelDecoder(nn.Module):
     decoder at unit granularity. With skip_stop_grad its loss never reaches the trunk.
     """
     def __init__(self, input_size, patch_size, in_chans, unit, dim, blocks, cond_dim, rank=0, conv=False, attnres=False,
-                 layernorm=False):
+                 layernorm=False, modulation=True):
         super().__init__()
+        assert modulation or not attnres, 'skip_decoder_attnres drives the per-token modulation: it needs skip_decoder_modulation'
+        self.modulation = modulation
         assert patch_size % unit == 0, f'patch size {patch_size} must be a multiple of the decoder unit {unit}'
         self.p, self.u, self.g = patch_size, unit, input_size // patch_size
         self.s = patch_size // unit # tokens per patch side
@@ -228,7 +237,8 @@ class SkipPixelDecoder(nn.Module):
         self.readout_norm = make_norm(cond_dim, layernorm)
         self.readout = nn.Linear(cond_dim, self.s * self.s * dim) # trunk token -> its decoder tokens' starting state
         self.input_gate = nn.Sequential(nn.SiLU(), nn.Linear(cond_dim, dim)) # on the embedded noisy pixels, from c
-        self.blocks = nn.ModuleList([SkipDecoderBlock(self.s * self.s, dim, cond_dim, rank, conv, layernorm=layernorm) for _ in range(blocks)])
+        self.blocks = nn.ModuleList([SkipDecoderBlock(self.s * self.s, dim, cond_dim, rank, conv, layernorm=layernorm, modulation=modulation)
+                                     for _ in range(blocks)])
         self.norm = make_norm(dim, layernorm)
         self.out = nn.Linear(dim, raw)
         if attnres: # one depth-mixing query (and key norm) per block, zero-initialized: uniform over the sources at first
@@ -683,7 +693,8 @@ class JiT(nn.Module):
         skip_decoder_blocks=2,
         skip_decoder_rank=0,
         skip_decoder_conv=False,
-        skip_decoder_attnres=False
+        skip_decoder_attnres=False,
+        skip_decoder_modulation=True
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -801,7 +812,8 @@ class JiT(nn.Module):
             self.skip_head = nn.ModuleList()
             self.skip_decoder_module = SkipPixelDecoder(input_size, patch_size, in_channels, unit,
                                                         skip_decoder_dim or (16 if unit == 1 else 64), skip_decoder_blocks,
-                                                        hidden_size, skip_decoder_rank, skip_decoder_conv, skip_decoder_attnres, layernorm)
+                                                        hidden_size, skip_decoder_rank, skip_decoder_conv, skip_decoder_attnres, layernorm,
+                                                        skip_decoder_modulation)
 
         # linear predict
         # with patch_overlap the final layer predicts overlapping (patch + 2 * overlap)^2 patches, blended by overlap-add
@@ -860,8 +872,11 @@ class JiT(nn.Module):
             nn.init.constant_(self.skip_decoder_module.input_gate[-1].weight, 0)
             nn.init.constant_(self.skip_decoder_module.input_gate[-1].bias, 0)
             for block in self.skip_decoder_module.blocks:
-                nn.init.constant_(block.modulation[-1].weight, 0)
-                nn.init.constant_(block.modulation[-1].bias, 0)
+                if block.modulation is not None:
+                    nn.init.constant_(block.modulation[-1].weight, 0)
+                    nn.init.constant_(block.modulation[-1].bias, 0)
+                else: # no gate: the block starts as an identity through its zero MLP output
+                    nn.init.constant_(block.mlp.w3.weight, 0)
             nn.init.constant_(self.skip_decoder_module.out.weight, 0)
             nn.init.constant_(self.skip_decoder_module.out.bias, 0)
         if self.skip_pathway and self.skip_decoder == 'linear': # the skip embedding like the patch embedding; its gate starts closed (= no skip)
@@ -931,7 +946,8 @@ class JiT(nn.Module):
             random_bias(self.skip_decoder_module.input_gate[-1])
             nn.init.constant_(self.skip_decoder_module.embed.weight, 0)
             for block in self.skip_decoder_module.blocks:
-                random_bias(block.modulation[-1])
+                if block.modulation is not None:
+                    random_bias(block.modulation[-1])
                 nn.init.constant_(block.mlp.w3.weight, 0)
         if self.gated_bottleneck:
             random_bias(self.bottleneck_gate[-1])
