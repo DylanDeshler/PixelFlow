@@ -14,7 +14,7 @@ $ python eval_linear.py --ckpt=mae_vitb16          # official MAE weights (any n
 
 JiT checkpoints (train_jit.py ckpt.pt) work too, as the accurate counterpart of train_jit's quick mid-training probes.
 Features are the mean-pooled patch tokens after each of jit_blocks, on the input noised to jit_t, with the null label
-(as in diagnostics.probe_features); the head bank sweeps lr x {each block, all blocks concatenated}, and k-NN runs per
+(as in diagnostics.probe_features); the head bank sweeps lr x {the probe blocks concatenated, a depth-attention mixture of every block} x {mean, attention pooling}, and k-NN runs per
 block. JiT heads put a BatchNorm without affine in front of the linear layer (MAE's linear-probe protocol,
 --jit_feature_norm): unlike DINOv2's LayerNorm'd outputs, JiT's intermediate states are unnormalized. Data is the prepared memmap dataset the model trained on (data_dir/ and data_dir/val/, found from the run's
 config.json by default) at the model's resolution; the linear heads train with random flips only, since the memmaps
@@ -356,9 +356,9 @@ if linear:
     heads = nn.ModuleDict()
     param_groups = []
     if is_jit:
-        # each probe block on its own, all of them concatenated, and (jit_depth_attn) a learned mixture over every block;
-        # each with every token pooling in jit_pools
-        feature_sets = {f'block{b}': ([i], False) for b, i in zip(backbone.blocks, backbone.probe_index)}
+        # the probe blocks concatenated and a learned mixture over every block (jit_depth_attn; it subsumes the
+        # single-block heads, which only come back without it), each with every token pooling in jit_pools
+        feature_sets = {} if jit_depth_attn else {f'block{b}': ([i], False) for b, i in zip(backbone.blocks, backbone.probe_index)}
         if len(backbone.blocks) > 1:
             feature_sets['blocks' + '+'.join(map(str, backbone.blocks))] = (backbone.probe_index, False)
         if jit_depth_attn:

@@ -6,7 +6,7 @@ Single-GPU ImageNet-1k pretraining + frozen-feature evaluation for trying out Vi
 | --- | --- |
 | `vit.py` | baseline ViT (key-compatible with official DINO weights), DINO head, multi-crop wrapper, DINO loss. Defines the encoder interface new models must implement. |
 | `train_dino.py` | DINO pretraining. Defaults = official ViT-S/16 100 epoch recipe (effective batch 512). Logs k-NN accuracy every ~10 epochs. |
-| `eval_linear.py` | final eval of a checkpoint (DINO, official weights, or a JiT `train_jit.py` checkpoint): full 20-NN + DINOv2-style linear probe sweep (52 heads, one backbone pass). |
+| `eval_linear.py` | final eval of a checkpoint (DINO, official weights, or a JiT `train_jit.py` checkpoint): full 20-NN + DINOv2-style linear probe sweep (one backbone pass; JiT: depth-attention / attention-pooling heads, BatchNorm'd features). |
 | `data.py` / `evaluation.py` | ImageNet loading, DINO augmentations, eval transforms, feature extraction, k-NN classifier. |
 | `prepare_imagenet.py` | downloads ImageNet from Hugging Face (or uses the official tarballs) and writes the ImageFolder layout. |
 | `configurator.py` | nanoGPT-style `--key=value` overrides of the config globals. |
@@ -379,9 +379,21 @@ accuracy as block x noise-level matrices.
 
 The mid-training probes are kept cheap: 10k train / 5k val images and one AdamW run per cell, with no lr sweep. For an
 accurate number, run `eval_linear.py` on the checkpoint. It uses the full train/val split the run trained on (found from
-its `config.json`), the DINOv2 head sweep (13 lrs x {each probe block, all blocks}, 12,500 iters), and k-NN per block.
-It reads the same features: mean-pooled tokens, null label, input noised to `--jit_t`. Pick t from the probe heatmap;
-results land in `{run}/eval/results_t{t}.json`.
+its `config.json`), the DINOv2 head sweep (SGD, 13 lrs, 12,500 iters), and k-NN per block. It reads the same tokens
+(null label, input noised to `--jit_t`; pick t from the probe heatmap), and the heads cover
+{the probe blocks concatenated, a depth-attention mixture of every block} x {mean pooling, attention pooling} x lr
+(single-block heads only with `--jit_depth_attn=False`; k-NN still runs per probe block):
+- depth attention (`--jit_depth_attn`): per token, a softmax over depth of a learned query against each block's
+  RMS-normalized state (AttnRes's form), so the probe picks its own mix of blocks. The best heads' depth weights are printed.
+- attention pooling (`--jit_pools=mean,attn`): a learned query per attention head over the tokens, no projections.
+- both queries start at zero (uniform over depth, exactly mean pooling), so any gain over the mean-pooled heads is learned.
+- every JiT head puts a BatchNorm without affine in front of its linear layer (MAE's linear-probe protocol,
+  `--jit_feature_norm`). JiT's intermediate states aren't normalized like DINOv2's outputs, and plain SGD on their raw
+  scale barely trains: without it the best head sat at the top of the lr grid, far below the quick probes.
+
+Results land in `{run}/eval/results_t{t}.json`, with a feature-set x pooling table printed at the end. The heads keep
+every block's tokens per batch (roughly 8 GB of activations at 128px, batch 1024); at 256px lower `--batch_size` or drop a
+pooling.
 ```bash
 python eval_linear.py --ckpt=runs/in100_128/jit-b16_icl0/muon/ckpt.pt --jit_t=1.0
 python eval_linear.py --ckpt=runs/in100_128/jit-b16_icl0/muon/ckpt.pt --jit_t=0.75 --jit_blocks=4,6,8 --knn=False
