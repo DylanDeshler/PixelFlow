@@ -18,6 +18,8 @@ Figures:
     optimization.png        loss, gradient norm, update/weight ratio per parameter group, lr
     attn_res.png            AttnRes: the final layer's mixing weight on the patch embedding per noise level, and over sources (attn_res runs only)
     skip_pathway.png        how far the skip pathway's gate is open, per noise level (skip_pathway runs only)
+    sensitivity.png         how strongly the prediction follows its noisy input per noise level (copy / gain / Tweedie ratio),
+                            sampled head over training and, for skip_pathway runs, the trunk-only head
     gated_bottleneck.png    how far the gated full-rank patch path is open, per noise level (gated_bottleneck runs only)
     compare.png / .csv      key curves and latest values across runs
 """
@@ -293,6 +295,45 @@ def fig_gated_bottleneck(run, out):
 def fig_skip_pathway(run, out):
     return fig_gate(run, out, 'skip_ratio', 'skip_pathway', 'skip pathway', 'gated input patches / trunk output')
 
+def fig_sensitivity(run, out):
+    # input sensitivity per noise level (diagnostics.input_sensitivity): the sampled prediction at a few evals, and the
+    # trunk-only prediction at the latest eval (skip pathway runs: same images, noise and probes)
+    diags = [d for d in run['diags'] if d.get('sensitivity')]
+    if not diags:
+        return None
+    plt = setup()
+    from matplotlib.ticker import LogLocator, FuncFormatter, NullFormatter, NullLocator
+    ts = diags[-1]['t']
+    picks = sorted({0, len(diags) // 2, len(diags) - 1})
+    trunk = diags[-1]['sensitivity'].get('trunk')
+    panels = (('copy', 'copy  t tr(J) / n', '1 = passes the input through, 0 = ignores it'),
+              ('gain', 'gain  t² |J|²_F / n', 'squared amplification of a small change to the input (copy = 1)'),
+              ('tweedie', 'Tweedie ratio  copy / (SNR x-MSE)', '1 = an MMSE denoiser with the same error'))
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.8), facecolor=SURFACE)
+    for ax, (key, title, sub) in zip(axes, panels):
+        style_axis(ax, 't (1 = clean, logit scale)', key, f'{title}\n{sub}')
+        for color, i in zip(ordinal_blues(len(picks)), picks):
+            line(ax, ts, diags[i]['sensitivity']['sampled'][key], color, label=f"sampled, iter {diags[i]['iter']:,}")
+        if trunk is not None:
+            ax.plot(ts, trunk[key], '--s', color=ORANGE, linewidth=2, markersize=5, markeredgecolor=SURFACE, markeredgewidth=1.5,
+                    label=f"trunk-only, iter {diags[-1]['iter']:,}")
+        if key == 'tweedie': # a ratio: log scale, reference at 1
+            ax.axhline(1.0, color=INK_2, linewidth=1, linestyle=':')
+            ax.set_yscale('log')
+            ax.yaxis.set_major_locator(LogLocator(subs=(1, 2, 5)))
+            ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f'{v:g}'))
+            ax.yaxis.set_minor_formatter(NullFormatter())
+        ax.set_xscale('logit') # the noise levels are evenly spaced in logit(t)
+        ticks = [0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95]
+        ax.set_xticks(ticks, [f'{v:g}' for v in ticks])
+        ax.xaxis.set_minor_locator(NullLocator())
+        ax.tick_params(colors=INK_2, labelsize=8)
+    axes[0].legend(frameon=False, fontsize=8)
+    fig.suptitle(f"{run['name']}: input sensitivity (Jacobian of the prediction w.r.t. its noisy input, held-out images)",
+                 color=INK, fontsize=11, x=0.01, ha='left')
+    fig.tight_layout(rect=(0, 0, 1, 0.92))
+    return save(fig, os.path.join(out, 'sensitivity.png'))
+
 def fig_semantics_locality(run, out):
     plt = setup()
     fig, axes = plt.subplots(2, 2, figsize=(12, 8), facecolor=SURFACE)
@@ -442,7 +483,8 @@ def make_run_figures(run_dir):
     figures = {}
     for name, fn in (('convergence', fig_convergence), ('noise_levels', fig_noise_levels), ('detail', fig_detail),
                      ('semantics_locality', fig_semantics_locality), ('optimization', fig_optimization),
-                     ('attn_res', fig_attn_res), ('gated_bottleneck', fig_gated_bottleneck), ('skip_pathway', fig_skip_pathway)):
+                     ('attn_res', fig_attn_res), ('gated_bottleneck', fig_gated_bottleneck), ('skip_pathway', fig_skip_pathway),
+                     ('sensitivity', fig_sensitivity)):
         path = fn(run, out)
         if path:
             figures[name] = path

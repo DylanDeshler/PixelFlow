@@ -36,7 +36,7 @@ import torch
 from PIL import Image
 
 from data_jit import MemmapImages
-from jit_common import build_denoiser, generate_and_score, save_labeled_grid
+from jit_common import load_denoiser, generate_and_score, save_labeled_grid
 from fid import InceptionMetrics, load_ref_stats, precision_recall
 
 from plot_style import SURFACE, INK, INK_2, GRID, BLUE, ORANGE # validated categorical pair on the light surface
@@ -136,11 +136,12 @@ fid_tolerance = 0.05 # trade-off pick: highest IS among scales with FID <= (1 + 
 plot = True # save the CFG sweep plot (needs >= 2 scales)
 interval_min = 0.0
 interval_max = 1.0
-sampling_method = 'heun'
+sampling_method = 'heun' # 'heun' / 'euler' (ODE, JiT) or 'ancestral' (stochastic, DDIM's eta family; 1 call per step vs heun's 2)
+sampling_eta = 1.0 # 'ancestral' only: fresh-noise level per step, 1 = DDPM's ancestral sampler, 0 = deterministic (= euler)
 num_sampling_steps = 50
 time_schedule = 'uniform' # 'uniform' (JiT), 'shift' (FLUX/SD3-style, uses the checkpoint's P_mean), 'train_quantile'
 gen_batch_size = 256 # samples per network call (even: halved into conditional + unconditional under CFG)
-ema = 1 # which EMA to sample with (JiT uses the first, decay 0.9999)
+ema = 1 # which weights to sample with: 1 or 2 = that EMA (JiT uses the first, decay 0.9999), 0 = the raw (non-EMA) weights
 seed = 0
 save_samples = '' # '', 'png' or 'npz'
 device = 'cuda'
@@ -153,6 +154,7 @@ config = {k: globals()[k] for k in config_keys}
 # -----------------------------------------------------------------------------
 
 assert ckpt and data_dir, 'pass --ckpt and --data_dir'
+assert sampling_method in ('heun', 'euler', 'ancestral'), f'unknown sampling_method {sampling_method}'
 assert gen_batch_size % 2 == 0, f'gen_batch_size is the network batch, half conditional and half unconditional under CFG: must be even, got {gen_batch_size}'
 if os.path.isdir(ckpt): # a run directory: its latest checkpoint
     ckpt = os.path.join(ckpt, 'ckpt.pt')
@@ -170,23 +172,12 @@ device_type = 'cuda' if 'cuda' in device else 'cpu'
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16}[dtype]
 ctx = nullcontext() if (device_type == 'cpu' or dtype == 'float32') else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-checkpoint = torch.load(ckpt, map_location='cpu', weights_only=False)
-if 'denoiser_args' in checkpoint:
-    denoiser_args = dict(checkpoint['denoiser_args'])
-else:
-    # released JiT checkpoint: rebuild from its argparse namespace
-    a = checkpoint['args']
-    denoiser_args = dict(model=a.model, img_size=a.img_size, num_classes=a.class_num, P_mean=a.P_mean, P_std=a.P_std,
-                         t_eps=a.t_eps, noise_scale=a.noise_scale)
-denoiser = build_denoiser(**denoiser_args).to(device)
-denoiser.load_state_dict(checkpoint[f'model_ema{ema}'])
-denoiser.eval() # inference only (also keeps the compiled graph from being rebuilt for a train-mode call)
+denoiser, meta = load_denoiser(ckpt, ema, device) # eval mode: inference only (also keeps the compiled graph from being rebuilt for a train-mode call)
 if compile:
     # every sampling call has the same batch (fixed_shape below), so one static graph serves the whole evaluation
     denoiser.net.compile()
 denoiser.time_schedule = time_schedule
-print(f"loaded EMA{ema} weights of {denoiser_args['model']} from {ckpt}")
-checkpoint = None
+print(f"loaded {f'EMA{ema}' if ema else 'raw'} weights of {meta['denoiser_args']['model']} from {ckpt}")
 
 data = MemmapImages(data_dir)
 assert data.num_classes == denoiser.num_classes and data.img_size == denoiser.img_size, 'checkpoint and dataset disagree'
@@ -215,12 +206,14 @@ def parse_cfgs(spec):
     return [float(c) for c in spec.split(',')]
 
 cfg_list = parse_cfgs(cfgs)
+sampler = f"{sampling_method}{num_sampling_steps}" + (f'_eta{sampling_eta:g}' if sampling_method == 'ancestral' else '') # for file names
 sweeping = len(cfg_list) > 1
 sweep_n = sweep_num_images if sweeping and 0 < sweep_num_images < final_num_images else final_num_images
 rescore = sweeping and sweep_n < final_num_images
 real_feats = real_features(sweep_n)
 
 results = {'ckpt': ckpt, 'final_num_images': final_num_images, 'sweep_num_images': sweep_n, 'steps': num_sampling_steps, 'method': sampling_method, 'time_schedule': time_schedule,
+           **({'eta': sampling_eta} if sampling_method == 'ancestral' else {}), 'ema': ema,
            'interval': [interval_min, interval_max], 'fid': {}, 'is': {}, 'precision': {}, 'recall': {}}
 class SampleWriter:
     """
@@ -263,12 +256,12 @@ def evaluate_cfg(cfg, n, real, save=True):
     writer = None
     if save and save_samples:
         assert save_samples in ('png', 'npz'), "save_samples must be '', 'png' or 'npz'"
-        name = f"samples_{n / 1000:g}k_{sampling_method}{num_sampling_steps}{'' if time_schedule == 'uniform' else '_' + time_schedule}_cfg{cfg}_interval{interval_min}-{interval_max}"
+        name = f"samples_{n / 1000:g}k_{sampler}{'' if time_schedule == 'uniform' else '_' + time_schedule}_cfg{cfg}_interval{interval_min}-{interval_max}"
         writer = SampleWriter(os.path.join(samples_dir, name + ('.npz' if save_samples == 'npz' else '')), save_samples, n, data.img_size)
     out = generate_and_score(
         denoiser, metrics, ref_stats, n, data.num_classes, device, ctx,
         cfg=cfg, interval=(interval_min, interval_max), steps=num_sampling_steps,
-        method=sampling_method, batch_size=gen_batch_size, seed=seed, on_batch=writer, fixed_shape=True,
+        method=sampling_method, batch_size=gen_batch_size, seed=seed, on_batch=writer, fixed_shape=True, eta=sampling_eta,
     )
     if writer is not None:
         writer.close()
@@ -326,7 +319,8 @@ denoiser.fixed_shape = True
 with torch.no_grad(), ctx:
     x = denoiser.generate(torch.cat([labels, labels.new_zeros(grid_batch - 64)]))[:64]
 denoiser.fixed_shape = False
-tag = f"{final_num_images / 1000:g}k_{sampling_method}{num_sampling_steps}" + ('' if time_schedule == 'uniform' else f'_{time_schedule}')
+tag = f"{final_num_images / 1000:g}k_{sampler}" + ('' if time_schedule == 'uniform' else f'_{time_schedule}') \
+      + ('' if ema == 1 else '_raw' if ema == 0 else f'_ema{ema}')
 save_labeled_grid(x, [class_names[i] for i in labels.tolist()], os.path.join(samples_dir, f'eval_samples_{tag}.png'))
 with open(os.path.join(out_dir, f'eval_{tag}.json'), 'w') as f:
     json.dump(results, f, indent=2)
@@ -334,5 +328,6 @@ print(f"results written to {os.path.join(out_dir, f'eval_{tag}.json')}")
 if plot and len(cfg_list) >= 2:
     path = plot_cfg_sweep(results, cfg_list, os.path.join(out_dir, f'cfg_sweep_{tag}.png'),
                           f"{os.path.basename(os.path.dirname(os.path.abspath(ckpt)))}: CFG sweep, FID-{sweep_n / 1000:g}k, "
-                          f"{sampling_method} {num_sampling_steps} steps, interval [{interval_min}, {interval_max}]")
+                          f"{sampling_method}{f' (eta {sampling_eta:g})' if sampling_method == 'ancestral' else ''} {num_sampling_steps} steps, "
+                          f"interval [{interval_min}, {interval_max}]")
     print(f"plot saved to {path}")

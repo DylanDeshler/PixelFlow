@@ -391,6 +391,30 @@ can be turned on when resuming.
 Training-time FIDs use no CFG, 10k samples and a fixed seed, so the same noise and labels are used at every eval and across runs.
 They're for comparing runs with each other. Paper-comparable numbers need `eval_jit.py` with 50k samples and CFG.
 
+## Samplers
+
+`--sampling_method` (in `train_jit.py` and `eval_jit.py`):
+- `heun` (JiT's default, 50 steps) and `euler` are deterministic ODE samplers.
+- `ancestral` is stochastic: DDIM's eta family on JiT's path. With `--sampling_eta` 1 (default) it's DDPM's ancestral sampler,
+  fresh noise every step; 0 is deterministic DDIM, the same step as `euler` except above t = 1 - t_eps, where JiT's clamped
+  velocity shortens euler's step.
+
+In theory a stochastic sampler's error is bounded by the prediction's L2 error, while an ODE sampler's also depends on how
+the prediction reacts to its input (diagnostic 8). Fresh noise doesn't undo a prediction that keeps too much of its input,
+though: on a Gaussian toy, over-copying late in sampling inflates the sample std under both, slightly more under ancestral.
+Heun makes two network calls per step, so Heun-50 (99 calls) costs the same as 99 euler or ancestral steps. Compare
+samplers at matched calls. On a Gaussian toy with the exact denoiser, at 99 calls the sample std comes out 1.9% low for
+Heun-50 and for ancestral eta 0, and 3.5% low for ancestral eta 1 (few-step ancestral sampling under-disperses: 6% low at
+50 steps). Every method ends with JiT's final euler step.
+
+`--time_schedule=train_quantile` puts the steps at quantiles of the training logit-normal (the diffusion_forcing repo's
+`'logit'` grid for its Euler sampler). `--ema=0` in `eval_jit.py` samples the raw weights instead of EMA1, with results
+written under an `_raw` tag.
+```bash
+python eval_jit.py --ckpt=runs/in100_128/<model>/<run> --data_dir=/data/in100_128 --final_num_images=10000 --sampling_method=ancestral --num_sampling_steps=99 --sampling_eta=1.0
+python eval_jit.py --ckpt=runs/in100_128/<model>/<run> --data_dir=/data/in100_128 --final_num_images=10000 --sampling_method=euler --time_schedule=train_quantile
+```
+
 ## Data-efficiency diagnostics
 
 With `diag=True` (default; needs the `--split=val` data and `fid.py` run after it), every FID eval also logs to wandb
@@ -399,6 +423,7 @@ and `{out_dir}/diagnostics/diag_{iter}.json`:
 | # | what | wandb keys | reading it |
 | --- | --- | --- | --- |
 | 1 | loss per noise level on fixed train / held-out images (raw weights) | `noise_loss/*`, `noise_xmse/*`, `noise_gap/*` | slow high-noise (small t) bins: semantics bottleneck; slow low-noise bins: detail; per-bin gap: where it memorizes |
+| 1b | skip pathway runs: the per-noise-level held-out loss of the trunk-only prediction (what the trunk trains on, never sampled), same images and noise as 1 | `noise_loss_trunk/*`, `noise_xmse_trunk/*` | the sampled head's gain over its own trunk at each noise level |
 | 2 | precision / recall (k=3, Inception) | `val/precision`, `val/recall` | low recall with fine precision: coverage / data-limited |
 | 3 | raw vs EMA weights (off by default, `--diag_raw=True`: a second full FID run) | `val/*_raw` | EMA much better: noisy gradients (batch size, variance reduction, EMA horizon) |
 | 4 | grad norms, update/weight ratio per block (every `log_interval`), adaLN gates, attention entropy | `grad_norm/*`, `update_ratio/*`, `gate_*/*`, `attn_entropy/*` | blocks that barely update or are gated off; collapsed or uniform attention |
@@ -406,6 +431,8 @@ and `{out_dir}/diagnostics/diag_{iter}.json`:
 | 5 | k-NN + linear probe of mean-pooled tokens (blocks at 1/3, 2/3 and the end of the model, t=1, 0.75, 0.5, null label) | `probe/*` | whether / when semantic features emerge, and whether FID gains follow them |
 | 6 | relative error per frequency band and noise level; sample vs real spectrum | `freq_err/*`, `spectrum_log_ratio/*`, heatmaps | capacity spent on (or missing) high frequencies; vs copying the input (`z / t`) and a Wiener filter on the same images and noise (`freq_vs_copy/*`, `freq_vs_wiener/*` at the cleanest t, model-vs-copy panel in `detail.png`): above 1 at low noise = detail it was given is lost |
 | 7 | memorization: nearest-training-image distance of samples vs held-out images | `mem/nn_ratio`, `mem/near_dup_rate` | ratio < 1 or near-dup rate well above 1%: samples copy training images |
+| 8 | input sensitivity: Jacobian of the prediction w.r.t. its noisy input per noise level (Hutchinson estimate, one probe per image, `diag_sensitivity_images` held-out images, default 256), for the sampled prediction and, in skip pathway runs, the trunk-only one on the same inputs | `sensitivity/{copy,gain,tweedie}_t*`, `sensitivity_trunk/*`, `trends/sensitivity.png` | copy: 1 = passes the input through, 0 = ignores it. gain: also counts a change spreading to other pixels (texture made out of the noise). tweedie: 1 = what an MMSE denoiser with the same error would have, above 1 = follows its input more than that. The held-out loss can't see these, but a deterministic sampler's error depends on them | Band-resolved too (`copy_band` / `gain_band` / `tweedie_band` per noise level x band in the JSON): under an ODE sampler a band whose copy runs above its Tweedie-consistent level stops shedding its noise |
+| 9 | trajectory error: held-out images noised to t0 (`diag_trajectory_t0`, default 0.3,0.5,0.7,0.85) and sampled from there with the FID's sampler and EMA weights, vs the one-step error at the same z, per band; final image spectrum vs the clean image's | `trajectory/excess_from_t*_band*`, `trajectory/spectrum_from_t*_band*` | the one-step error is what the loss sees; excess > 1 is what the sampler adds by feeding the model its own outputs, which is what samples and FID see. Spectrum > 0: excess power (grain) |
 
 In the windowed ablation the in-context class tokens may only attend to each other, so they can't relay image content between
 tiles; a test confirms that perturbing one tile leaves every other tile's output exactly unchanged. The model never saw masked
@@ -414,6 +441,16 @@ rather than reading absolute values.
 
 JiT's convention is t=1 clean and t=0 pure noise. The eval runs two extra sample batches (raw weights) plus about 40k
 instrumented forward passes, so it costs roughly 2-3x a plain FID eval; `--diag_raw=False` or `--diag=False` cut that.
+
+## Diagnostics on finished checkpoints
+
+`diagnose_ckpt.py` runs the one-step loss / band error, input sensitivity (overall and per band) and trajectory passes on
+existing checkpoints, no training, on the same held-out images and noise for every run, and prints the runs side by
+side (also `{run}/diagnostics/ckpt_diag_{iter}_{weights}.json`). Skip pathway runs get the trunk-only prediction too.
+EMA1 weights by default (what's sampled); milestone `ckpt_{iter}.pt` files compare runs at matched iterations.
+```bash
+python diagnose_ckpt.py --ckpts=runs/in100_128/jit-b16_icl0/<run1>,runs/in100_128/jit-b16_icl0/<run2> --data_dir=/data/in100_128
+```
 
 ## Training-trend figures
 
@@ -432,6 +469,7 @@ python plot_trends.py runs/in100_128/jit-b16/base runs/in100_128/jit-b16/mask0.5
 | `detail.png` | per-band error at low and high noise, sample vs real spectrum: is fine detail improving or stuck (e.g. at the patch-bottleneck floor)? |
 | `semantics_locality.png` | probe accuracy per block, windowed-attention loss increase, attention distance: do representations and global context use grow? |
 | `optimization.png` | loss, gradient norm, update/weight ratio per parameter group (from `train_log.jsonl`): are some blocks barely learning? |
+| `sensitivity.png` | input sensitivity (copy, gain, Tweedie ratio) per noise level over training, and the trunk-only head's in skip pathway runs: does the prediction lean on its noisy input more than its error justifies? |
 | `compare.png` / `.csv` | the key curves and latest values across runs |
 
 `train_log.jsonl` (loss, lr, gradient norms, update ratios every `log_interval`) is written by `train_jit.py` alongside wandb.

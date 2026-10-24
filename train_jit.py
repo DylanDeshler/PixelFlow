@@ -152,7 +152,8 @@ fid_interval_max = 1.0
 sample_cfg = 3.0 # also save a sample grid (one batch, no FID) at this CFG scale; 0 disables
 sample_interval_min = 0.1 # CFG interval for that grid: guidance applied only for t in [min, max]
 sample_interval_max = 1.0
-sampling_method = 'heun'
+sampling_method = 'heun' # 'heun' / 'euler' (ODE, JiT) or 'ancestral' (stochastic, DDIM's eta family; 1 call per step vs heun's 2)
+sampling_eta = 1.0 # 'ancestral' only: fresh-noise level per step, 1 = DDPM's ancestral sampler, 0 = deterministic (= euler)
 num_sampling_steps = 50
 time_schedule = 'uniform' # sampling time grid: 'uniform' (JiT), 'shift' (FLUX/SD3-style, uses P_mean), 'train_quantile'
 gen_batch_size = 256
@@ -169,6 +170,9 @@ diag_probe_train_images = 10000
 diag_probe_val_images = 5000
 diag_spectrum_images = 2000 # generated samples for the sample-vs-real spectrum
 diag_window_tiles = '1,2,4' # windowed-attention ablation: attention confined to k x k patch tiles ('' disables; k >= grid skipped)
+diag_sensitivity_images = 256 # 8: held-out images for the input-sensitivity pass (Jacobian of the prediction w.r.t. its noisy input); 0 disables
+diag_trajectory_t0 = '0.3,0.5,0.7,0.85' # 9: held-out images noised to each t0 and sampled from there (EMA weights): error vs one-step ('' disables)
+diag_trajectory_images = 256
 progress_gif = True # after each eval, rebuild samples/progress*.gif from all saved sample grids (same seed / classes) and log to wandb
 trend_plots = True # after each eval, regenerate the plot_trends.py figures in {out_dir}/trends and log them to wandb (needs diag)
 diag_opt_stats = True # 4: grad norms and update/weight ratios per block, every log_interval
@@ -328,6 +332,7 @@ if skip_pathway:
     denoiser.net.skip_drop_prob = skip_pathway_drop_prob # training only; evaluation and sampling always use the skip
     denoiser.net.skip_stop_grad = skip_stop_grad
 assert time_schedule in ('uniform', 'shift', 'train_quantile'), f'unknown time_schedule {time_schedule}'
+assert sampling_method in ('heun', 'euler', 'ancestral'), f'unknown sampling_method {sampling_method}'
 denoiser.time_schedule = time_schedule
 summary(denoiser)
 print(describe_arch(model, arch))
@@ -517,6 +522,7 @@ if diag:
     xd, yd = val_data.get(spaced(len(val_data), diag_images))
     diag_val = (to_model_input(xd, flip=False, device=device), torch.from_numpy(yd).to(device))
     diag_ts = diag_lib.t_grid(diag_t_bins)
+    trajectory_t0s = [float(v) for v in diag_trajectory_t0.split(',') if v]
     band_masks = diag_lib.radial_band_masks(img_size, diag_freq_bands, device)
     # 5: probe sets (uint8 on CPU)
     n_blocks = len(denoiser.net.blocks)
@@ -572,7 +578,7 @@ def generate(spectrum=None):
     return generate_and_score(
         denoiser, metrics, ref_stats, fid_num_images, num_classes, device, ctx,
         cfg=fid_cfg, interval=(fid_interval_min, fid_interval_max), steps=num_sampling_steps,
-        method=sampling_method, batch_size=gen_batch_size, on_batch=spectrum,
+        method=sampling_method, batch_size=gen_batch_size, on_batch=spectrum, eta=sampling_eta,
     )
 
 @torch.no_grad()
@@ -592,6 +598,9 @@ def evaluate(step):
             denoiser.eval()
             tr = diag_lib.probe_features(denoiser.net, probe_train_x, probe_ts, probe_blocks, num_classes, ctx, device, noise_scale)
             va = diag_lib.probe_features(denoiser.net, probe_val_x, probe_ts, probe_blocks, num_classes, ctx, device, noise_scale)
+            # 9. error along the sampler's own trajectory from held-out images noised to t0 (same sampler as the FID)
+            trajectory = diag_lib.trajectory_pass(denoiser, *diag_val, trajectory_t0s, noise_scale, ctx, band_masks,
+                                                  diag_trajectory_images, chunk=gen_batch_size) if trajectory_t0s else None
             denoiser.train()
             probes = diag_lib.run_probes(tr, probe_train_y, va, probe_val_y, num_classes)
     log['val/fid'], log['val/is'] = out['fid'], out['is']
@@ -623,6 +632,16 @@ def evaluate(step):
     # 4. locality ablation on the held-out batch: same images / noise / t, attention confined to tiles
     window_passes = {k: diag_lib.noise_level_pass(denoiser.net, *diag_val, diag_ts, noise_scale, t_eps, ctx, band_masks, tile=k)
                      for k in window_tiles}
+    # skip pathway: the trunk-only prediction on the same held-out images and noise (what the trunk is trained on; never sampled)
+    has_skip = getattr(denoiser.net, 'skip_pathway', False)
+    trunk_pass = diag_lib.noise_level_pass(denoiser.net, *diag_val, diag_ts, noise_scale, t_eps, ctx, band_masks, skip_on=False) if has_skip else None
+    # 8. input sensitivity of the sampled prediction (and of the trunk-only one, for comparison on the same z)
+    sensitivity = {}
+    if diag_sensitivity_images > 0:
+        sensitivity['sampled'] = diag_lib.input_sensitivity(denoiser.net, *diag_val, diag_ts, noise_scale, ctx, diag_sensitivity_images, masks=band_masks)
+        if has_skip:
+            sensitivity['trunk'] = diag_lib.input_sensitivity(denoiser.net, *diag_val, diag_ts, noise_scale, ctx, diag_sensitivity_images,
+                                                              skip_on=False, masks=band_masks)
     denoiser.train()
     t_labels = [f'{t:.3f}' for t in diag_ts.tolist()]
     for i, tl in enumerate(t_labels):
@@ -630,6 +649,13 @@ def evaluate(step):
             log[f'noise_loss/{split}_t{tl}'] = passes[split]['v_loss'][i].item()
             log[f'noise_xmse/{split}_t{tl}'] = passes[split]['x_mse'][i].item()
         log[f'noise_gap/t{tl}'] = (passes['val']['v_loss'][i] - passes['train']['v_loss'][i]).item()
+        if trunk_pass is not None:
+            log[f'noise_loss_trunk/val_t{tl}'] = trunk_pass['v_loss'][i].item()
+            log[f'noise_xmse_trunk/val_t{tl}'] = trunk_pass['x_mse'][i].item()
+        for head, sens in sensitivity.items():
+            prefix = 'sensitivity' if head == 'sampled' else 'sensitivity_trunk'
+            for k in ('copy', 'gain', 'tweedie'):
+                log[f'{prefix}/{k}_t{tl}'] = sens[k][i].item()
     pv = passes['val']
     for b in range(pv['attn_entropy'].shape[1] if 'attn_entropy' in pv else 0): # not for PixelDiT
         log[f'attn_entropy/block{b + 1:02d}'] = pv['attn_entropy'][:, b].mean().item()
@@ -665,6 +691,11 @@ def evaluate(step):
         # (> 1 = the model loses detail it was given)
         log[f'freq_vs_copy/{bl}'] = (pv['freq_rel_err'][-1, k] / pv['freq_rel_err_copy'][-1, k]).item()
         log[f'freq_vs_wiener/{bl}'] = (pv['freq_rel_err'][-1, k] / pv['freq_rel_err_wiener'][-1, k]).item()
+    if trajectory is not None: # per t0 and band: sampled-from-t0 error / one-step error (1 = the sampler adds nothing), final spectrum
+        for i, t0 in enumerate(trajectory_t0s):
+            for k, bl in enumerate(band_labels):
+                log[f'trajectory/excess_from_t{t0:g}_{bl}'] = (trajectory['traj_err'][i, k] / trajectory['onestep_err'][i, k]).item()
+                log[f'trajectory/spectrum_from_t{t0:g}_{bl}'] = trajectory['traj_spectrum'][i, k].item()
     # 6. sample vs real spectrum, log10 ratio per band (0 = matches real images)
     spec_ratio = torch.log10(spectrum.result() / real_spectrum).cpu()
     for k, bl in enumerate(band_labels):
@@ -684,7 +715,10 @@ def evaluate(step):
             os.path.join(d, f'window_loss_increase_{step}.png'), log=False)
     record.update({'iter': step, 'scalars': log, 't': diag_ts.tolist(),
                    'passes': {split: {k: v.tolist() for k, v in p.items()} for split, p in passes.items()},
-                   'window_loss_increase': {f'tile{k}': v.tolist() for k, v in window_increase.items()}})
+                   'window_loss_increase': {f'tile{k}': v.tolist() for k, v in window_increase.items()},
+                   'trunk_pass': {k: trunk_pass[k].tolist() for k in ('v_loss', 'x_mse', 'freq_rel_err')} if trunk_pass is not None else None,
+                   'sensitivity': {head: {k: v.tolist() for k, v in sens.items()} for head, sens in sensitivity.items()},
+                   'trajectory': dict({k: v.tolist() for k, v in trajectory.items()}, t0=trajectory_t0s) if trajectory is not None else None})
     with open(os.path.join(d, f'diag_{step}.json'), 'w') as f:
         json.dump(record, f)
     log['diag_minutes'] = (time.time() - t_start) / 60
@@ -703,7 +737,7 @@ def save_samples(step):
         denoiser.eval()
         for cfg, interval, suffix in settings:
             denoiser.cfg_scale, denoiser.cfg_interval = cfg, interval
-            denoiser.steps, denoiser.method = num_sampling_steps, sampling_method
+            denoiser.steps, denoiser.method, denoiser.eta = num_sampling_steps, sampling_method, sampling_eta
             with torch.random.fork_rng(devices=[device] if device_type == 'cuda' else []):
                 torch.manual_seed(0)
                 with ctx:

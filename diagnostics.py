@@ -10,6 +10,8 @@ Training diagnostics for JiT, aimed at finding where data efficiency is lost.
     5. representation probes                            k-NN + linear probe on intermediate tokens, at several noise levels
     6. error by frequency band                          prediction error spectrum per noise level, sample vs real spectra
     7. memorization                                     nearest-training-image distances of samples vs held-out images
+    8. input sensitivity                                Jacobian of the prediction w.r.t. its noisy input per noise level
+                                                        (how much it copies / amplifies the input), sampled vs trunk-only head
 
 Items 1, 4 (gates / attention) and 6 share one instrumented forward pass over a fixed batch.
 JiT's convention: t=1 is the clean image, t=0 pure noise.
@@ -102,10 +104,9 @@ def _block(block, x, c, rope, n_prefix, g, mask=None, res=None, index=None):
     stats['gate_msa'], stats['gate_mlp'] = gate_msa.abs().mean(), gate_mlp.abs().mean()
     return x, stats
 
-@torch.no_grad()
 def instrumented_forward(net, x, t, y, capture_blocks=(), tile=None, skip_on=True):
     """
-    Same output as net(x, t, y), plus per-block attention stats (entropy, spatial distance, mass on in-context tokens),
+    Same output as net(x, t, y) (in eval: none of training's stop-gradients, so gradients flow to x through every path), plus per-block attention stats (entropy, spatial distance, mass on in-context tokens),
     |gate| sizes, and the patch tokens (in-context class tokens removed) after the blocks in capture_blocks (1-indexed).
     tile: if set, runs the windowed-attention ablation (see tile_mask) instead of full attention.
     skip_on: False runs a skip-pathway model without its skip (the trunk-only prediction, used for skip_residual).
@@ -254,7 +255,7 @@ def t_grid(n_bins, lo=-3.0, hi=3.0):
     return torch.sigmoid(torch.linspace(lo, hi, n_bins))
 
 @torch.no_grad()
-def noise_level_pass(net, x, y, ts, noise_scale, t_eps, ctx, masks, seed=0, chunk=128, tile=None):
+def noise_level_pass(net, x, y, ts, noise_scale, t_eps, ctx, masks, seed=0, chunk=128, tile=None, skip_on=True):
     """
     For each t in ts, noises the fixed batch x with fixed noise and records:
       v_loss (the training objective), x_mse, relative prediction error per frequency band,
@@ -265,6 +266,7 @@ def noise_level_pass(net, x, y, ts, noise_scale, t_eps, ctx, masks, seed=0, chun
                 the same images, so slightly optimistic)
       attention entropy / spatial distance / in-context mass and gate sizes per block (averaged over the batch).
     tile: run the windowed-attention ablation (tile_mask) instead of full attention; same images, noise and t.
+    skip_on: False scores a skip-pathway model's trunk-only prediction (the one its trunk is trained on) instead of the sampled one.
     Returns dict of tensors with a leading len(ts) dimension.
     """
     g = torch.Generator(device=x.device).manual_seed(seed)
@@ -283,7 +285,7 @@ def noise_level_pass(net, x, y, ts, noise_scale, t_eps, ctx, masks, seed=0, chun
             tt = t.view(-1, 1, 1, 1)
             z = tt * xb + (1 - tt) * eb
             with ctx:
-                x_pred, stats, _ = instrumented_forward(net, z, t, yb, tile=tile)
+                x_pred, stats, _ = instrumented_forward(net, z, t, yb, tile=tile, skip_on=skip_on)
             x_pred = x_pred.float()
             v = (xb - z) / (1 - tt).clamp_min(t_eps)
             v_pred = (x_pred - z) / (1 - tt).clamp_min(t_eps)
@@ -303,6 +305,108 @@ def noise_level_pass(net, x, y, ts, noise_scale, t_eps, ctx, masks, seed=0, chun
         out['freq_rel_err'].append((err_power / x_power).cpu())
         out['freq_rel_err_copy'].append((copy_power / x_power).cpu())
         out['freq_rel_err_wiener'].append((wiener_power / x_power).cpu())
+    return {k: torch.stack(v) for k, v in out.items()}
+
+# -----------------------------------------------------------------------------
+# 8. input sensitivity
+
+def input_sensitivity(net, x, y, ts, noise_scale, ctx, n_images=256, seed=0, chunk=64, skip_on=True, masks=None):
+    """
+    How strongly the x prediction reacts to its noisy input z, per noise level: the Jacobian J = d x_hat / d z of each
+    image's n = 3 H W outputs w.r.t. its n inputs, from one Rademacher probe r per image through a vector-Jacobian
+    product (Hutchinson): tr J ~ r . J^T r, ||J||_F^2 ~ |J^T r|^2. In units where passing the input through (x_hat = z / t)
+    scores 1 and ignoring it scores 0:
+      copy     t tr(J) / n          how much of the input the prediction keeps, pixel for pixel
+      gain     t^2 ||J||_F^2 / n    mean squared amplification of a small random change to z, including what spreads to
+                                    other pixels (texture made out of the noise counts here, not in copy)
+      tweedie  copy / (SNR x_mse), SNR = t^2 / ((1 - t) noise_scale)^2. The MMSE denoiser has J = t Cov[x | z] / ((1 - t) noise_scale)^2
+               (Tweedie's second-order identity), so its ratio is 1 in expectation; > 1: the prediction follows its input
+               more than an optimal denoiser with the same error would (equivalently, by SURE: its output stays closer to
+               the input than that denoiser's would)
+    masks ([bands, H, W], radial_band_masks): the same three per frequency band, from the same probe: with P_b the
+    projection onto band b, copy_b = t tr(P_b J) / tr(P_b) estimated as t (P_b r) . J^T r, gain_b = t^2 |P_b J^T r|^2 / tr(P_b)
+    (the amplification of perturbations within band b), tweedie_b against the band's own x_mse. Under an ODE sampler a
+    band whose copy runs above its tweedie-consistent level stops shedding the noise still in it.
+    A sampler feeds the model its own earlier outputs, so these matter for sampling in a way the held-out loss can't show
+    (a deterministic sampler's error depends on the Jacobian's error as well as the prediction's).
+    Same images and noise as noise_level_pass (its first n_images). Runs with autograd on; parameters get no gradients.
+    skip_on: False measures a skip-pathway model's trunk-only prediction instead, on the same z and probes.
+    Returns dict of tensors: copy, gain, tweedie, x_mse [len(ts)] and, with masks, copy_band, gain_band, tweedie_band,
+    x_mse_band [len(ts), bands].
+    """
+    g = torch.Generator(device=x.device).manual_seed(seed)
+    noise = (torch.randn(x.shape, generator=g, device=x.device) * noise_scale)[:n_images] # noise_level_pass's noise
+    x, y = x[:n_images], y[:n_images]
+    g = torch.Generator(device=x.device).manual_seed(seed + 1)
+    probes = torch.randint(0, 2, x.shape, generator=g, device=x.device).float() * 2 - 1 # the same for every t
+    n, count, hw = x[0].numel(), len(x), x.shape[-2] * x.shape[-1]
+    dof = masks.sum(dim=(1, 2)) * x.shape[1] * count if masks is not None else None # tr(P_b) summed over channels and images
+    out = defaultdict(list)
+    for t_val in ts.tolist():
+        acc = defaultdict(float)
+        for i in range(0, count, chunk):
+            xb, yb, eb, rb = x[i:i + chunk], y[i:i + chunk], noise[i:i + chunk], probes[i:i + chunk]
+            t = torch.full((len(xb),), t_val, device=x.device)
+            tt = t.view(-1, 1, 1, 1)
+            z = (tt * xb + (1 - tt) * eb).requires_grad_(True)
+            with torch.enable_grad(), ctx:
+                x_pred = instrumented_forward(net, z, t, yb, skip_on=skip_on)[0]
+            (jt_r,) = torch.autograd.grad(x_pred, z, grad_outputs=rb.to(x_pred.dtype)) # J^T r, no parameter gradients
+            jt_r, err = jt_r.float(), x_pred.detach().float() - xb
+            acc['copy'] += t_val * (jt_r * rb).sum().item() / (n * count)
+            acc['gain'] += t_val ** 2 * jt_r.pow(2).sum().item() / (n * count)
+            acc['x_mse'] += err.pow(2).sum().item() / (n * count)
+            if masks is not None: # per band, via the spectra (Parseval: a . b = sum_f Re(conj(A_f) B_f) / HW)
+                R, G = torch.fft.fft2(rb), torch.fft.fft2(jt_r)
+                band = lambda p: (masks * p.sum(dim=(0, 1))).sum(dim=(1, 2)) / hw
+                acc['copy_band'] = acc['copy_band'] + t_val * band((R.conj() * G).real) / dof
+                acc['gain_band'] = acc['gain_band'] + t_val ** 2 * band(G.abs().pow(2)) / dof
+                acc['x_mse_band'] = acc['x_mse_band'] + band(torch.fft.fft2(err).abs().pow(2)) / dof
+        snr = t_val ** 2 / ((1 - t_val) * noise_scale) ** 2
+        acc['tweedie'] = acc['copy'] / max(snr * acc['x_mse'], 1e-12)
+        if masks is not None:
+            acc['tweedie_band'] = acc['copy_band'] / (snr * acc['x_mse_band']).clamp_min(1e-12)
+        for k, val in acc.items():
+            out[k].append(torch.as_tensor(val, dtype=torch.float32).cpu())
+    return {k: torch.stack(v) for k, v in out.items()}
+
+@torch.no_grad()
+def trajectory_pass(denoiser, x, y, t0s, noise_scale, ctx, masks, n_images=256, seed=0, chunk=256):
+    """
+    Error along the sampler's own trajectory, on held-out images: each image noised to t0 (noise_level_pass's noise) and
+    the rest of the sampling run from there (denoiser.sample_from: its method and time grid, no CFG), compared with the
+    clean image per frequency band, next to the one-step prediction's error at the same z. The one-step error is what
+    the loss measures; the gap to the trajectory error is what the sampler adds by feeding the model its own outputs, which
+    is what samples and FID see. Per t0, [bands] each:
+      onestep_err    relative error per band of x_hat(z_t0)
+      traj_err       relative error per band of the sampler's final image
+      traj_spectrum  log10 power per band of the final image / the clean image's (> 0: excess power, e.g. grain)
+    Returns dict of [len(t0s), bands] tensors.
+    """
+    g = torch.Generator(device=x.device).manual_seed(seed)
+    noise = (torch.randn(x.shape, generator=g, device=x.device) * noise_scale)[:n_images]
+    x, y = x[:n_images], y[:n_images]
+    saved = denoiser.cfg_scale, denoiser.fixed_shape
+    denoiser.cfg_scale, denoiser.fixed_shape = 1.0, False
+    out = defaultdict(list)
+    try:
+        for t0 in t0s:
+            x_power, onestep_power, traj_power, final_power = 0, 0, 0, 0
+            for i in range(0, len(x), chunk):
+                xb, yb, eb = x[i:i + chunk], y[i:i + chunk], noise[i:i + chunk]
+                z = t0 * xb + (1 - t0) * eb
+                with ctx:
+                    x_hat = denoiser.net(z, torch.full((len(xb),), t0, device=x.device), yb).float()
+                    final = denoiser.sample_from(z, t0, yb).float()
+                x_power = x_power + band_power(xb, masks)
+                onestep_power = onestep_power + band_power(x_hat - xb, masks)
+                traj_power = traj_power + band_power(final - xb, masks)
+                final_power = final_power + band_power(final, masks)
+            out['onestep_err'].append((onestep_power / x_power).cpu())
+            out['traj_err'].append((traj_power / x_power).cpu())
+            out['traj_spectrum'].append(torch.log10(final_power / x_power).cpu())
+    finally:
+        denoiser.cfg_scale, denoiser.fixed_shape = saved
     return {k: torch.stack(v) for k, v in out.items()}
 
 # -----------------------------------------------------------------------------

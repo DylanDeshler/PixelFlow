@@ -149,22 +149,58 @@ class FastDenoiser(Denoiser):
         t[0], t[-1] = 0.0, 1.0
         return t.float()
 
+    eta = 1.0 # method='ancestral': 1 = DDPM's ancestral sampler, 0 = deterministic (see _ancestral_step)
+
+    @torch.no_grad()
+    def _ancestral_step(self, z, t, t_next, labels):
+        """
+        Stochastic step: DDIM's eta family (Song et al. 2021) on JiT's path z = t x + s e, s = (1 - t) noise_scale.
+        From the (guided) clean estimate x_hat and the noise it implies, e_hat = (z - t x_hat) / s:
+            z_next = t_next x_hat + sqrt(s_next^2 - c^2) e_hat + c * fresh noise,  c = eta * s_next * s_{t|t_next} / s
+        with s_{t|t_next}^2 = s^2 - (t / t_next)^2 s_next^2 the noise the forward process adds from t_next to t, so c is eta
+        times the std of z_next given z and x_hat. eta = 1 is DDPM's ancestral sampler (the reverse SDE in the many-step
+        limit); eta = 0 is deterministic DDIM, the same step as euler except above t = 1 - t_eps, where JiT's clamped
+        velocity shortens euler's step. In theory its sample error is bounded by the prediction's L2 error, which an ODE's
+        isn't (Song et al. 2021), but it doesn't undo a prediction that keeps too much of its input: that keeps the fresh
+        noise too (diagnostics.input_sensitivity's Tweedie ratio measures it).
+        """
+        v = self._forward_sample(z, t, labels)
+        x_hat = z + (1.0 - t).clamp_min(self.t_eps) * v # inverts the clamp: the network's (CFG-combined) x prediction
+        s, s_next = (1.0 - t) * self.noise_scale, (1.0 - t_next) * self.noise_scale
+        e_hat = (z - t * x_hat) / s
+        s_fwd = (s ** 2 - (t / t_next) ** 2 * s_next ** 2).clamp_min(0).sqrt()
+        c = (self.eta * s_next * s_fwd / s).clamp(max=s_next)
+        return t_next * x_hat + (s_next ** 2 - c ** 2).clamp_min(0).sqrt() * e_hat + c * torch.randn_like(z)
+
     @torch.no_grad()
     def generate(self, labels):
-        # JiT's Denoiser.generate with a configurable time grid (identical to JiT's for time_schedule='uniform')
-        device = labels.device
-        bsz = labels.size(0)
-        z = self.noise_scale * torch.randn(bsz, 3, self.img_size, self.img_size, device=device)
-        timesteps = self.sampling_timesteps(device).view(-1, *([1] * z.ndim)).expand(-1, bsz, -1, -1, -1)
+        # JiT's Denoiser.generate with a configurable time grid (identical to JiT's for time_schedule='uniform') and an
+        # optional stochastic sampler
+        z = self.noise_scale * torch.randn(labels.size(0), 3, self.img_size, self.img_size, device=labels.device)
+        return self._integrate(z, self.sampling_timesteps(labels.device), labels)
+
+    @torch.no_grad()
+    def sample_from(self, z, t0, labels):
+        """
+        Finish sampling from z at time t0 (e.g. a held-out image noised to t0): the sampling grid's times after t0, with
+        the same method, so the steps are the ones generate takes from there.
+        """
+        ts = self.sampling_timesteps(z.device)
+        return self._integrate(z, torch.cat([ts.new_tensor([t0]), ts[ts > t0 + 1e-6]]), labels)
+
+    def _integrate(self, z, ts, labels):
+        # steps along the 1-D grid ts (start time ... 1); the last step is euler for every method, as in JiT
         if self.method == "euler":
             stepper = self._euler_step
         elif self.method == "heun":
             stepper = self._heun_step
+        elif self.method == "ancestral":
+            stepper = self._ancestral_step
         else:
-            raise NotImplementedError
-        for i in range(self.steps - 1):
+            raise NotImplementedError(f"unknown sampling method {self.method}: 'euler', 'heun' or 'ancestral'")
+        timesteps = ts.view(-1, *([1] * z.ndim)).expand(-1, z.size(0), -1, -1, -1)
+        for i in range(len(ts) - 2):
             z = stepper(z, timesteps[i], timesteps[i + 1], labels)
-        # last step euler
         return self._euler_step(z, timesteps[-2], timesteps[-1], labels)
 
     ema_warmup = False
@@ -200,6 +236,26 @@ def build_denoiser(model, img_size, num_classes, attn_dropout=0.0, proj_dropout=
     )
     return FastDenoiser(args)
 
+def load_denoiser(ckpt, ema=1, device='cpu'):
+    """
+    Denoiser from a train_jit.py checkpoint (ckpt.pt or a milestone ckpt_{iter}.pt) or a released JiT .pth, with the
+    weights ema selects: 1 or 2 = that EMA, 0 = the raw weights (ckpt.pt only). Returns (denoiser in eval mode, checkpoint
+    dict without the weights).
+    """
+    assert ema in (0, 1, 2), f'ema must be 0 (raw weights), 1 or 2, got {ema}'
+    checkpoint = torch.load(ckpt, map_location='cpu', weights_only=False)
+    if 'denoiser_args' in checkpoint:
+        denoiser_args = dict(checkpoint['denoiser_args'])
+    else:
+        # released JiT checkpoint: rebuild from its argparse namespace
+        a = checkpoint['args']
+        denoiser_args = dict(model=a.model, img_size=a.img_size, num_classes=a.class_num, P_mean=a.P_mean, P_std=a.P_std,
+                             t_eps=a.t_eps, noise_scale=a.noise_scale)
+    denoiser = build_denoiser(**denoiser_args).to(device)
+    denoiser.load_state_dict(checkpoint['model' if ema == 0 else f'model_ema{ema}'])
+    meta = {k: v for k, v in checkpoint.items() if not k.startswith('model') and k not in ('optimizer', 'projector', 'masker')}
+    return denoiser.eval(), dict(meta, denoiser_args=denoiser_args)
+
 def ema_state_dicts(model):
     # same format as JiT's checkpoints: full state dicts with parameters replaced by their EMA values
     sd1, sd2 = dict(model.state_dict()), dict(model.state_dict())
@@ -229,7 +285,7 @@ def ema_weights(model, which=1):
 @torch.no_grad()
 def generate_and_score(model, metrics, ref_stats, num_images, num_classes, device, ctx,
                        cfg=1.0, interval=(0.0, 1.0), steps=50, method='heun', batch_size=256, seed=0, on_batch=None,
-                       fixed_shape=False):
+                       fixed_shape=False, eta=1.0):
     """
     Class-balanced generation (num_images / num_classes per class, as in JiT) and FID/IS against ref_stats.
     A fixed seed gives every evaluation the same noise and labels, so FID differences between runs
@@ -243,7 +299,7 @@ def generate_and_score(model, metrics, ref_stats, num_images, num_classes, devic
     assert num_images % num_classes == 0, 'number of images per class must be the same'
     was_training = model.training
     model.eval()
-    model.cfg_scale, model.cfg_interval, model.steps, model.method = cfg, interval, steps, method
+    model.cfg_scale, model.cfg_interval, model.steps, model.method, model.eta = cfg, interval, steps, method, eta
     labels_all = np.arange(num_classes).repeat(num_images // num_classes)
     if fixed_shape and cfg != 1.0: # batched CFG doubles every network call
         assert batch_size % 2 == 0, f'batch_size must be even with fixed_shape, got {batch_size}'
@@ -299,7 +355,7 @@ _NAME_EXCLUDE = {
     'epochs', 'batch_size', 'gradient_accumulation_steps', 'eval_every_epochs', 'save_every_epochs', 'keep_ckpt_every_epochs', 'log_interval',
     'eval_only', 'init_from', 'wandb_log', 'wandb_project', 'wandb_run_name', 'fid_num_images', 'fid_cfg',
     'fid_interval_min', 'fid_interval_max', 'sample_cfg', 'sample_interval_min', 'sample_interval_max',
-    'sampling_method', 'num_sampling_steps', 'time_schedule', 'gen_batch_size', 'eval_loss_images',
+    'sampling_method', 'sampling_eta', 'num_sampling_steps', 'time_schedule', 'gen_batch_size', 'eval_loss_images',
     'device', 'dtype', 'compile', 'trend_plots', 'progress_gif',
 }
 _ARCH_SHORT = {'depth': 'd', 'hidden_size': 'w', 'num_heads': 'h', 'patch_size': 'p', 'bottleneck_dim': 'bn',
