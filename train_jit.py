@@ -30,7 +30,7 @@ from torchinfo import summary
 import numpy as np
 import torch
 
-from data_jit import MemmapImages, EpochSampler, to_model_input
+from data_jit import MemmapImages, EpochSampler, Prefetcher, to_model_input
 from jit_common import build_denoiser, resolve_arch, describe_arch, run_dir, legacy_run_dir, ema_state_dicts, ema_weights, generate_and_score, save_labeled_grid
 from fid import InceptionMetrics, load_ref_stats, precision_recall
 from repa import FrozenEncoder, Projector, MaskedTransformerAdapter, BlockCapture, repa_loss, mta_loss
@@ -61,6 +61,9 @@ dataset = 'in100_128' # in100_128, in100_256, in1k_128, in1k_256, ... (a directo
 data_dir = '' # '' -> {data_root}/{dataset}; set it to use a dataset outside data_root
 gradient_accumulation_steps = 1
 batch_size = 1024 # micro batch; effective batch = batch_size * gradient_accumulation_steps (JiT uses 1024)
+data_workers = 16 # background reader threads filling pinned buffers ahead of training (data_jit.Prefetcher), for
+                  # datasets bigger than the page cache; 0 = read each batch on the main thread during the forward
+data_prefetch = 3 # batches read ahead
 # model: a JiT preset, optionally with any architecture field overridden (-1 keeps the preset's value)
 model = 'JiT-B/16' # JiT-B/16, JiT-B/32, JiT-L/16, JiT-L/32, JiT-H/16, JiT-H/32, or PixelDiT-B/16, -L/16, -XL/16 (model_pixeldit.py)
 depth = -1
@@ -303,8 +306,11 @@ print(f"{data_dir}: {len(data):,} images, {num_classes} classes, {img_size}px | 
       f"{iters_per_epoch:,} iters/epoch, {max_iters:,} total iters, lr {lr:.2e}, noise scale {noise_scale}")
 
 def get_batch():
+    if prefetcher is not None:
+        return prefetcher.next()
     x, y = data.get(sampler.next())
     return to_model_input(x, flip=True, device=device), torch.from_numpy(y).to(device, non_blocking=True)
+prefetcher = None # started just before training (after a resume has set the sampler's epoch)
 
 # model
 assert img_size % arch['patch_size'] == 0, f"img_size {img_size} not divisible by patch_size {arch['patch_size']}"
@@ -786,8 +792,11 @@ save_iters = max(1, save_every_epochs * iters_per_epoch)
 keep_iters = keep_ckpt_every_epochs * iters_per_epoch
 
 # training loop
+if data_workers > 0:
+    prefetcher = Prefetcher(data, sampler, device, flip=True, workers=data_workers, depth=data_prefetch)
 X, Y = get_batch() # fetch the very first batch
 t0 = time.time()
+data_seconds = 0.0 # per step: host time spent in get_batch (reset every iteration)
 local_iter_num = 0 # number of iterations in the lifetime of this process
 while True:
 
@@ -841,6 +850,7 @@ while True:
         break
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
+    data_seconds = 0.0
     for micro_step in range(gradient_accumulation_steps):
         with ctx:
             loss_parts = {}
@@ -862,7 +872,9 @@ while True:
                 loss = loss + repa_coeff * loss_repa
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately fetch the next batch while the GPU works on the forward pass
+        t_data = time.time()
         X, Y = get_batch()
+        data_seconds += time.time() - t_data # host time reading the next batch (the GPU only overlaps it with the forward)
         loss.backward()
     # 4. optimization health: grad norms and update/weight ratios per block (only on logging iterations)
     log_opt = diag_opt_stats and iter_num % log_interval == 0
@@ -898,7 +910,8 @@ while True:
         repa_str = f", repa {loss_repa.item():.4f}" if encoder is not None else ""
         grad_str = f", grad norm {math.sqrt(sum(v ** 2 for v in grad_norms.values())):.4f}" if log_opt else ""
         trunk_str = f", trunk-only loss {loss_trunkf:.4f}" if loss_trunkf is not None else ""
-        print(f"iter {iter_num} (epoch {iter_num / iters_per_epoch:.2f}): loss {lossf:.4f}{trunk_str}{repa_str}{grad_str}, time {dt*1000:.2f}ms, {imgs_per_sec:.0f} img/s")
+        print(f"iter {iter_num} (epoch {iter_num / iters_per_epoch:.2f}): loss {lossf:.4f}{trunk_str}{repa_str}{grad_str}, time {dt*1000:.2f}ms "
+              f"(data {data_seconds*1000:.0f}ms), {imgs_per_sec:.0f} img/s")
         if wandb_log:
             log = {
                 "iter": iter_num,
@@ -908,6 +921,7 @@ while True:
                 **({"train/loss_trunk": loss_trunkf} if loss_trunkf is not None else {}),
                 "lr": lr_now,
                 "imgs_per_sec": imgs_per_sec,
+                "data_ms": data_seconds * 1000,
             }
             if optimizer_type == 'muon':
                 log["lr_muon"] = peak_muon_lr * lr_now / lr
@@ -921,7 +935,7 @@ while True:
             wandb.log(log, step=iter_num)
         # same stats to a local file, for plot_trends.py (independent of wandb)
         record = {'iter': iter_num, 'epoch': iter_num / iters_per_epoch, 'images': iter_num * effective_batch_size,
-                  'loss': lossf, 'lr': lr_now, 'imgs_per_sec': imgs_per_sec}
+                  'loss': lossf, 'lr': lr_now, 'imgs_per_sec': imgs_per_sec, 'data_ms': data_seconds * 1000}
         if loss_trunkf is not None:
             record['loss_trunk'] = loss_trunkf
         if encoder is not None:

@@ -14,6 +14,9 @@ Layout of a prepared dataset dir:
 
 import os
 import json
+import queue
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
@@ -67,6 +70,80 @@ class EpochSampler:
         idx = self.perm[self.pos:self.pos + self.batch_size]
         self.pos += self.batch_size
         return idx
+
+class Prefetcher:
+    """
+    Background batch reader for a MemmapImages training set, for datasets larger than the page cache. A thread draws the
+    next batches from the sampler (depth ahead) and fills reusable pinned buffers through a pool of reader threads with
+    os.preadv, one read per run of consecutive rows: file reads release the GIL, so reading overlaps the whole training
+    step (not just the forward), and many reads in flight reach the disk's throughput instead of paying its latency
+    once per image. The kernel is told the access is random, so it doesn't read ahead (wasted bandwidth on random rows).
+    next() returns what to_model_input(*data.get(sampler.next())) would: images [B, 3, R, R] in [-1, 1] on device
+    (with random flips) and labels, rows in sorted index order as MemmapImages.get returns them.
+    """
+    def __init__(self, data, sampler, device, flip=True, workers=16, depth=3):
+        self.data, self.sampler, self.device, self.flip, self.workers = data, sampler, device, flip, workers
+        self.cuda = 'cuda' in str(device)
+        self.row = data.img_size * data.img_size * 3
+        self.fd = os.open(data.images.filename, os.O_RDONLY)
+        if hasattr(os, 'posix_fadvise'):
+            os.posix_fadvise(self.fd, 0, 0, os.POSIX_FADV_RANDOM)
+        shape = (sampler.batch_size, data.img_size, data.img_size, 3)
+        self.buffers = [torch.empty(shape, dtype=torch.uint8, pin_memory=self.cuda) for _ in range(depth + 1)]
+        self.copied = [None] * len(self.buffers) # CUDA event after each buffer's last host-to-device copy
+        self.free, self.ready = queue.Queue(), queue.Queue()
+        for k in range(len(self.buffers)):
+            self.free.put(k)
+        self.pool = ThreadPoolExecutor(workers)
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _read_rows(self, out, idx):
+        # rows idx (sorted) of the file into out (contiguous uint8 rows), one preadv per run of consecutive rows
+        i = 0
+        while i < len(idx):
+            j = i + 1
+            while j < len(idx) and idx[j] == idx[j - 1] + 1:
+                j += 1
+            view, offset = memoryview(out[i:j].reshape(-1)), int(idx[i]) * self.row
+            done = 0
+            while done < len(view):
+                n = os.preadv(self.fd, [view[done:]], offset + done)
+                if n <= 0:
+                    raise IOError(f'short read at byte {offset + done} of {self.data.images.filename}')
+                done += n
+            i = j
+
+    def _run(self):
+        try:
+            while True:
+                k = self.free.get()
+                if self.copied[k] is not None:
+                    self.copied[k].synchronize() # the GPU has finished copying this buffer's previous batch
+                idx = np.sort(self.sampler.next())
+                out = self.buffers[k].numpy()
+                parts = np.array_split(np.arange(len(idx)), min(self.workers, len(idx)))
+                for f in [self.pool.submit(self._read_rows, out[p[0]:p[-1] + 1], idx[p[0]:p[-1] + 1]) for p in parts if len(p)]:
+                    f.result()
+                self.ready.put((k, self.data.labels[idx]))
+        except BaseException as e: # surfaced by next()
+            self.ready.put((None, e))
+
+    def next(self):
+        k, labels = self.ready.get()
+        if k is None:
+            raise RuntimeError('background data loading failed') from labels
+        if self.cuda:
+            x = self.buffers[k].to(self.device, non_blocking=True)
+            self.copied[k] = torch.cuda.Event()
+            self.copied[k].record()
+        else:
+            x = self.buffers[k].clone()
+        self.free.put(k)
+        x = x.permute(0, 3, 1, 2)
+        if self.flip:
+            mask = torch.rand(x.shape[0], device=self.device) < 0.5
+            x = torch.where(mask.view(-1, 1, 1, 1), x.flip(-1), x)
+        return x.float().div_(255).mul_(2).sub_(1), torch.from_numpy(labels).to(self.device, non_blocking=True)
 
 def to_model_input(x_uint8, flip, device):
     """
