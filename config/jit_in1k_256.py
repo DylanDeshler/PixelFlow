@@ -2,7 +2,11 @@
 # Paper: FID 4.37 at 200 epochs / 3.66 at 600 epochs (50k samples, with CFG, see eval_jit.py).
 dataset = 'in1k_256'
 batch_size = 256
-gradient_accumulation_steps = 4
-epochs = 200
-eval_every_epochs = 40
+gen_batch_size = batch_size * 2
+gradient_accumulation_steps = 1
+epochs = 400
+eval_every_epochs = 10
 fid_num_images = 10000
+in_context_len = 0
+fid_num_images = 10000
+model = 'JiT-L/16'

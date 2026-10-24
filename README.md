@@ -293,6 +293,11 @@ as exactly vanilla JiT.
 - `--patch_overlap=o`: each patch also sees o pixels of its neighbours. The patch embedding's first conv becomes
   (16 + 2o)^2 with stride 16. The final layer predicts (16 + 2o)^2 patches, blended by overlap-add (averaged where
   they overlap). About +0.9M params for o = 4.
+- `--head_overlap=o`: the output side of `--patch_overlap` alone, with the patch embedding unchanged. Each token's
+  final layer predicts a (16 + 2o)^2 patch and neighbouring predictions are overlap-added (averaged), i.e. a transposed
+  conv with kernel 16 + 2o and stride 16 in place of the per-patch projection, so seams are blended by construction.
+  It applies to every final layer: with `--skip_final_layer` both the sampled head and the trunk-only head overlap, so
+  the trunk's training signal changes too.
 
 `--dcae_norm=group` replaces each branch's per-pixel channel norm with GroupNorm (gcd(32, C) groups: 1 for the
 3-channel stem branch, 16 for the 48-channel branches, 32 for the token-level head branch), as DC-AE uses. The
@@ -446,7 +451,7 @@ instrumented forward passes, so it costs roughly 2-3x a plain FID eval; `--diag_
 
 `diagnose_ckpt.py` runs the one-step loss / band error, input sensitivity (overall and per band) and trajectory passes on
 existing checkpoints, no training, on the same held-out images and noise for every run, and prints the runs side by
-side (also `{run}/diagnostics/ckpt_diag_{iter}_{weights}.json`). Skip pathway runs get the trunk-only prediction too.
+side (also `{run}/diagnostics/ckpt_diag_{iter}_{weights}_{sampler}.json`). Skip pathway runs get the trunk-only prediction too.
 EMA1 weights by default (what's sampled); milestone `ckpt_{iter}.pt` files compare runs at matched iterations.
 ```bash
 python diagnose_ckpt.py --ckpts=runs/in100_128/jit-b16_icl0/<run1>,runs/in100_128/jit-b16_icl0/<run2> --data_dir=/data/in100_128

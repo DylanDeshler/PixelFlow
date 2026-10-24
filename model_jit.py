@@ -2,7 +2,7 @@
 # Local changes: attn_bias is created on query.device instead of via .cuda(), so the model runs on any device;
 # optional Attention Residuals (attn_res, see AttnResState), adaLN-single (adaln_single), a gated bottleneck
 # (gated_bottleneck, see GatedBottleneckPatchEmbed), a skip pathway (skip_pathway, see SkipEmbed), DC-AE style conv
-# stem / head (dcae_stem / dcae_head, see DCAEBranch), overlapping patches (patch_overlap) and LayerNorm in place of
+# stem / head (dcae_stem / dcae_head, see DCAEBranch), overlapping patches (patch_overlap; head_overlap for the output only) and LayerNorm in place of
 # every RMSNorm (layernorm), all off by default, in which case the model is unchanged.
 # --------------------------------------------------------
 # References:
@@ -682,6 +682,7 @@ class JiT(nn.Module):
         dcae_width=128,
         dcae_kernel2=1,
         patch_overlap=0,
+        head_overlap=0,
         layernorm=False,
         skip_final_layer=False,
         skip_residual=False,
@@ -727,6 +728,12 @@ class JiT(nn.Module):
         assert not skip_decoder_attnres or (skip_decoder != 'linear' and attn_res != 'none'), 'skip_decoder_attnres needs a skip_decoder and attn_res'
         self.skip_decoder_attnres = skip_decoder_attnres
         self.dcae_stem, self.dcae_head, self.patch_overlap = dcae_stem, dcae_head, patch_overlap
+        # head_overlap: the output side of patch_overlap alone (the patch embedding stays non-overlapping): each token's
+        # final layer predicts a (patch + 2 * head_overlap)^2 patch, blended with its neighbours' by overlap-add, i.e. a
+        # transposed conv with kernel patch + 2 * head_overlap and stride patch instead of a per-patch projection
+        assert not (patch_overlap and head_overlap), 'patch_overlap already overlaps the output; head_overlap is the output-only version'
+        self.head_overlap = head_overlap
+        self.out_overlap = patch_overlap or head_overlap
         self.layernorm = layernorm
         assert not skip_final_layer or skip_pathway, 'skip_final_layer needs skip_pathway'
         self.has_skip_final_layer = skip_final_layer
@@ -816,12 +823,12 @@ class JiT(nn.Module):
                                                         skip_decoder_modulation)
 
         # linear predict
-        # with patch_overlap the final layer predicts overlapping (patch + 2 * overlap)^2 patches, blended by overlap-add
-        self.final_layer = FinalLayer(hidden_size, patch_size + 2 * patch_overlap, self.out_channels, adaln_single=adaln_single, layernorm=layernorm)
+        # with patch_overlap / head_overlap the final layer predicts overlapping (patch + 2 * overlap)^2 patches, blended by overlap-add
+        self.final_layer = FinalLayer(hidden_size, patch_size + 2 * self.out_overlap, self.out_channels, adaln_single=adaln_single, layernorm=layernorm)
         if skip_final_layer:
             # the with-skip prediction (what evaluation and sampling use) gets its own final layer; final_layer then only
             # serves the trunk-only branch of skip_stop_grad, so nothing the skip branch trains is shared with the trunk
-            self.skip_final_layer = FinalLayer(hidden_size, patch_size + 2 * patch_overlap, self.out_channels, adaln_single=adaln_single, layernorm=layernorm)
+            self.skip_final_layer = FinalLayer(hidden_size, patch_size + 2 * self.out_overlap, self.out_channels, adaln_single=adaln_single, layernorm=layernorm)
         if dcae_head:
             self.output_head = DCAEHead(self.out_channels, patch_size, dcae_width, dcae_kernel2, hidden_size, layernorm, dcae_norm)
         if dcae_trunk_head:
@@ -1110,10 +1117,10 @@ class JiT(nn.Module):
         return self.sampled_head()
 
     def output(self, x, c, final_layer=None, head=None):
-        # final layer -> image (unpatchify, or overlap-add for patch_overlap) -> (DC-AE head)
+        # final layer -> image (unpatchify, or overlap-add for patch_overlap / head_overlap) -> (DC-AE head)
         x = (final_layer or self.final_layer)(x, c)
-        if self.patch_overlap:
-            o, p = self.patch_overlap, self.patch_size
+        if self.out_overlap:
+            o, p = self.out_overlap, self.patch_size
             k, size = p + 2 * o, self.input_size
             cols = x.transpose(1, 2).float() # [N, C * k * k, L], channel-major patches as F.fold expects
             img = F.fold(cols, size, kernel_size=k, stride=p, padding=o)

@@ -7,7 +7,8 @@ n_images of the diag_images evenly spaced val images train_jit.py's diagnostics 
                 ratio (1 = an MMSE denoiser with the same error; diagnostics.input_sensitivity), sampled and trunk-only
     trajectory  held-out images noised to t0 and sampled from there with the run's sampler: final error vs the one-step
                 error at t0, per band, and the final image's spectrum vs the clean image's (diagnostics.trajectory_pass)
-Prints side-by-side tables across the runs and writes {run}/diagnostics/ckpt_diag_{iter}_{weights}.json.
+Prints side-by-side tables across the runs and writes {run}/diagnostics/ckpt_diag_{iter}_{weights}_{sampler}.json
+(e.g. ckpt_diag_97500_ema1_heun50_train_quantile.json; the sampler only affects the trajectory part).
 
 $ python diagnose_ckpt.py --ckpts=runs/in100_128/jit-b16_icl0/<run1>,runs/in100_128/jit-b16_icl0/<run2> --data_dir=/data/in100_128
 --ckpts takes run directories (their ckpt.pt) or checkpoint files; milestone ckpt_{iter}.pt files compare runs at matched
@@ -92,7 +93,9 @@ for spec in ckpts.split(','):
     r['trajectory'] = {k: v.tolist() for k, v in tr.items()}
     out = os.path.join(os.path.dirname(os.path.abspath(path)), 'diagnostics')
     os.makedirs(out, exist_ok=True)
-    with open(os.path.join(out, f'ckpt_diag_{it}_{weights}.json'), 'w') as f:
+    sampler = f"{denoiser.method}{denoiser.steps}" + (f'_eta{sampling_eta:g}' if denoiser.method == 'ancestral' else '') \
+              + ('' if time_schedule == 'uniform' else f'_{time_schedule}')
+    with open(os.path.join(out, f'ckpt_diag_{it}_{weights}_{sampler}.json'), 'w') as f:
         json.dump(dict(r, config=config), f)
     results.append(r)
     del denoiser, net

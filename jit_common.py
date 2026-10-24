@@ -63,12 +63,12 @@ def describe_arch(model, arch):
         return f"arch: {', '.join(parts)} (preset {model}, * = overridden)"
     preset = dict(JIT_PRESETS[model], mlp_ratio=4.0, attn_res='none', attn_res_block_size=0, attn_res_adaln=False, adaln_single=False, gated_bottleneck=False,
                   skip_pathway=False, skip_head_blocks=0, skip_inject_block=0, dcae_stem=False, dcae_head=False, dcae_width=128,
-                  dcae_kernel2=1, patch_overlap=0, layernorm=False, skip_final_layer=False, skip_residual=False, dcae_trunk_head=False, gate_init='zero', dcae_norm='channel',
+                  dcae_kernel2=1, patch_overlap=0, head_overlap=0, layernorm=False, skip_final_layer=False, skip_residual=False, dcae_trunk_head=False, gate_init='zero', dcae_norm='channel',
                   skip_decoder='linear', skip_decoder_dim=0, skip_decoder_blocks=2, skip_decoder_rank=0, skip_decoder_conv=False, skip_decoder_attnres=False,
                   skip_decoder_modulation=True)
     full = dict(preset, **arch)
     parts = []
-    for k in ('depth', 'hidden_size', 'num_heads', 'patch_size', 'layernorm', 'bottleneck_dim', 'gated_bottleneck', 'patch_overlap', 'dcae_stem', 'dcae_head', 'dcae_trunk_head', 'dcae_norm', 'dcae_width', 'dcae_kernel2',
+    for k in ('depth', 'hidden_size', 'num_heads', 'patch_size', 'layernorm', 'bottleneck_dim', 'gated_bottleneck', 'patch_overlap', 'head_overlap', 'dcae_stem', 'dcae_head', 'dcae_trunk_head', 'dcae_norm', 'dcae_width', 'dcae_kernel2',
               'skip_pathway', 'skip_decoder', 'skip_decoder_dim', 'skip_decoder_blocks', 'skip_decoder_rank', 'skip_decoder_conv', 'skip_decoder_attnres',
               'skip_decoder_modulation', 'skip_head_blocks', 'skip_inject_block', 'skip_final_layer', 'skip_residual', 'mlp_ratio', 'in_context_len', 'in_context_start',
               'attn_res', 'attn_res_block_size', 'attn_res_adaln', 'adaln_single', 'gate_init'):
@@ -375,7 +375,7 @@ _NAME_TOKENS = {
     'skip_pathway': 'skip', 'skip_head_blocks': 'skiphead', 'skip_inject_block': 'skipat', 'skip_pathway_drop_prob': 'skipdrop', 'skip_stop_grad': 'skipsg', 'skip_final_layer': 'skipfl', 'skip_residual': 'skipres',
     'dcae_stem': 'dcaestem', 'dcae_head': 'dcaehead', 'dcae_trunk_head': 'dcaetrunkhead', 'gate_init': 'gateinit-', 'dcae_norm': 'dcaenorm-', 'pixeldit_prediction': 'pred-',
     'skip_decoder': 'skipdec-', 'skip_decoder_dim': 'skipdecdim', 'skip_decoder_blocks': 'skipdecblocks', 'skip_decoder_rank': 'skipdecrank',
-    'skip_decoder_conv': 'skipdecconv', 'skip_decoder_attnres': 'skipdecattnres', 'skip_decoder_modulation': 'skipdecmod', 'dcae_width': 'dcaew', 'dcae_kernel2': 'dcaek', 'patch_overlap': 'overlap', 'layernorm': 'layernorm',
+    'skip_decoder_conv': 'skipdecconv', 'skip_decoder_attnres': 'skipdecattnres', 'skip_decoder_modulation': 'skipdecmod', 'dcae_width': 'dcaew', 'dcae_kernel2': 'dcaek', 'patch_overlap': 'overlap', 'head_overlap': 'headoverlap', 'layernorm': 'layernorm',
     'repa_encoder': 'repa-', 'repa_adapter': 'adapter-', 'repa_depth': 'repadepth', 'repa_coeff': 'repacoeff', 'repa_proj_dim': 'repaproj',
     'repa_mask_ratio': 'repamask', 'repa_adapter_depth': 'adapterdepth',
     'mask_ratio': 'mask', 'mask_prob': 'maskprob', 'mask_weighting': 'maskweight-',

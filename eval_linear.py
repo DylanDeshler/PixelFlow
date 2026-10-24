@@ -15,7 +15,8 @@ $ python eval_linear.py --ckpt=mae_vitb16          # official MAE weights (any n
 JiT checkpoints (train_jit.py ckpt.pt) work too, as the accurate counterpart of train_jit's quick mid-training probes.
 Features are the mean-pooled patch tokens after each of jit_blocks, on the input noised to jit_t, with the null label
 (as in diagnostics.probe_features); the head bank sweeps lr x {each block, all blocks concatenated}, and k-NN runs per
-block. Data is the prepared memmap dataset the model trained on (data_dir/ and data_dir/val/, found from the run's
+block. JiT heads put a BatchNorm without affine in front of the linear layer (MAE's linear-probe protocol,
+--jit_feature_norm): unlike DINOv2's LayerNorm'd outputs, JiT's intermediate states are unnormalized. Data is the prepared memmap dataset the model trained on (data_dir/ and data_dir/val/, found from the run's
 config.json by default) at the model's resolution; the linear heads train with random flips only, since the memmaps
 are pre-cropped (JiT's own augmentation).
 $ python eval_linear.py --ckpt=runs/in100_128/jit-b16_icl0/muon/ckpt.pt --jit_t=0.75
@@ -66,6 +67,13 @@ learning_rates = '1e-5,2e-5,5e-5,1e-4,2e-4,5e-4,1e-3,2e-3,5e-3,1e-2,2e-2,5e-2,1e
 jit_t = 1.0 # noise level of the input (t=1 is clean); the mid-training probe heatmap shows which t is best
 jit_blocks = '' # comma separated, 1-indexed; '' -> a third, two thirds and the last block (train_jit's probe blocks)
 jit_ema = 1 # 1 or 2: which EMA weights, 0: raw weights
+jit_depth_attn = True # also probe a learned mixture of every block's tokens: per token, a softmax over depth of a learned
+                      # query against each block's RMS-normalized state (AttnRes's form; zero-init = uniform over depth)
+jit_pools = 'mean,attn' # token pooling of the JiT heads, comma list: mean, attn (a learned query per attention head over
+                        # the tokens, no projections; zero-init = mean pooling)
+jit_feature_norm = True # BatchNorm without affine on the pooled features before each linear head (MAE's linear-probe
+                        # protocol): JiT's intermediate states have no final norm (DINOv2's protocol assumes LayerNorm'd
+                        # features), and plain SGD on their raw scale barely trains
 # system
 device = 'cuda'
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
@@ -111,16 +119,18 @@ class JiTBackbone(nn.Module):
     Adapts a JiT denoiser to the encoder interface: get_intermediate_layers returns the patch tokens after each probe
     block (in-context class tokens dropped) and forward their mean-pooled concatenation. Inputs are images in [-1, 1].
     """
-    def __init__(self, net, blocks, t, noise_scale):
+    def __init__(self, net, blocks, t, noise_scale, capture=None):
         super().__init__()
         self.net = net
-        self.blocks = blocks
+        self.blocks = blocks # the probe blocks (k-NN, per-block heads)
+        self.capture = capture or blocks # blocks whose tokens get_intermediate_layers returns (all of them for depth attention)
+        self.probe_index = [self.capture.index(b) for b in blocks]
         self.t = t
         self.noise_scale = noise_scale
         self.embed_dim = net.hidden_size
         self.num_prefix_tokens = 0
         self.captured = {}
-        for b in blocks:
+        for b in self.capture:
             n_strip = net.in_context_len if (net.in_context_len > 0 and b - 1 >= net.in_context_start) else 0
             net.blocks[b - 1].register_forward_hook(lambda m, i, o, b=b, n=n_strip: self.captured.__setitem__(b, o[:, n:]))
 
@@ -129,12 +139,13 @@ class JiTBackbone(nn.Module):
         z = self.t * x + (1 - self.t) * self.noise_scale * torch.randn_like(x)
         y = torch.full((x.shape[0],), self.net.num_classes, device=x.device, dtype=torch.long) # null label
         self.net(z, t, y)
-        tokens = [self.captured[b] for b in self.blocks]
+        tokens = [self.captured[b] for b in self.capture]
         self.captured.clear()
         return tokens
 
     def forward(self, x):
-        return torch.cat([tokens.mean(1) for tokens in self.get_intermediate_layers(x)], dim=-1)
+        tokens = self.get_intermediate_layers(x)
+        return torch.cat([tokens[i].mean(1) for i in self.probe_index], dim=-1)
 
 class MemmapLoader:
     """
@@ -163,7 +174,7 @@ def load_jit(ckpt, checkpoint):
     assert all(1 <= b <= n for b in blocks), f'jit_blocks {blocks} outside 1..{n}'
     print(f"loaded {'EMA' + str(jit_ema) if jit_ema else 'raw'} weights of {checkpoint['denoiser_args']['model']} from {ckpt} "
           f"at iter {checkpoint['iter_num']} (epoch {checkpoint.get('epoch', 0):.1f}): blocks {blocks}, t={jit_t}")
-    backbone = JiTBackbone(net, blocks, jit_t, denoiser.noise_scale)
+    backbone = JiTBackbone(net, blocks, jit_t, denoiser.noise_scale, capture=list(range(1, n + 1)) if jit_depth_attn else None)
     if compile and 'cuda' in device:
         net.compile() # after the capture hooks are registered
     backbone.iter_num, backbone.epoch = checkpoint['iter_num'], checkpoint.get('epoch')
@@ -221,7 +232,7 @@ suffix = ''
 if is_jit:
     results.update(iter=backbone.iter_num, epoch=backbone.epoch, jit_t=jit_t, jit_blocks=backbone.blocks, jit_ema=jit_ema)
     suffix = f'_t{jit_t:g}' + (f'_ema{jit_ema}' if jit_ema != 1 else '') # so evals at several noise levels sit side by side
-    n_last_blocks = len(backbone.blocks) # get_intermediate_layers returns exactly the probe blocks
+    n_last_blocks = len(backbone.capture) # get_intermediate_layers returns the captured blocks
     train_data, val_data = MemmapImages(data_dir), MemmapImages(os.path.join(data_dir, 'val'))
     assert train_data.img_size == backbone.net.input_size, f'{data_dir} is {train_data.img_size}px, the model {backbone.net.input_size}px'
     num_classes = train_data.num_classes
@@ -268,42 +279,100 @@ if knn:
 # linear probe sweep
 
 class LinearClassifier(nn.Module):
-    def __init__(self, use_n_blocks, use_avgpool, num_classes=1000, pooled_blocks=None):
+    def __init__(self, use_n_blocks, use_avgpool, num_classes=1000, pooled_blocks=None, feature_norm=False):
         """
         pooled_blocks: indices into the token list whose mean-pooled tokens form the features (JiT, which has no cls
         token); otherwise the cls tokens of the last use_n_blocks, optionally with the avgpooled last-block patch tokens.
+        feature_norm: BatchNorm without affine on the features before the linear layer (MAE's linear-probe protocol).
         """
         super().__init__()
         self.use_n_blocks = use_n_blocks
         self.use_avgpool = use_avgpool
         self.pooled_blocks = pooled_blocks
         in_dim = embed_dim * (len(pooled_blocks) if pooled_blocks is not None else use_n_blocks + int(use_avgpool))
+        self.norm = nn.BatchNorm1d(in_dim, affine=False) if feature_norm else nn.Identity()
         self.linear = nn.Linear(in_dim, num_classes)
         self.linear.weight.data.normal_(mean=0.0, std=0.01)
         self.linear.bias.data.zero_()
 
     def forward(self, x_tokens_list):
         if self.pooled_blocks is not None:
-            return self.linear(torch.cat([x_tokens_list[i].mean(1) for i in self.pooled_blocks], dim=-1))
+            return self.linear(self.norm(torch.cat([x_tokens_list[i].mean(1) for i in self.pooled_blocks], dim=-1)))
         intermediate = x_tokens_list[-self.use_n_blocks:]
         x = torch.cat([tokens[:, 0] for tokens in intermediate], dim=-1)
         if self.use_avgpool:
             x = torch.cat([x, x_tokens_list[-1][:, num_prefix_tokens:].mean(1)], dim=-1)
-        return self.linear(x)
+        return self.linear(self.norm(x))
+
+def rms_normalize(x, eps=1e-6):
+    return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+
+class JiTProbe(nn.Module):
+    """
+    Linear probe on JiT tokens. feats: {'tokens': list of [B, T, D] per captured block, 'normed': [S, B, T, D] the same
+    RMS-normalized, computed once per batch and shared by every head (autograd keeps references, not copies).
+    sources: captured-block indices. depth_attn: mix them per token with softmax_s(q . normed_s) over depth (AttnRes's
+    form), else use each separately. pool: 'mean', or 'attn': per attention head, softmax over tokens of a learned query
+    against the (normalized) tokens, no projections. Both queries start at zero (uniform over depth, mean pooling).
+    The pooled features (concatenated over sources) go through BatchNorm without affine (feature_norm), then a linear layer.
+    """
+    def __init__(self, sources, depth_attn, pool, num_classes, dim, num_heads, feature_norm):
+        super().__init__()
+        self.sources, self.depth_attn, self.pool, self.num_heads = sources, depth_attn, pool, num_heads
+        n_feat = 1 if depth_attn else len(sources)
+        self.depth_query = nn.Parameter(torch.zeros(dim)) if depth_attn else None
+        self.pool_query = nn.Parameter(torch.zeros(n_feat, num_heads, dim // num_heads)) if pool == 'attn' else None
+        self.norm = nn.BatchNorm1d(n_feat * dim, affine=False) if feature_norm else nn.Identity()
+        self.linear = nn.Linear(n_feat * dim, num_classes)
+        self.linear.weight.data.normal_(mean=0.0, std=0.01)
+        self.linear.bias.data.zero_()
+
+    def depth_weights(self, normed):
+        # [S', B, T] softmax over the sources
+        return torch.einsum('sbtd,d->sbt', normed, self.depth_query).softmax(0)
+
+    def attn_pool(self, keys, values, q):
+        # keys / values [B, T, D], q [H, D / H] -> [B, D]
+        B, T, D = values.shape
+        k = keys.view(B, T, self.num_heads, -1)
+        w = (torch.einsum('bthd,hd->bht', k, q) / k.shape[-1] ** 0.5).softmax(-1)
+        return torch.einsum('bht,bthd->bhd', w, values.view(B, T, self.num_heads, -1)).reshape(B, D)
+
+    def forward(self, feats):
+        if self.depth_attn:
+            normed = feats['normed'][self.sources] if len(self.sources) < feats['normed'].shape[0] else feats['normed']
+            mixed = torch.einsum('sbt,sbtd->btd', self.depth_weights(normed), normed)
+            pairs = [(mixed, mixed)] # (keys, values): the mixture of normalized states is its own key
+        else:
+            pairs = [(feats['normed'][i], feats['tokens'][i]) for i in self.sources]
+        if self.pool == 'mean':
+            pooled = [v.mean(1) for _, v in pairs]
+        else:
+            pooled = [self.attn_pool(k, v, self.pool_query[j]) for j, (k, v) in enumerate(pairs)]
+        return self.linear(self.norm(torch.cat(pooled, dim=-1)))
 
 if linear:
     lrs = [float(lr) for lr in learning_rates.split(',')]
     heads = nn.ModuleDict()
     param_groups = []
     if is_jit:
-        # each probe block on its own, and all of them concatenated
-        configs = {f'block{b}': [i] for i, b in enumerate(backbone.blocks)}
+        # each probe block on its own, all of them concatenated, and (jit_depth_attn) a learned mixture over every block;
+        # each with every token pooling in jit_pools
+        feature_sets = {f'block{b}': ([i], False) for b, i in zip(backbone.blocks, backbone.probe_index)}
         if len(backbone.blocks) > 1:
-            configs['blocks' + '+'.join(map(str, backbone.blocks))] = list(range(len(backbone.blocks)))
-        for feat_name, pooled in configs.items():
+            feature_sets['blocks' + '+'.join(map(str, backbone.blocks))] = (backbone.probe_index, False)
+        if jit_depth_attn:
+            feature_sets['depthattn'] = (list(range(len(backbone.capture))), True)
+        pools = [p_ for p_ in jit_pools.split(',') if p_]
+        assert pools and all(p_ in ('mean', 'attn') for p_ in pools), f"jit_pools must list mean and/or attn, got {jit_pools}"
+        configs = {}
+        for feat_name, (sources, depth_attn) in feature_sets.items():
+            for pool in pools:
+                configs[f'{feat_name}_{pool}'] = (sources, depth_attn, pool)
+        for cfg_name, (sources, depth_attn, pool) in configs.items():
             for lr in lrs:
-                name = f'{feat_name}_lr{lr:.0e}'
-                heads[name] = LinearClassifier(None, False, num_classes, pooled_blocks=pooled)
+                name = f'{cfg_name}_lr{lr:.0e}'
+                heads[name] = JiTProbe(sources, depth_attn, pool, num_classes, embed_dim, backbone.net.num_heads, jit_feature_norm)
                 param_groups.append({'params': heads[name].parameters(), 'base_lr': lr * batch_size / 256})
     else:
         for n in sorted({1, n_last_blocks}):
@@ -336,7 +405,10 @@ if linear:
         with ctx:
             tokens = features_fn(x, n_last_blocks)
         # heads train in fp32 on top of the bf16 backbone
-        return [t.float() for t in tokens]
+        tokens = [t.float() for t in tokens]
+        if is_jit: # the normalized states, once for every head
+            return {'tokens': tokens, 'normed': torch.stack([rms_normalize(t) for t in tokens])}
+        return tokens
 
     @torch.no_grad()
     def evaluate():
@@ -357,7 +429,15 @@ if linear:
         return 0.5 * (1.0 + math.cos(math.pi * it / max_iters))
 
     X, Y = get_batch()
-    assert len(get_features(X[:2])) == n_last_blocks, f'backbone returned fewer than n_last_blocks={n_last_blocks} layers'
+    assert len(get_features(X[:2])['tokens'] if is_jit else get_features(X[:2])) == n_last_blocks, f'backbone returned fewer than n_last_blocks={n_last_blocks} layers'
+    if is_jit:
+        # scale of the pooled features the heads see: a common offset much larger than the per-dimension spread across
+        # images makes raw-feature SGD ill-conditioned (what jit_feature_norm removes)
+        for b, i in zip(backbone.blocks, backbone.probe_index):
+            f = get_features(X)['tokens'][i].mean(1)
+            print(f"block {b} pooled features: mean |f| {f.norm(dim=-1).mean():.3g}, per-dim std across images {f.std(0).mean():.3g}, "
+                  f"|batch mean| / sqrt(total per-dim variance) {f.mean(0).norm() / f.var(0).sum().sqrt():.3g}")
+        print(f"linear heads: {'BatchNorm (no affine) on the features, then' if jit_feature_norm else 'raw features,'} SGD")
     t0 = time.time()
     for iter_num in range(max_iters + 1):
         if iter_num > 0 and (iter_num % eval_interval == 0 or iter_num == max_iters):
@@ -391,11 +471,26 @@ if linear:
             if wandb_log:
                 wandb.log({'iter': iter_num, 'train/mean_head_loss': lossf, 'lr_coeff': coeff}, step=iter_num)
 
-    if is_jit: # best head per feature set, so the block comparison is visible at a glance
-        for feat_name in configs:
-            best = max((n for n in accs if n.rsplit('_lr', 1)[0] == feat_name), key=accs.get)
-            results[f'linear_top1_{feat_name}'] = accs[best]
-            print(f"  {feat_name:24s} {accs[best]:.2f} ({best.rsplit('_', 1)[1]})")
+    if is_jit: # best head per feature set x pooling (over lr), so the comparison is visible at a glance
+        print(f"\nbest over lr: rows feature set, columns token pooling")
+        print(' ' * 18 + ''.join(f'{p_:>16}' for p_ in pools))
+        for feat_name in feature_sets:
+            cells = []
+            for pool in pools:
+                cfg_name = f'{feat_name}_{pool}'
+                best = max((n for n in accs if n.rsplit('_lr', 1)[0] == cfg_name), key=accs.get)
+                results[f'linear_top1_{cfg_name}'] = accs[best]
+                cells.append(f"{accs[best]:6.2f} ({best.rsplit('_lr', 1)[1]})")
+            print(f'  {feat_name:16s}' + ''.join(f'{c:>16}' for c in cells))
+        if jit_depth_attn: # which blocks the best depth-attention heads mix, averaged over a val batch's tokens
+            xv, _ = next(iter(val_loader))
+            feats = get_features(xv.to(device))
+            for pool in pools:
+                best = max((n for n in accs if n.rsplit('_lr', 1)[0] == f'depthattn_{pool}'), key=accs.get)
+                with torch.no_grad():
+                    w = heads[best].depth_weights(feats['normed']).mean(dim=(1, 2)).tolist()
+                results[f'depth_weights_{pool}'] = w
+                print(f"  depth weights of {best}: " + ' '.join(f'b{b} {v:.2f}' for b, v in zip(backbone.capture, w)))
     print("\nall heads (val top1):")
     for name, acc in sorted(accs.items(), key=lambda kv: -kv[1]):
         print(f"  {name:32s} {acc:.2f}")
