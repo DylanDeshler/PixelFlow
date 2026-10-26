@@ -117,9 +117,12 @@ out = out or f"{os.path.basename(os.path.normpath(data_dir))}_patch_sizes"
 ctx = torch.autocast(device_type='cuda', dtype=torch.bfloat16) if 'cuda' in device else nullcontext()
 
 # models: coarsest first
-models = [load_denoiser(p, ema, device)[0] for p in ckpts.split(',')]
-assert len(models) == 3, 'pass exactly three checkpoints (32 / 16 / 8 px)'
-models.sort(key=lambda d: -d.net.patch_size)
+loaded = sorted((load_denoiser(p, ema, device) for p in ckpts.split(',')), key=lambda dm: -dm[0].net.patch_size)
+assert len(loaded) == 3, 'pass exactly three checkpoints (32 / 16 / 8 px)'
+models, steps = [d for d, _ in loaded], [m.get('iter_num') for _, m in loaded]
+print('checkpoints at iteration ' + ', '.join(f'{d.net.patch_size}px {s}' for d, s in zip(models, steps)))
+if len(set(steps)) > 1:
+    print('WARNING: the checkpoints are at different iterations, so the comparison mixes patch size with training length')
 nets = [d.net for d in models]
 patches = [n.patch_size for n in nets]
 img, num_classes = models[0].img_size, models[0].num_classes
