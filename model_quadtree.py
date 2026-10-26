@@ -615,7 +615,7 @@ class QuadtreeJiT(nn.Module):
         return self.output(h, c, layout)
 
 
-# presets: JiT-B's backbone; patch_size is the finest level
+# presets: JiT-B's backbone, named by the patch range (32px coarsest, 8px finest; patch_size is the finest level)
 QUADTREE_PRESETS = {
-    'QuadJiT-B/8': dict(depth=12, hidden_size=768, num_heads=12, bottleneck_dim=128, patch_size=8, levels=3, tokens=64),
+    'QuadJiT-B/32-8': dict(depth=12, hidden_size=768, num_heads=12, bottleneck_dim=128, patch_size=8, levels=3, tokens=64),
 }

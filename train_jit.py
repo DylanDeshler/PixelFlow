@@ -65,7 +65,7 @@ data_workers = 16 # background reader threads filling pinned buffers ahead of tr
                   # datasets bigger than the page cache; 0 = read each batch on the main thread during the forward
 data_prefetch = 3 # batches read ahead
 # model: a JiT preset, optionally with any architecture field overridden (-1 keeps the preset's value)
-model = 'JiT-B/16' # JiT-B/16, JiT-B/32, JiT-L/16, JiT-L/32, JiT-H/16, JiT-H/32, PixelDiT-B/16, -L/16, -XL/16 (model_pixeldit.py), or QuadJiT-B/8 (model_quadtree.py)
+model = 'JiT-B/16' # JiT-B/16, JiT-B/32, JiT-L/16, JiT-L/32, JiT-H/16, JiT-H/32, PixelDiT-B/16, -L/16, -XL/16 (model_pixeldit.py), or QuadJiT-B/32-8 (model_quadtree.py)
 depth = -1
 hidden_size = -1
 num_heads = -1

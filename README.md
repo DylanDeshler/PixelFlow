@@ -382,7 +382,7 @@ python viz_quadtree_router.py --data_dir=/data/in1k_128 --baseline=$BASE --ts=0.
 ```
 
 ```bash
-B="config/jit_in1k_128.py config/model_quadjit_b8.py --optimizer_type=muon --attn_res=full --adaln_single=True --keep_ckpt_every_epochs=10"
+B="config/jit_in1k_128.py config/model_quadjit_b32_8.py --optimizer_type=muon --attn_res=full --adaln_single=True --keep_ckpt_every_epochs=10"
 BASE=runs/in1k_128/jit-b16_icl0/<best run>/ckpt_<iter>.pt                     # frozen router baseline
 python train_jit.py $B --quad_router=uniform                                   # floor: uniform 16px, K=64
 python train_jit.py $B --quad_router=uniform --quad_tokens=256                 # ceiling: uniform 8px (or --batch_size=512 --gradient_accumulation_steps=2)
@@ -393,11 +393,45 @@ python train_jit.py $B --quad_router=dino --quad_route_baseline=$BASE --quad_rou
 python train_jit.py $B --quad_router=pixel --quad_route_baseline=$BASE         # non-semantic routing (optional)
 python train_jit.py $B --quad_router=dino --quad_route_baseline=$BASE --quad_rope=integrated   # ablations: --quad_pos=center,
                                                                                # --quad_area_bias=False, --quad_level_embed=False
-python eval_jit.py --ckpt=runs/in1k_128/quadjit-b8/<run> --data_dir=/data/in1k_128 --quad_route_every=4   # re-route every 4 calls
+python eval_jit.py --ckpt=runs/in1k_128/quadjit-b32-8/<run> --data_dir=/data/in1k_128 --quad_route_every=4   # re-route every 4 calls
 ```
 
 `config/model_jit_b8.py` (plain JiT with 8px patches) remains as a cross-check of the K=256 ceiling, using JiT's own
 position embedding.
+
+### A no-training estimate of the gain: `analyze_patch_sizes.py`
+
+This uses three plain-JiT checkpoints at 32/16/8px patches, trained alike to the same step. Generation stitches each
+step's estimate region by region from the three models according to a router's layout, and is scored by FID-10k. Every
+configuration uses the same noise and labels. The full description is in the script's docstring.
+- **anchors:** each model alone. The 16px model is the K=64 baseline, the 8px model the K=256 ceiling.
+- **stitched:** FID per router × K. "gap closed" is the share of the 16px → 8px FID improvement reached. Routers:
+  - **loss:** the no-external-representation router from proposal Section 7, a greedy on the largest expected loss
+    reductions. It uses the 8px estimate in place of E[x | z_t], so each model's expected error over a region is
+    ‖x_l − x8‖² plus a posterior-variance term that is the same for every model. That makes the measured gain with
+    x8 in place of x the conditional mean a split-value regression head would learn. It needs no training, but it
+    borrows the 8px model, so it is optimistic.
+  - **dino, pixel:** on the 16px null-label estimate, as in training.
+  - **random, uniform.**
+  - **disagree** (optional): equals loss for 16px parents.
+- **attribution** at `--attr_tokens`:
+  - by t: stitching only inside each t window, with the 16px model elsewhere;
+  - by patch size: the same layouts with the 8px regions, or the 32px regions, rendered by the 16px model (what
+    splitting buys, what merging costs).
+- **regions:** each region's split gain per t (the error the finer model removes, split into structure + detail).
+  Every heuristic's rank correlation with it: loss, i.e. how much of the realized gain is predictable from z_t; dino and its gate and divergence terms; pixel; disagree; centre; random.,
+  also in Inception feature space, plus the heuristics' correlations with each other.
+- **recon** (`--recon`): reconstruction FID from t0, including the loss-oracle that sees the true image.
+
+Results are saved after every generation, and a rerun with the same `--out` skips finished ones. Cost is in units of
+the 8px model generating the same images: a stitched configuration is about 1.3 for the models, plus 0.25 for the
+routing estimate and about 1 for DINO when the dino router is used.
+
+```bash
+P="runs/in1k_128/jit-b16_p32_icl0/<run>/ckpt_<iter>.pt,runs/in1k_128/jit-b16_icl0/<run>/ckpt_<iter>.pt,runs/in1k_128/jit-b16_p8_icl0/<run>/ckpt_<iter>.pt"
+python analyze_patch_sizes.py --ckpts=$P --data_dir=/data/in1k_128                                  # everything above except recon
+python analyze_patch_sizes.py --ckpts=$P --data_dir=/data/in1k_128 --routers=loss,dino,random --tokens=64,100 --attr_routers=loss   # cheaper
+```
 
 ## PixelDiT baseline
 
