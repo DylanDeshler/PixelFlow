@@ -111,8 +111,8 @@ def instrumented_forward(net, x, t, y, capture_blocks=(), tile=None, skip_on=Tru
     tile: if set, runs the windowed-attention ablation (see tile_mask) instead of full attention.
     skip_on: False runs a skip-pathway model without its skip (the trunk-only prediction, used for skip_residual).
     """
-    if getattr(net, 'family', 'jit') == 'pixeldit':
-        return _pixeldit_forward(net, x, t, y, capture_blocks, tile)
+    if getattr(net, 'family', 'jit') != 'jit': # PixelDiT, QuadtreeJiT: the model's own forward
+        return _plain_forward(net, x, t, y, capture_blocks, tile)
     g = int(round(net.x_embedder.num_patches ** 0.5))
     x_input = x
     masks = {}
@@ -191,9 +191,9 @@ def instrumented_forward(net, x, t, y, capture_blocks=(), tile=None, skip_on=Tru
         stats['attn_res_alpha'] = attn_res_matrix(res.weights, x.device)
     return out, stats, feats
 
-def _pixeldit_forward(net, x, t, y, capture_blocks=(), tile=None):
-    # PixelDiT: the model's own forward, with the patch-level blocks' tokens captured by hooks for the probes; the attention
-    # statistics and the windowed-attention ablation are JiT-specific and not computed
+def _plain_forward(net, x, t, y, capture_blocks=(), tile=None):
+    # non-JiT families (PixelDiT, QuadtreeJiT): the model's own forward, with the blocks' tokens captured by hooks for the
+    # probes; the attention statistics and the windowed-attention ablation are JiT-specific and not computed
     assert tile is None, 'the windowed-attention ablation is only implemented for JiT'
     feats, hooks = {}, []
     for b in capture_blocks:
@@ -408,6 +408,129 @@ def trajectory_pass(denoiser, x, y, t0s, noise_scale, ctx, masks, n_images=256, 
     finally:
         denoiser.cfg_scale, denoiser.fixed_shape = saved
     return {k: torch.stack(v) for k, v in out.items()}
+
+@torch.no_grad()
+def layout_stats(net, x, y, ts, noise_scale, ctx, n_images=256, seed=0, chunk=128):
+    """
+    QuadtreeJiT: how the router spends the token budget per noise level, on held-out images noised as in noise_level_pass
+    (the same layouts the model trains with). Per t, [len(ts), levels] unless noted (level 0 = coarsest):
+      area            mean fraction of the image tokenized at each level
+      x_mse           held-out clean-image error of the pixels each level covers (NaN where a level covers nothing): do
+                      fine tokens lower the error where they are placed, and what does covering a region coarsely cost?
+      clean_agreement [len(ts)] fraction of the image tokenized at the same level as the router's scorer applied to the
+                      clean image itself (dino / pixel routers): how much of the clean-image routing survives noise
+    """
+    from model_quadtree import cell_maps
+    g = torch.Generator(device=x.device).manual_seed(seed)
+    noise = (torch.randn(x.shape, generator=g, device=x.device) * noise_scale)[:n_images]
+    x, y = x[:n_images], y[:n_images]
+    geo, L = net.geo, net.geo.L
+    f = x.shape[-1] // geo.grids[-1] # pixels per finest cell
+    clean = None
+    if net.router.mode in ('dino', 'pixel'):
+        with ctx:
+            clean = torch.cat([net.route_clean(x[i:i + chunk]) for i in range(0, len(x), chunk)])
+    out = {'area': [], 'x_mse': [], 'clean_agreement': []}
+    for t_val in ts.tolist():
+        area, err_sum, err_cnt, agree = 0, torch.zeros(L), torch.zeros(L), 0
+        for i in range(0, len(x), chunk):
+            xb, yb, eb = x[i:i + chunk], y[i:i + chunk], noise[i:i + chunk]
+            t = torch.full((len(xb),), t_val, device=x.device)
+            z = t_val * xb + (1 - t_val) * eb
+            with ctx:
+                layout = net.route(z, t)
+                x_pred = net(z, t, yb, layout=layout).float()
+            area = area + net.level_area(layout).sum(0).cpu()
+            cell_err = F.avg_pool2d((x_pred - xb).pow(2).mean(1, keepdim=True), f)[:, 0] # [B, G, G]
+            lev = cell_maps(layout, geo)[1]
+            for l in range(L):
+                m = lev == l
+                err_sum[l] += cell_err[m].sum().item()
+                err_cnt[l] += m.sum().item()
+            if clean is not None:
+                agree = agree + (cell_maps(clean[i:i + chunk], geo)[1] == lev).float().flatten(1).mean(1).sum().item()
+        out['area'].append(area / len(x))
+        out['x_mse'].append(torch.where(err_cnt > 0, err_sum / err_cnt.clamp_min(1), torch.full_like(err_sum, float('nan'))))
+        out['clean_agreement'].append(torch.tensor(agree / len(x) if clean is not None else float('nan')))
+    return {k: torch.stack(v) for k, v in out.items()}
+
+def _boundary_pairs(img, layout, geo):
+    # every horizontal and vertical neighbour pixel pair: |difference| (mean over channels), whether it crosses a token
+    # boundary, and whether it crosses a boundary between two levels; flattened over the batch
+    from model_quadtree import cell_maps
+    tok, lev = cell_maps(layout.to(img.device), geo)
+    f = img.shape[-1] // geo.grids[-1]
+    tok = tok.repeat_interleave(f, 1).repeat_interleave(f, 2)
+    lev = lev.repeat_interleave(f, 1).repeat_interleave(f, 2)
+    dh = (img[:, :, :, 1:] - img[:, :, :, :-1]).abs().mean(1)
+    dv = (img[:, :, 1:, :] - img[:, :, :-1, :]).abs().mean(1)
+    d = torch.cat([dh.flatten(), dv.flatten()])
+    cross_tok = torch.cat([(tok[:, :, 1:] != tok[:, :, :-1]).flatten(), (tok[:, 1:] != tok[:, :-1]).flatten()])
+    cross_lev = torch.cat([(lev[:, :, 1:] != lev[:, :, :-1]).flatten(), (lev[:, 1:] != lev[:, :-1]).flatten()])
+    return d, cross_tok, cross_lev
+
+def seam_ratio(img, layout, geo):
+    """
+    Mean |neighbour difference| across token boundaries / inside tokens ([-1, 1] images), overall and for boundaries
+    between two different levels. About 1 when the tokenization leaves no trace; well above the same ratio on real images
+    with comparable layouts means visible seams.
+    """
+    d, ct, cl = _boundary_pairs(img.float(), layout, geo)
+    inside = d[~ct].mean()
+    return (d[ct].mean() / inside).item(), (d[cl].mean() / inside).item() if cl.any() else float('nan')
+
+def level_highfreq(img, layout, geo):
+    # high-frequency energy (|x - 3x3 local mean|, mean over channels) of the pixels each level covers [levels]
+    from model_quadtree import cell_maps
+    hf = (img.float() - F.avg_pool2d(img.float(), 3, 1, 1, count_include_pad=False)).abs().mean(1) # [B, H, W]
+    lev = cell_maps(layout.to(img.device), geo)[1]
+    f = img.shape[-1] // geo.grids[-1]
+    lev = lev.repeat_interleave(f, 1).repeat_interleave(f, 2)
+    return torch.stack([hf[lev == l].mean() if (lev == l).any() else torch.tensor(float('nan'), device=img.device) for l in range(geo.L)]).cpu()
+
+@torch.no_grad()
+def sampling_layout_stats(denoiser, labels, x_real, noise_scale, ctx, t_ref=0.95, seed=0):
+    """
+    QuadtreeJiT, along its own sampling trajectories (len(labels) samples with the denoiser's current sampler settings,
+    fixed seed): the router's layouts are recorded while generating.
+      t, agree_final, agree_prev   per routing call: its t, and the fraction of the image tokenized at the same level as
+                                   the trajectory's final layout / the previous call's layout (mean over samples)
+      settle_t                     the t from which every later call agrees >= 90% with the final layout
+      seam / seam_cross            seam_ratio of the samples with their final layouts (all / between-level boundaries)
+      seam_real / seam_cross_real  the same on real held-out images with the router's layouts at t_ref (reference)
+      hf_ratio                     [levels] high-frequency energy of the samples / the real images in the regions each
+                                   level covers (< 1: detail missing there, e.g. texture blurred under coarse tokens)
+    """
+    net, geo = denoiser.net, denoiser.net.geo
+    B = len(labels)
+    net.record_layouts(True)
+    try:
+        with torch.random.fork_rng(devices=[labels.device] if labels.is_cuda else []):
+            torch.manual_seed(seed)
+            with ctx:
+                samples = denoiser.generate(labels).float()
+        history = [(lay[:B].to(labels.device), t) for lay, t in net.router.history]
+    finally:
+        net.record_layouts(False)
+    from model_quadtree import layout_agreement
+    final = history[-1][0]
+    agree_final = [layout_agreement(lay, final, geo).mean().item() for lay, _ in history]
+    agree_prev = [float('nan')] + [layout_agreement(history[i][0], history[i - 1][0], geo).mean().item() for i in range(1, len(history))]
+    settle_i = len(history) - 1
+    while settle_i > 0 and agree_final[settle_i - 1] >= 0.9:
+        settle_i -= 1
+    # real reference: held-out images with the layouts the router gives them near clean (from x_t at t_ref)
+    xr = x_real[:B]
+    g = torch.Generator(device=xr.device).manual_seed(seed)
+    zr = t_ref * xr + (1 - t_ref) * torch.randn(xr.shape, generator=g, device=xr.device) * noise_scale
+    with ctx:
+        real_layout = net.route(zr, torch.full((len(xr),), t_ref, device=xr.device))
+    seam, seam_cross = seam_ratio(samples, final, geo)
+    seam_real, seam_cross_real = seam_ratio(xr, real_layout, geo)
+    return {'t': torch.tensor([t for _, t in history]), 'agree_final': torch.tensor(agree_final), 'agree_prev': torch.tensor(agree_prev),
+            'settle_t': torch.tensor(history[settle_i][1]), 'seam': torch.tensor(seam), 'seam_cross': torch.tensor(seam_cross),
+            'seam_real': torch.tensor(seam_real), 'seam_cross_real': torch.tensor(seam_cross_real),
+            'hf_ratio': level_highfreq(samples, final, geo) / level_highfreq(xr, real_layout, geo)}
 
 # -----------------------------------------------------------------------------
 # 5. representation probes

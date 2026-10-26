@@ -36,7 +36,7 @@ import torch
 from PIL import Image
 
 from data_jit import MemmapImages
-from jit_common import load_denoiser, generate_and_score, save_labeled_grid
+from jit_common import load_denoiser, generate_and_score, save_labeled_grid, save_layout_grids
 from fid import InceptionMetrics, load_ref_stats, precision_recall
 
 from plot_style import SURFACE, INK, INK_2, GRID, BLUE, ORANGE # validated categorical pair on the light surface
@@ -141,6 +141,7 @@ sampling_eta = 1.0 # 'ancestral' only: fresh-noise level per step, 1 = DDPM's an
 num_sampling_steps = 50
 time_schedule = 'uniform' # 'uniform' (JiT), 'shift' (FLUX/SD3-style, uses the checkpoint's P_mean), 'train_quantile'
 gen_batch_size = 256 # samples per network call (even: halved into conditional + unconditional under CFG)
+quad_route_every = 1 # QuadJiT only: re-route every N network calls while sampling (heun makes 2 per step)
 ema = 1 # which weights to sample with: 1 or 2 = that EMA (JiT uses the first, decay 0.9999), 0 = the raw (non-EMA) weights
 seed = 0
 save_samples = '' # '', 'png' or 'npz'
@@ -177,6 +178,9 @@ if compile:
     # every sampling call has the same batch (fixed_shape below), so one static graph serves the whole evaluation
     denoiser.net.compile()
 denoiser.time_schedule = time_schedule
+is_quadtree = getattr(denoiser.net, 'family', 'jit') == 'quadtree'
+if is_quadtree:
+    denoiser.net.route_every = quad_route_every
 print(f"loaded {f'EMA{ema}' if ema else 'raw'} weights of {meta['denoiser_args']['model']} from {ckpt}")
 
 data = MemmapImages(data_dir)
@@ -206,7 +210,8 @@ def parse_cfgs(spec):
     return [float(c) for c in spec.split(',')]
 
 cfg_list = parse_cfgs(cfgs)
-sampler = f"{sampling_method}{num_sampling_steps}" + (f'_eta{sampling_eta:g}' if sampling_method == 'ancestral' else '') # for file names
+sampler = f"{sampling_method}{num_sampling_steps}" + (f'_eta{sampling_eta:g}' if sampling_method == 'ancestral' else '') \
+          + (f'_routeevery{quad_route_every}' if is_quadtree and quad_route_every > 1 else '') # for file names
 sweeping = len(cfg_list) > 1
 sweep_n = sweep_num_images if sweeping and 0 < sweep_num_images < final_num_images else final_num_images
 rescore = sweeping and sweep_n < final_num_images
@@ -316,12 +321,17 @@ labels = torch.linspace(0, data.num_classes - 1, 64).long().to(device)
 grid_batch = max(64, gen_batch_size // (1 if best_cfg == 1.0 else 2))
 torch.manual_seed(seed)
 denoiser.fixed_shape = True
+if is_quadtree:
+    denoiser.net.record_layouts(True)
 with torch.no_grad(), ctx:
     x = denoiser.generate(torch.cat([labels, labels.new_zeros(grid_batch - 64)]))[:64]
 denoiser.fixed_shape = False
 tag = f"{final_num_images / 1000:g}k_{sampler}" + ('' if time_schedule == 'uniform' else f'_{time_schedule}') \
       + ('' if ema == 1 else '_raw' if ema == 0 else f'_ema{ema}')
 save_labeled_grid(x, [class_names[i] for i in labels.tolist()], os.path.join(samples_dir, f'eval_samples_{tag}.png'))
+if is_quadtree: # the same grid with the token layouts drawn on
+    save_layout_grids(denoiser.net, x, [class_names[i] for i in labels.tolist()], os.path.join(samples_dir, f'eval_samples_{tag}'), denoiser.net.router.history)
+    denoiser.net.record_layouts(False)
 with open(os.path.join(out_dir, f'eval_{tag}.json'), 'w') as f:
     json.dump(results, f, indent=2)
 print(f"results written to {os.path.join(out_dir, f'eval_{tag}.json')}")

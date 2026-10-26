@@ -15,6 +15,7 @@ from denoiser import Denoiser
 from fid import to_uint8
 import model_jit
 from model_pixeldit import PixelDiT, PIXELDIT_PRESETS
+from model_quadtree import QuadtreeJiT, QUADTREE_PRESETS
 
 # architecture of each JiT preset, as defined in model_jit.py (mlp_ratio is the JiT default for all of them)
 JIT_PRESETS = {
@@ -29,8 +30,15 @@ JIT_PRESETS = {
 for _name, _arch in PIXELDIT_PRESETS.items():
     JIT_PRESETS[_name] = dict(_arch, in_context_len=0, in_context_start=0, family='pixeldit')
     model_jit.JiT_models[_name] = (lambda arch: lambda **kwargs: PixelDiT(**arch, **kwargs))(JIT_PRESETS[_name])
+# fixed-budget quadtree tokenization (model_quadtree.py): same stack, its own network class
+for _name, _arch in QUADTREE_PRESETS.items():
+    JIT_PRESETS[_name] = dict(_arch, in_context_len=0, in_context_start=0, family='quadtree')
+    model_jit.JiT_models[_name] = (lambda arch: lambda **kwargs: QuadtreeJiT(**arch, **kwargs))(JIT_PRESETS[_name])
 for _name, _arch in JIT_PRESETS.items():
     assert _name in model_jit.JiT_models, f'{_name} missing from model_jit.JiT_models'
+
+QUADTREE_DEFAULTS = dict(attn_res='none', adaln_single=False, router='uniform', route_baseline='', route_dino='dinov2_vitb14_reg',
+                         route_t_min=0.0, route_gate_tau=1.0, pos_embed='integrated', rope='plain', area_bias=True, level_embed=True)
 
 def resolve_arch(model, **overrides):
     """
@@ -53,6 +61,16 @@ def describe_arch(model, arch):
     One line with every architecture field as actually built, marking the ones that differ from the preset, e.g.
     'arch: depth 12, hidden_size 768, ..., in_context_len 0* (preset 32), ... (preset JiT-B/16, * = overridden)'.
     """
+    if JIT_PRESETS[model].get('family') == 'quadtree':
+        preset = dict(QUADTREE_DEFAULTS, **JIT_PRESETS[model], mlp_ratio=4.0)
+        full = dict(preset, **arch)
+        keys = ('depth', 'hidden_size', 'num_heads', 'patch_size', 'levels', 'tokens', 'bottleneck_dim', 'mlp_ratio', 'attn_res', 'adaln_single',
+                'router', 'route_t_min', 'route_gate_tau', 'pos_embed', 'rope', 'area_bias', 'level_embed')
+        parts = [(f"{k} {full[k]:g}" if isinstance(full[k], float) else f"{k} {full[k]}") + (f"* (preset {preset[k]})" if full[k] != preset[k] else '')
+                 for k in keys]
+        if full['router'] in ('dino', 'pixel'):
+            parts.append(f"route_baseline {full['route_baseline']}" + (f", route_dino {full['route_dino']}" if full['router'] == 'dino' else ''))
+        return f"arch: {', '.join(parts)} (preset {model}, * = overridden)"
     if JIT_PRESETS[model].get('family') == 'pixeldit':
         preset = dict(JIT_PRESETS[model], mlp_ratio=4.0, prediction='x')
         full = dict(preset, **arch)
@@ -95,7 +113,7 @@ def describe_arch(model, arch):
 def _register(name, arch):
     # JiT's Denoiser looks the network up in model_jit.JiT_models by name, so custom architectures get registered there
     if name not in model_jit.JiT_models:
-        cls = PixelDiT if arch.get('family') == 'pixeldit' else model_jit.JiT
+        cls = {'pixeldit': PixelDiT, 'quadtree': QuadtreeJiT}.get(arch.get('family'), model_jit.JiT)
         model_jit.JiT_models[name] = lambda **kwargs: cls(**arch, **kwargs)
 
 
@@ -199,9 +217,16 @@ class FastDenoiser(Denoiser):
         else:
             raise NotImplementedError(f"unknown sampling method {self.method}: 'euler', 'heun' or 'ancestral'")
         timesteps = ts.view(-1, *([1] * z.ndim)).expand(-1, z.size(0), -1, -1, -1)
-        for i in range(len(ts) - 2):
-            z = stepper(z, timesteps[i], timesteps[i + 1], labels)
-        return self._euler_step(z, timesteps[-2], timesteps[-1], labels)
+        hooks = hasattr(self.net, 'begin_sampling') # quadtree: layouts may be reused for route_every calls of one trajectory
+        if hooks:
+            self.net.begin_sampling()
+        try:
+            for i in range(len(ts) - 2):
+                z = stepper(z, timesteps[i], timesteps[i + 1], labels)
+            return self._euler_step(z, timesteps[-2], timesteps[-1], labels)
+        finally:
+            if hooks:
+                self.net.end_sampling()
 
     ema_warmup = False
 
@@ -347,6 +372,29 @@ def save_labeled_grid(x, names, path, nrow=8):
         draw.text((c * W + 2, r * (H + caption) + H), name[: max(4, W // 6)], fill='black')
     canvas.save(path)
 
+def save_layout_grids(net, x, names, prefix, history):
+    """
+    QuadJiT sample grids with the token layout drawn on: {prefix}_layout.png (the last routing call's layout on every
+    sample) and {prefix}_layout_steps.png (the first 8 samples: the sample, then the layouts of the routing calls nearest
+    t = 0.25, 0.5, 0.75 and the last one, drawn on the final sample). history: the router's recorded (layout, mean t)
+    pairs from generating x; CFG batches carry the conditional half first, so the first len(x) rows are x's.
+    """
+    from model_quadtree import draw_layout
+    if not history:
+        return
+    B, geo = x.shape[0], net.geo
+    save_labeled_grid(draw_layout(x, history[-1][0][:B], geo), names, prefix + '_layout.png')
+    picks = [min(range(len(history)), key=lambda i: abs(history[i][1] - t)) for t in (0.25, 0.5, 0.75)] + [len(history) - 1]
+    n = min(8, B)
+    cells, labels = [], []
+    for j in range(n):
+        cells.append(x[j:j + 1])
+        labels.append(names[j])
+        for i in picks:
+            cells.append(draw_layout(x[j:j + 1], history[i][0][j:j + 1], geo))
+            labels.append(f't={history[i][1]:.2f}')
+    save_labeled_grid(torch.cat(cells), labels, prefix + '_layout_steps.png', nrow=1 + len(picks))
+
 # settings that don't change what is trained (budget, evaluation, logging, system), left out of run directory names;
 # diag* (diagnostics) settings are excluded too
 _NAME_EXCLUDE = {
@@ -356,7 +404,7 @@ _NAME_EXCLUDE = {
     'eval_only', 'init_from', 'wandb_log', 'wandb_project', 'wandb_run_name', 'fid_num_images', 'fid_cfg',
     'fid_interval_min', 'fid_interval_max', 'sample_cfg', 'sample_interval_min', 'sample_interval_max',
     'sampling_method', 'sampling_eta', 'num_sampling_steps', 'time_schedule', 'gen_batch_size', 'eval_loss_images',
-    'device', 'dtype', 'compile', 'trend_plots', 'progress_gif', 'data_workers', 'data_prefetch',
+    'device', 'dtype', 'compile', 'trend_plots', 'progress_gif', 'data_workers', 'data_prefetch', 'quad_route_baseline', 'quad_route_every',
 }
 _ARCH_SHORT = {'depth': 'd', 'hidden_size': 'w', 'num_heads': 'h', 'patch_size': 'p', 'bottleneck_dim': 'bn',
                'in_context_len': 'icl', 'in_context_start': 'ics', 'mlp_ratio': 'mlp', 'pixel_depth': 'pd', 'pixel_dim': 'pdim'}
@@ -379,6 +427,8 @@ _NAME_TOKENS = {
     'repa_encoder': 'repa-', 'repa_adapter': 'adapter-', 'repa_depth': 'repadepth', 'repa_coeff': 'repacoeff', 'repa_proj_dim': 'repaproj',
     'repa_mask_ratio': 'repamask', 'repa_adapter_depth': 'adapterdepth',
     'mask_ratio': 'mask', 'mask_prob': 'maskprob', 'mask_weighting': 'maskweight-',
+    'quad_tokens': 'K', 'quad_levels': 'levels', 'quad_router': 'route-', 'quad_route_dino': 'dino-', 'quad_route_t_min': 'routetmin',
+    'quad_gate_tau': 'gatetau', 'quad_pos': 'pos-', 'quad_rope': 'rope-', 'quad_area_bias': 'areabias', 'quad_level_embed': 'levelemb',
 }
 
 def _fmt_value(v):

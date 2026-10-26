@@ -31,7 +31,7 @@ import numpy as np
 import torch
 
 from data_jit import MemmapImages, EpochSampler, Prefetcher, to_model_input
-from jit_common import build_denoiser, resolve_arch, describe_arch, run_dir, legacy_run_dir, ema_state_dicts, ema_weights, generate_and_score, save_labeled_grid
+from jit_common import build_denoiser, resolve_arch, describe_arch, run_dir, legacy_run_dir, ema_state_dicts, ema_weights, generate_and_score, save_labeled_grid, save_layout_grids
 from fid import InceptionMetrics, load_ref_stats, precision_recall
 from repa import FrozenEncoder, Projector, MaskedTransformerAdapter, BlockCapture, repa_loss, mta_loss
 from masking import TokenMasker, flow_loss
@@ -65,7 +65,7 @@ data_workers = 16 # background reader threads filling pinned buffers ahead of tr
                   # datasets bigger than the page cache; 0 = read each batch on the main thread during the forward
 data_prefetch = 3 # batches read ahead
 # model: a JiT preset, optionally with any architecture field overridden (-1 keeps the preset's value)
-model = 'JiT-B/16' # JiT-B/16, JiT-B/32, JiT-L/16, JiT-L/32, JiT-H/16, JiT-H/32, or PixelDiT-B/16, -L/16, -XL/16 (model_pixeldit.py)
+model = 'JiT-B/16' # JiT-B/16, JiT-B/32, JiT-L/16, JiT-L/32, JiT-H/16, JiT-H/32, PixelDiT-B/16, -L/16, -XL/16 (model_pixeldit.py), or QuadJiT-B/8 (model_quadtree.py)
 depth = -1
 hidden_size = -1
 num_heads = -1
@@ -74,6 +74,20 @@ bottleneck_dim = -1 # width of the low-rank patch embedding
 in_context_len = -1 # number of in-context class tokens (0 disables them)
 in_context_start = -1 # block where the in-context tokens are prepended
 mlp_ratio = -1.0
+# QuadJiT (model_quadtree.py, research_proposal_fixed_budget_quadtree_patch_allocation.md): exactly quad_tokens multi-scale
+# patches per image (patch_size is the finest level; 3 levels = 32 / 16 / 8 px at 128px), placed by a router
+quad_tokens = 64 # K = N0 + 3m: 64 / 100 / 160 (at 128px: K=64 with the uniform router is uniform 16px patches, K=256 uniform 8px)
+quad_levels = 3
+quad_router = 'uniform' # 'dino' (frozen DINOv2 on the baseline's estimate), 'pixel' (its gradient energy), 'random', 'uniform'
+quad_route_baseline = '' # dino / pixel: checkpoint of a uniform JiT whose clean-image estimate is routed on (EMA1 weights)
+quad_route_dino = 'dinov2_vitb14_reg' # torch.hub DINOv2 model, run at one DINO patch per finest patch (224px at 128 / 8px)
+quad_route_t_min = 0.0 # > 0: below this t the layout is the neutral coarse-first one (uniform 16px at K=64) instead of routed
+quad_gate_tau = 1.0 # temperature of the PCA-1 foreground gate (on standardized projections)
+quad_pos = 'integrated' # absolute position: 'integrated' (footprint-integrated sin-cos) or 'center' (sin-cos at the centre)
+quad_rope = 'plain' # RoPE on the physical centres: 'plain', or 'integrated' (rotary pairs damped by sinc(w width / 2))
+quad_area_bias = True # proportional attention: + log(token area) on every key's logits
+quad_level_embed = True # learned level embedding
+quad_route_every = 1 # sampling only: re-route every N network calls (heun makes 2 per step); training always routes
 pixel_depth = -1 # PixelDiT: number of pixel-level (PiT) blocks
 pixel_dim = -1 # PixelDiT: per-pixel token width
 pixeldit_prediction = 'x' # PixelDiT: 'x' (this repo's x-prediction) or 'v' (the paper's velocity output)
@@ -237,10 +251,24 @@ if is_pixeldit: # the JiT-specific options don't exist in PixelDiT
     assert not bad, f'not available for PixelDiT: {bad}'
 else:
     assert pixel_depth < 0 and pixel_dim < 0 and pixeldit_prediction == 'x', 'pixel_depth / pixel_dim / pixeldit_prediction are PixelDiT options'
+is_quadtree = model.startswith('QuadJiT')
+if is_quadtree: # the quadtree model has the JiT backbone options it needs (attn_res, adaln_single, layernorm) and none of the input / output paths
+    jit_only = dict(attn_res_adaln=not attn_res_adaln, gated_bottleneck=not gated_bottleneck, skip_pathway=not skip_pathway, dcae_stem=not dcae_stem,
+                    dcae_head=not dcae_head, patch_overlap=patch_overlap == 0, head_overlap=head_overlap == 0, gate_init=gate_init == 'zero',
+                    in_context_len=in_context_len <= 0, masking=mask_ratio == 0, repa=not repa_encoder)
+    bad = [k for k, ok in jit_only.items() if not ok]
+    assert not bad, f'not available for QuadJiT: {bad}'
+    assert quad_router not in ('dino', 'pixel') or quad_route_baseline, f"quad_router={quad_router} needs --quad_route_baseline (a uniform JiT checkpoint)"
+else:
+    assert (quad_tokens, quad_levels, quad_router) == (64, 3, 'uniform') and not quad_route_baseline, 'quad_* options are QuadJiT options'
 model_name, arch = resolve_arch(model, **{k: (None if v < 0 else v) for k, v in dict(
     depth=depth, hidden_size=hidden_size, num_heads=num_heads, patch_size=patch_size, bottleneck_dim=bottleneck_dim,
     in_context_len=in_context_len, in_context_start=in_context_start, mlp_ratio=mlp_ratio, pixel_depth=pixel_depth, pixel_dim=pixel_dim).items()},
     prediction=pixeldit_prediction if is_pixeldit and pixeldit_prediction != 'x' else None,
+    **(dict(tokens=quad_tokens, levels=quad_levels, router=quad_router, route_baseline=quad_route_baseline or None,
+            route_dino=quad_route_dino if quad_router == 'dino' else None, route_t_min=quad_route_t_min or None,
+            route_gate_tau=quad_gate_tau if quad_router == 'dino' else None, pos_embed=quad_pos, rope=quad_rope,
+            area_bias=quad_area_bias, level_embed=quad_level_embed) if is_quadtree else {}),
     attn_res=None if attn_res == 'none' else attn_res,
     attn_res_block_size=attn_res_block_size if (attn_res == 'block' and attn_res_block_size > 0) else None,
     adaln_single=adaln_single or None, attn_res_adaln=attn_res_adaln or None, gated_bottleneck=gated_bottleneck or None,
@@ -343,8 +371,13 @@ assert sampling_method in ('heun', 'euler', 'ancestral'), f'unknown sampling_met
 denoiser.time_schedule = time_schedule
 summary(denoiser)
 print(describe_arch(model, arch))
-print(f"model {model_name}: {sum(p.numel() for p in denoiser.net.parameters()) / 1e6:.1f}M params, "
-      f"{(img_size // arch['patch_size']) ** 2} tokens of {arch['patch_size'] ** 2 * 3}-d patches")
+if is_quadtree:
+    denoiser.net.route_every = quad_route_every
+    print(f"model {model_name}: {sum(p.numel() for p in denoiser.net.parameters()) / 1e6:.1f}M params, {arch['tokens']} tokens of "
+          f"{' / '.join(str(p) for p in denoiser.net.geo.patches)}px patches, router {arch.get('router', 'uniform')}")
+else:
+    print(f"model {model_name}: {sum(p.numel() for p in denoiser.net.parameters()) / 1e6:.1f}M params, "
+          f"{(img_size // arch['patch_size']) ** 2} tokens of {arch['patch_size'] ** 2 * 3}-d patches")
 with open(os.path.join(out_dir, 'config.json'), 'w') as f:
     json.dump({**config, 'resolved': {'data_dir': data_dir, 'out_dir': out_dir, 'model_name': model_name, 'arch': arch, 'noise_scale': noise_scale,
                                        'effective_batch_size': effective_batch_size, 'lr': lr, 'max_iters': max_iters,
@@ -538,7 +571,7 @@ if diag:
     assert all(1 <= b <= n_blocks for b in probe_blocks), f'diag_probe_blocks {probe_blocks} outside 1..{n_blocks}'
     probe_ts = [float(t) for t in diag_probe_ts.split(',')]
     window_tiles = [k for k in (int(v) for v in diag_window_tiles.split(',') if v) if k < grid]
-    if is_pixeldit: # the windowed-attention ablation (and attention stats) reimplement JiT's forward
+    if is_pixeldit or is_quadtree: # the windowed-attention ablation (and attention stats) reimplement JiT's forward
         window_tiles = []
     probe_train_x, probe_train_y = data.get(spaced(len(data), diag_probe_train_images))
     probe_val_x, probe_val_y = val_data.get(spaced(len(val_data), diag_probe_val_images))
@@ -608,6 +641,9 @@ def evaluate(step):
             # 9. error along the sampler's own trajectory from held-out images noised to t0 (same sampler as the FID)
             trajectory = diag_lib.trajectory_pass(denoiser, *diag_val, trajectory_t0s, noise_scale, ctx, band_masks,
                                                   diag_trajectory_images, chunk=gen_batch_size) if trajectory_t0s else None
+            # quadtree: layouts along the model's own sampling trajectories (stability), seams and detail per level in samples
+            quad_sampling = diag_lib.sampling_layout_stats(denoiser, torch.linspace(0, num_classes - 1, 64).long().to(device),
+                                                           diag_val[0], noise_scale, ctx) if is_quadtree else None
             denoiser.train()
             probes = diag_lib.run_probes(tr, probe_train_y, va, probe_val_y, num_classes)
     log['val/fid'], log['val/is'] = out['fid'], out['is']
@@ -642,6 +678,8 @@ def evaluate(step):
     # skip pathway: the trunk-only prediction on the same held-out images and noise (what the trunk is trained on; never sampled)
     has_skip = getattr(denoiser.net, 'skip_pathway', False)
     trunk_pass = diag_lib.noise_level_pass(denoiser.net, *diag_val, diag_ts, noise_scale, t_eps, ctx, band_masks, skip_on=False) if has_skip else None
+    # quadtree: area per patch level, per noise level, with the router the model trains with
+    layout = diag_lib.layout_stats(denoiser.net, *diag_val, diag_ts, noise_scale, ctx) if is_quadtree else None
     # 8. input sensitivity of the sampled prediction (and of the trunk-only one, for comparison on the same z)
     sensitivity = {}
     if diag_sensitivity_images > 0:
@@ -659,6 +697,12 @@ def evaluate(step):
         if trunk_pass is not None:
             log[f'noise_loss_trunk/val_t{tl}'] = trunk_pass['v_loss'][i].item()
             log[f'noise_xmse_trunk/val_t{tl}'] = trunk_pass['x_mse'][i].item()
+        if layout is not None:
+            for l, p_ in enumerate(denoiser.net.geo.patches):
+                log[f'layout/area_p{p_}_t{tl}'] = layout['area'][i, l].item()
+                log[f'layout/xmse_p{p_}_t{tl}'] = layout['x_mse'][i, l].item()
+            if not math.isnan(layout['clean_agreement'][i].item()):
+                log[f'layout/clean_agree_t{tl}'] = layout['clean_agreement'][i].item()
         for head, sens in sensitivity.items():
             prefix = 'sensitivity' if head == 'sampled' else 'sensitivity_trunk'
             for k in ('copy', 'gain', 'tweedie'):
@@ -698,6 +742,16 @@ def evaluate(step):
         # (> 1 = the model loses detail it was given)
         log[f'freq_vs_copy/{bl}'] = (pv['freq_rel_err'][-1, k] / pv['freq_rel_err_copy'][-1, k]).item()
         log[f'freq_vs_wiener/{bl}'] = (pv['freq_rel_err'][-1, k] / pv['freq_rel_err_wiener'][-1, k]).item()
+    if quad_sampling is not None: # stability of the layout along sampling, seams, detail per level vs real images
+        qs = quad_sampling
+        for t_pick in (0.25, 0.5, 0.75, 0.9):
+            i = int((qs['t'] - t_pick).abs().argmin())
+            log[f'layout/agree_final_t{t_pick:g}'] = qs['agree_final'][i].item()
+        log['layout/agree_prev_mean'] = qs['agree_prev'][1:].mean().item() if len(qs['agree_prev']) > 1 else float('nan')
+        for k in ('settle_t', 'seam', 'seam_cross', 'seam_real', 'seam_cross_real'):
+            log[f'layout/{k}'] = qs[k].item()
+        for l, p_ in enumerate(denoiser.net.geo.patches):
+            log[f'layout/hf_ratio_p{p_}'] = qs['hf_ratio'][l].item()
     if trajectory is not None: # per t0 and band: sampled-from-t0 error / one-step error (1 = the sampler adds nothing), final spectrum
         for i, t0 in enumerate(trajectory_t0s):
             for k, bl in enumerate(band_labels):
@@ -725,7 +779,10 @@ def evaluate(step):
                    'window_loss_increase': {f'tile{k}': v.tolist() for k, v in window_increase.items()},
                    'trunk_pass': {k: trunk_pass[k].tolist() for k in ('v_loss', 'x_mse', 'freq_rel_err')} if trunk_pass is not None else None,
                    'sensitivity': {head: {k: v.tolist() for k, v in sens.items()} for head, sens in sensitivity.items()},
-                   'trajectory': dict({k: v.tolist() for k, v in trajectory.items()}, t0=trajectory_t0s) if trajectory is not None else None})
+                   'trajectory': dict({k: v.tolist() for k, v in trajectory.items()}, t0=trajectory_t0s) if trajectory is not None else None,
+                   'layout': dict({k: v.tolist() for k, v in layout.items()}, patches=denoiser.net.geo.patches,
+                                  sampling={k: v.tolist() for k, v in quad_sampling.items()} if quad_sampling is not None else None)
+                             if layout is not None else None})
     with open(os.path.join(d, f'diag_{step}.json'), 'w') as f:
         json.dump(record, f)
     log['diag_minutes'] = (time.time() - t_start) / 60
@@ -745,11 +802,16 @@ def save_samples(step):
         for cfg, interval, suffix in settings:
             denoiser.cfg_scale, denoiser.cfg_interval = cfg, interval
             denoiser.steps, denoiser.method, denoiser.eta = num_sampling_steps, sampling_method, sampling_eta
+            if is_quadtree: # record the layouts, for the boundary overlays
+                denoiser.net.record_layouts(True)
             with torch.random.fork_rng(devices=[device] if device_type == 'cuda' else []):
                 torch.manual_seed(0)
                 with ctx:
                     x = denoiser.generate(labels)
             save_labeled_grid(x, names, os.path.join(samples_dir, f'samples_{step}{suffix}.png'))
+            if is_quadtree:
+                save_layout_grids(denoiser.net, x, names, os.path.join(samples_dir, f'samples_{step}{suffix}'), denoiser.net.router.history)
+                denoiser.net.record_layouts(False)
         denoiser.train()
 
 def save_checkpoint():

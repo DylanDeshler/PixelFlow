@@ -21,7 +21,9 @@ Figures:
     sensitivity.png         how strongly the prediction follows its noisy input per noise level (copy / gain / Tweedie ratio),
                             sampled head over training and, for skip_pathway runs, the trunk-only head
     gated_bottleneck.png    how far the gated full-rank patch path is open, per noise level (gated_bottleneck runs only)
+    layout.png              QuadJiT: area per patch size, router fidelity, error per size, seams, detail per size, layout stability
     compare.png / .csv      key curves and latest values across runs
+    budget.png              FID at matched images vs tokens per image and vs estimated training compute (quadtree study)
 """
 
 import os
@@ -334,6 +336,95 @@ def fig_sensitivity(run, out):
     fig.tight_layout(rect=(0, 0, 1, 0.92))
     return save(fig, os.path.join(out, 'sensitivity.png'))
 
+def _plain_ticks(ax, axis='x', ticks=None, n=5):
+    # plain number labels (no 10^k notation), at most n major ticks or the given ones, no minor labels
+    from matplotlib.ticker import FuncFormatter, NullFormatter, MaxNLocator, FixedLocator, LogLocator
+    a = ax.xaxis if axis == 'x' else ax.yaxis
+    log = (ax.get_xscale() if axis == 'x' else ax.get_yscale()) == 'log'
+    a.set_major_locator(FixedLocator(ticks) if ticks is not None else LogLocator(subs=(1, 2, 5)) if log else MaxNLocator(n))
+    a.set_major_formatter(FuncFormatter(lambda v, _: f'{v:.3g}'))
+    a.set_minor_formatter(NullFormatter())
+
+def _logit_t_axis(ax):
+    from matplotlib.ticker import NullLocator
+    ax.set_xscale('logit')
+    ticks = [0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95]
+    ax.set_xticks(ticks, [f'{v:g}' for v in ticks])
+    ax.xaxis.set_minor_locator(NullLocator())
+    ax.tick_params(colors=INK_2, labelsize=8)
+
+def fig_layout(run, out):
+    # QuadJiT (model_quadtree.py): how the router spends the token budget and what it costs or buys, per noise level
+    # (latest eval) and over training
+    diags = [d for d in run['diags'] if d.get('layout')]
+    if not diags:
+        return None
+    plt = setup()
+    lay, ts = diags[-1]['layout'], diags[-1]['t']
+    patches = lay['patches']
+    colors = CATEGORICAL[:len(patches)] # level colours, coarsest first (as LEVEL_COLORS on the sample overlays)
+    sub = dict(run, diags=diags, x=np.array([run['scale'](d['iter']) for d in diags]))
+    fig, axes = plt.subplots(2, 3, figsize=(16, 9), facecolor=SURFACE)
+    ax = axes[0, 0]
+    area = np.array(lay['area'])
+    for l, p in enumerate(patches):
+        line(ax, ts, area[:, l], colors[l], MARKERS[l], f'{p}px')
+    style_axis(ax, 't (1 = clean, logit scale)', 'fraction of the image', f"area per patch size (iter {diags[-1]['iter']:,})")
+    _logit_t_axis(ax)
+    ax.legend(frameon=False, fontsize=8, labelcolor=INK_2)
+    ax = axes[0, 1]
+    if any(np.isfinite(np.array(d['layout']['clean_agreement'], dtype=float)).any() for d in diags):
+        picks = sorted({0, len(diags) // 2, len(diags) - 1})
+        for color, i in zip(ordinal_blues(len(picks)), picks):
+            line(ax, ts, np.array(diags[i]['layout']['clean_agreement'], dtype=float), color, label=f"iter {diags[i]['iter']:,}")
+        style_axis(ax, 't (1 = clean, logit scale)', 'fraction of area at the same level', 'router fidelity: layout from the estimate vs from the clean image')
+        _logit_t_axis(ax)
+        ax.set_ylim(0, 1)
+        ax.legend(frameon=False, fontsize=8, labelcolor=INK_2)
+    else:
+        note(ax, 'router fidelity: needs a router that scores images (dino / pixel)')
+    ax = axes[0, 2]
+    xm = np.array(lay['x_mse'], dtype=float)
+    for l, p in enumerate(patches):
+        line(ax, ts, xm[:, l], colors[l], MARKERS[l], f'{p}px')
+    style_axis(ax, 't (1 = clean, logit scale)', 'held-out clean-image MSE', 'error of the pixels each patch size covers')
+    _logit_t_axis(ax)
+    ax.set_yscale('log')
+    _plain_ticks(ax, 'y')
+    ax.legend(frameon=False, fontsize=8, labelcolor=INK_2)
+    samp = [d['layout'].get('sampling') for d in diags]
+    if any(samp):
+        xs = np.array([x for x, s_ in zip(sub['x'], samp) if s_])
+        S = [s_ for s_ in samp if s_]
+        ax = axes[1, 0]
+        line(ax, xs, [s_['seam'] for s_ in S], BLUE, 'o', 'samples, all boundaries')
+        line(ax, xs, [s_['seam_real'] for s_ in S], BLUE, 's', 'real images, all boundaries')
+        line(ax, xs, [s_['seam_cross'] for s_ in S], ORANGE, 'o', 'samples, between sizes')
+        line(ax, xs, [s_['seam_cross_real'] for s_ in S], ORANGE, 's', 'real images, between sizes')
+        style_axis(ax, run['xlabel'], '|difference| across / inside tokens', 'seams: neighbour difference across token boundaries')
+        ax.legend(frameon=False, fontsize=8, labelcolor=INK_2)
+        ax = axes[1, 1]
+        hf = np.array([s_['hf_ratio'] for s_ in S], dtype=float)
+        for l, p in enumerate(patches):
+            line(ax, xs, hf[:, l], colors[l], MARKERS[l], f'{p}px regions')
+        ax.axhline(1.0, color=INK_2, linewidth=1, linestyle=':')
+        style_axis(ax, run['xlabel'], 'samples / real images', 'high-frequency energy in each patch size\'s regions')
+        ax.legend(frameon=False, fontsize=8, labelcolor=INK_2)
+        ax = axes[1, 2]
+        line(ax, xs, [s_['settle_t'] for s_ in S], BLUE, 'o', 'layout settled (>= 90% agreement with the final one from here on)')
+        line(ax, xs, [np.nanmean(np.array(s_['agree_prev'], dtype=float)) for s_ in S], ORANGE, 's', 'mean agreement with the previous routing call')
+        style_axis(ax, run['xlabel'], 't / fraction of area', 'layout stability along sampling')
+        ax.set_ylim(0, 1.02)
+        ax.legend(frameon=False, fontsize=8, labelcolor=INK_2)
+        for ax in axes[1]:
+            _plain_ticks(ax, 'x')
+    else:
+        for ax in axes[1]:
+            note(ax, 'sampling statistics appear from the first eval with diagnostics')
+    fig.suptitle(f"{run['name']}: quadtree token allocation", color=INK, fontsize=11, x=0.01, ha='left')
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    return save(fig, os.path.join(out, 'layout.png'))
+
 def fig_semantics_locality(run, out):
     plt = setup()
     fig, axes = plt.subplots(2, 2, figsize=(12, 8), facecolor=SURFACE)
@@ -427,7 +518,69 @@ def fig_optimization(run, out):
 # -----------------------------------------------------------------------------
 # comparison across runs
 
+ROUTER_ORDER = ['jit', 'uniform', 'random', 'pixel', 'dino'] # fixed colour slots (CATEGORICAL order), never by rank
+
+def run_budget(run):
+    """
+    (tokens, training GFLOPs per image, router) of a run from its config: backbone forward 2 x (12 D^2 per token per block
+    for the attention / MLP matrices) plus 4 K^2 D per block for the attention products, times 3 for forward + backward;
+    plus a forward of the router's models per image (the frozen JiT-B/16 baseline at 64 tokens, DINOv2-B at 261 tokens).
+    Patch embeddings, heads and norms are left out (small at these widths).
+    """
+    res = run['config'].get('resolved') or {}
+    arch, ds = res.get('arch'), str(run['config'].get('dataset', ''))
+    img = int(ds.rsplit('_', 1)[-1]) if ds.rsplit('_', 1)[-1].isdigit() else 128 # e.g. in1k_128
+    if not arch:
+        return None
+    D, depth = arch.get('hidden_size', 768), arch.get('depth', 12)
+    fwd = lambda K, D=D, depth=depth: depth * (24 * D ** 2 * K + 4 * K ** 2 * D) / 1e9
+    if arch.get('family') == 'quadtree':
+        K, router = arch['tokens'], arch.get('router', 'uniform')
+        extra = {'dino': fwd(64, 768, 12) + fwd(261, 768, 12), 'pixel': fwd(64, 768, 12)}.get(router, 0.0)
+    else:
+        K, router, extra = (img // arch.get('patch_size', 16)) ** 2, 'jit', 0.0
+    return K, 3 * fwd(K) + extra, router
+
+def fig_budget(runs, out):
+    # FID at matched training images vs the token budget and vs training compute per image (fixed-budget quadtree study)
+    pts = []
+    for r in runs:
+        b = run_budget(r)
+        fid = scalar(r, 'val/fid')
+        if b is None or not has(fid):
+            continue
+        pts.append((r, b, fid))
+    if len(pts) < 2:
+        return None
+    common = min(r['x'][np.isfinite(f)][-1] for r, _, f in pts) # largest images seen every run has reached
+    plt = setup()
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5), facecolor=SURFACE)
+    seen = set()
+    for r, (K, gflops, router), fid in pts:
+        at = np.where((r['x'] <= common + 1e-9) & np.isfinite(fid))[0]
+        if not len(at): # its first eval comes after the point every run has reached
+            print(f"budget.png: {r['name']} has no eval at or before {common:.3g}, left out")
+            continue
+        i = int(at[-1])
+        c = CATEGORICAL[ROUTER_ORDER.index(router) % len(CATEGORICAL)]
+        for ax, xv in zip(axes, (K, gflops)):
+            ax.plot([xv], [fid[i]], MARKERS[ROUTER_ORDER.index(router) % len(MARKERS)], color=c, markersize=9, markeredgecolor=SURFACE,
+                    markeredgewidth=1.5, label=router if router not in seen and ax is axes[0] else None)
+            ax.annotate(f'{router} K={K}', (xv, fid[i]), xytext=(6, 4), textcoords='offset points', color=INK_2, fontsize=8)
+        seen.add(router)
+    style_axis(axes[0], 'tokens per image (K)', f"FID-10k at {common:.3g}{'M images' if runs[0]['xlabel'].startswith('images') else ' iters'}", 'FID vs token budget')
+    style_axis(axes[1], 'training GFLOPs per image (backbone x3 + router forward, estimated)', 'FID-10k', 'FID vs training compute')
+    for ax in axes:
+        ax.set_xscale('log')
+    _plain_ticks(axes[0], 'x', ticks=sorted({b[0] for _, b, _ in pts}))
+    _plain_ticks(axes[1], 'x')
+    axes[0].legend(frameon=False, fontsize=8, labelcolor=INK_2, title='router', title_fontsize=8)
+    fig.suptitle('fixed-budget comparison at matched training images', color=INK, fontsize=11, x=0.01, ha='left')
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    return save(fig, os.path.join(out, 'budget.png'))
+
 def compare(runs, out):
+    fig_budget(runs, out)
     plt = setup()
     metrics = [
         ('FID-10k (EMA, CFG 1)', lambda r: scalar(r, 'val/fid'), True),
@@ -484,7 +637,7 @@ def make_run_figures(run_dir):
     for name, fn in (('convergence', fig_convergence), ('noise_levels', fig_noise_levels), ('detail', fig_detail),
                      ('semantics_locality', fig_semantics_locality), ('optimization', fig_optimization),
                      ('attn_res', fig_attn_res), ('gated_bottleneck', fig_gated_bottleneck), ('skip_pathway', fig_skip_pathway),
-                     ('sensitivity', fig_sensitivity)):
+                     ('sensitivity', fig_sensitivity), ('layout', fig_layout)):
         path = fn(run, out)
         if path:
             figures[name] = path

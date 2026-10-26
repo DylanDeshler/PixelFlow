@@ -94,6 +94,7 @@ Paths are derived, not configured per run:
 export JIT_DATA_ROOT=/data
 python train_jit.py config/jit_in100_128.py                                   # runs/in100_128/jit-b16/base
 python train_jit.py config/jit_in100_128.py config/model_jit_s16.py           # runs/in100_128/jit-b16_w384_h6/base
+python train_jit.py config/jit_in1k_128.py config/model_jit_b8.py             # 8px patches (--patch_size=8): runs/in1k_128/jit-b16_p8_icl0/base
 python train_jit.py config/jit_in100_128.py --model=JiT-L/16 --depth=16 --batch_size=128   # runs/in100_128/jit-l16_d16/base
 python train_jit.py config/jit_in100_128.py --noise_scale=0.75                # runs/in100_128/jit-b16/noise0.75
 ```
@@ -316,6 +317,87 @@ pre-norms, QK-norm in attention, the final layer, the AttnRes key norms and the 
 is a separate module and keeps its own. Computed in fp32 and returned in the input's dtype like JiT's RMSNorm, so
 activations stay bf16 under autocast. AttnRes scores with LayerNorm keys subtract each source's mean:
 `(v . u - mean(v) sum(u)) / std(v)`. The key norm's bias adds the same constant to every source's score, so it cancels.
+
+## Fixed-budget quadtree tokenization (QuadJiT)
+
+`model_quadtree.py` implements `research_proposal_fixed_budget_quadtree_patch_allocation.md`. It's a separate model that
+copies what it changes from JiT, so the baseline can't be affected. Every image is tokenized into exactly
+`--quad_tokens` patches drawn from 3 levels (32 / 16 / 8 px at 128px; K = 16 + 3m), placed by a router, and the JiT-B
+backbone runs on those K tokens. The backbone has the best config's options (`--attn_res`, `--adaln_single`) and no skip
+pathway.
+
+How the pieces work:
+- **Embedding:** each level has its own bottleneck patch embedding and final layer. Every candidate patch is embedded,
+  each image gathers its own K tokens, and each token's output patch is scattered back onto the canvas. Shapes are
+  static, so whole-model compile works.
+- **Positions** (proposal Section 3.1):
+  - RoPE on the physical patch centres;
+  - footprint-integrated sin-cos as the absolute embedding (a parent's embedding is the mean of its children's);
+  - a learned level embedding;
+  - proportional attention: +log(area) on every key's logits.
+- **Routing** runs under no_grad and outside the compiled graph, every training step and every sampling call.
+  - `--quad_router=dino`: frozen DINOv2 (`--quad_route_dino`, at one 14px DINO patch per 8px patch, so 224px) on a
+    frozen baseline's clean-image estimate. The score is the angular divergence of each patch's four quadrant features
+    times a PCA-1 foreground gate, standardized per level, allocated by hierarchical greedy.
+  - `pixel`: gradient energy of the same estimate.
+  - `random`: a pseudo-random function of the input, so the two halves of a CFG batch share a layout.
+  - `uniform`: coarse-first. K=64 is uniform 16px patches and K=256 uniform 8px, so the uniform baselines run on exactly
+    the same code path.
+  - The baseline (`--quad_route_baseline`) must be a fixed checkpoint (its EMA1 weights are used). Copy the in1k_128
+    run's `ckpt.pt`, or use a milestone `ckpt_{iter}.pt`; a `ckpt.pt` that is still being written changes under you.
+  - It predicts with the null label, so both halves of a CFG batch get one layout.
+- **The router is not part of the model's parameters.** It isn't trained, EMA'd or saved, and it's rebuilt from the
+  architecture fields when a checkpoint loads. `eval_jit.py`, `diagnose_ckpt.py` and `eval_linear.py` work unchanged.
+  DINOv2 comes from torch.hub, so the first run needs internet access or a populated `~/.cache/torch/hub`.
+- **Cost:** the dino router adds a baseline forward and a DINOv2-B forward per step, roughly +50% on a JiT-B/16 step at
+  batch 1024.
+- **Diagnostics,** every eval (`layout/*`, and `trends/layout.png` from `plot_trends.py`):
+  - **Area per patch size,** per noise level.
+  - **Router fidelity** (`clean_agree_t*`): the fraction of the image tokenized at the same size as when the router's
+    scorer is applied to the clean image (dino / pixel routers). It shows how much routing survives noise and sets
+    `--quad_route_t_min` from data.
+  - **Error by patch size** (`xmse_p*_t*`): held-out clean-image error of the pixels each size covers. Do fine tokens
+    lower the error where they're placed, and what does a coarse region cost?
+  - **From 64 fixed-seed samples:**
+    - layout stability along sampling (`agree_final_t*`, `agree_prev_mean`, `settle_t`: the t from which the layout
+      stays within 90% of its final form), which sets `--quad_route_every`;
+    - seams (`seam`, `seam_cross`): neighbour differences across token boundaries / inside tokens, next to the same ratio
+      on real held-out images with the router's near-clean layouts (`seam_real`, `seam_cross_real`);
+    - detail per patch size (`hf_ratio_p*`): high-frequency energy of the samples / real images in the regions each size
+      covers. Below 1 under 32px tokens is the texture-blur risk.
+- **Sample grids:** each grid is also saved with token boundaries drawn on (`samples_{step}_layout.png`), and with the
+  layouts at t ≈ 0.25 / 0.5 / 0.75 / last for 8 samples (`_layout_steps.png`). `eval_jit.py` does the same for its
+  final grid. Boundaries are coloured by the finer of the two tokens they separate: 32px blue, 16px orange, 8px green.
+- **Comparing runs:** `plot_trends.py` with several runs adds `budget.png`, FID at matched training images vs tokens per
+  image and vs estimated training GFLOPs per image (router included).
+- **The router by eye, before any training:** `viz_quadtree_router.py`.
+  - **On clean held-out images:** DINOv2's PCA-1 foreground projection and gate, plus every router's layouts at every
+    budget.
+  - **With `--baseline`:** the layout routed on the baseline's estimate from noised images, next to the clean-image
+    layout, with the agreement per t.
+
+```bash
+python viz_quadtree_router.py --data_dir=/data/in1k_128                                      # -> in1k_128_quadtree_router.png
+python viz_quadtree_router.py --data_dir=/data/in1k_128 --baseline=$BASE --ts=0.3,0.5,0.7,0.9  # + _noisy.png
+```
+
+```bash
+B="config/jit_in1k_128.py config/model_quadjit_b8.py --optimizer_type=muon --attn_res=full --adaln_single=True --keep_ckpt_every_epochs=10"
+BASE=runs/in1k_128/jit-b16_icl0/<best run>/ckpt_<iter>.pt                     # frozen router baseline
+python train_jit.py $B --quad_router=uniform                                   # floor: uniform 16px, K=64
+python train_jit.py $B --quad_router=uniform --quad_tokens=256                 # ceiling: uniform 8px (or --batch_size=512 --gradient_accumulation_steps=2)
+python train_jit.py $B --quad_router=random                                    # mixed-scale machinery, does routing matter
+python train_jit.py $B --quad_router=dino --quad_route_baseline=$BASE          # the method, K=64
+python train_jit.py $B --quad_router=dino --quad_route_baseline=$BASE --quad_tokens=100   # budgets: also 160
+python train_jit.py $B --quad_router=dino --quad_route_baseline=$BASE --quad_route_t_min=0.5   # uniform 16px below t=0.5
+python train_jit.py $B --quad_router=pixel --quad_route_baseline=$BASE         # non-semantic routing (optional)
+python train_jit.py $B --quad_router=dino --quad_route_baseline=$BASE --quad_rope=integrated   # ablations: --quad_pos=center,
+                                                                               # --quad_area_bias=False, --quad_level_embed=False
+python eval_jit.py --ckpt=runs/in1k_128/quadjit-b8/<run> --data_dir=/data/in1k_128 --quad_route_every=4   # re-route every 4 calls
+```
+
+`config/model_jit_b8.py` (plain JiT with 8px patches) remains as a cross-check of the K=256 ceiling, using JiT's own
+position embedding.
 
 ## PixelDiT baseline
 
