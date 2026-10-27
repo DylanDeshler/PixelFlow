@@ -444,6 +444,12 @@ python analyze_patch_sizes.py --ckpts=$P --data_dir=/data/in1k_128              
 python analyze_patch_sizes.py --ckpts=$P --data_dir=/data/in1k_128 --routers=loss,dino,random --tokens=64,100 --attr_routers=loss   # cheaper
 ```
 
+`plot_patch_sizes.py --json_path=in1k_128_patch_sizes.json` plots the main results to `in1k_128_patch_sizes_main.png`, in
+three panels:
+- FID vs tokens per router: measured points, with quadratic fits in log2 K over K = 64–256;
+- the drop-in view: FID change vs uniform at the same K;
+- the compute view: tokens saved vs uniform at the same FID.
+
 ## PixelDiT baseline
 
 `--model=PixelDiT-B/16` (also `-L/16`, `-XL/16`) trains PixelDiT (Yu et al. 2025, arXiv 2511.20645), implemented in

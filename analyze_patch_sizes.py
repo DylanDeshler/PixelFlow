@@ -23,6 +23,8 @@ Parts (every generation uses the same seed, so the same noise and labels: sample
                  X_exact  router X's scores with the exact allocation (allocate_exact) instead of the greedy: the
                           layout maximizing the summed scores, where the greedy never splits a node with a small gain to
                           reach large gains among its children. loss_exact: the loss router's own objective, optimized.
+                 X_2level router X on two levels only (16 / 8 px at 128px): the coarsest level is never used, layouts
+                          split the uniform 16px layout (K >= 64); no 32px model. uniform_2level = uniform.
                Flicker: the fraction of the image whose patch size changes from one layout to the next within a
                trajectory (every re-route), from the sample pass.
                "gap closed" = (FID_16 - FID) / (FID_16 - FID_8): the share of the 16px -> 8px improvement reached.
@@ -161,6 +163,23 @@ for K in budgets + [attr_tokens]:
     geo.check_budget(K)
 router_list = [r for r in routers.split(',') if r]
 attr_list = [r for r in attr_routers.split(',') if r]
+ROUTERS = ('loss', 'dino', 'pixel', 'disagree', 'random', 'uniform', 'oracle') # each also as X_exact, X_2level, X_exact_2level
+for r in router_list + attr_list + (recon_routers.split(',') if recon else []):
+    name = r.removesuffix('_2level').removesuffix('_exact')
+    assert name in ROUTERS and (name != 'oracle' or r in recon_routers.split(',')), \
+        f"unknown router '{r}': one of {ROUTERS} (oracle: --recon only), optionally + _exact, then + _2level"
+# one run per output: two processes resuming the same files would each overwrite the other's results
+lock = out + '.lock'
+if os.path.exists(lock):
+    try:
+        os.kill(int(open(lock).read()), 0)
+        sys.exit(f'another analysis (PID {open(lock).read().strip()}) is writing {out}.*: wait for it, or pass another --out')
+    except (OSError, ValueError):
+        pass # stale lock from a run that died
+with open(lock, 'w') as fh:
+    fh.write(str(os.getpid()))
+import atexit
+atexit.register(lambda: os.path.exists(lock) and os.remove(lock))
 edges = [float(v) for v in attr_t.split(',')]
 windows = list(zip(edges[:-1], edges[1:]))
 router = QuadRouter(geo, geo.n0, 'uniform', gate_tau=gate_tau, num_classes=num_classes, img=img)
@@ -181,7 +200,7 @@ if os.path.exists(out + '.json'):
     with open(out + '.json') as fh:
         prev = json.load(fh)
     if all(prev.get('config', {}).get(k) == config[k] for k in FID_KEYS):
-        for part in ('fid', 'recon', 'seams', 'flicker'):
+        for part in ('fid', 'recon', 'seams', 'flicker', 'regions'):
             results[part] = prev.get(part, {})
         if os.path.exists(out + '_samples.npz'):
             samples = dict(np.load(out + '_samples.npz'))
@@ -319,12 +338,22 @@ def allocate_exact(scores, K):
     leaves = in_tree & ~split
     return torch.arange(geo.n, device=dev).expand(B, -1)[leaves].view(B, K)
 
-def layout_of(scores, K, exact=False):
+def layout_of(scores, K, exact=False, two=False):
+    # two: never the coarsest level (its patches always split first: layouts from the uniform middle level, K >= its count)
+    if two:
+        assert K >= geo.counts[1], f'two-level layouts need K >= {geo.counts[1]}'
+        # larger than any combination of the other scores, so every coarsest patch splits; per image and no larger, so
+        # float32 keeps the other scores' precision in the exact allocation's sums
+        scores = scores.float().clone()
+        scores[:, :geo.n0] = 2 * scores.abs().sum(1, keepdim=True) + 1
     return allocate_exact(scores, K) if exact else allocate(scores, K, geo, router.children, router.parent)
 
 def base_router(name):
-    # 'loss_exact' -> ('loss', True)
-    return (name[:-len('_exact')], True) if name.endswith('_exact') else (name, False)
+    # 'loss_exact_2level' -> ('loss', True, True): scores, exact allocation, two levels only (never the coarsest)
+    two = name.endswith('_2level')
+    name = name.removesuffix('_2level')
+    exact = name.endswith('_exact')
+    return name.removesuffix('_exact'), exact, two
 
 def stitched_error(layout, E):
     # a layout's error: every finest cell's error from the model at its token's size [B]
@@ -350,13 +379,15 @@ class StitchedNet(nn.Module):
     def __init__(self, mode, K, window=(0.0, 1.0), render=None):
         super().__init__()
         self.mode, self.K, self.window, self.render = mode, K, window, render or {}
-        self.base, self.exact = base_router(mode)
+        self.base, self.exact, self.two = base_router(mode)
         self.x_true, self.cache, self.calls, self.prev = None, None, 0, None
         self.log = [] # (t, area [L], flicker or None) per call
         # the models this configuration can use, known up front (the levels a layout can contain, after render)
         levels = set(range(geo.L))
         if self.base == 'uniform': # one fixed layout
             levels = set(geo.level[allocate(router.neutral[None].cpu(), K, geo, geo.children, geo.parent)[0]].tolist())
+        if self.two:
+            levels.discard(0)
         self.used = sorted({self.render.get(l, l) for l in levels})
 
     def begin_sampling(self): # called by the sampler at the start of every trajectory
@@ -388,11 +419,13 @@ class StitchedNet(nn.Module):
             return nets[1](z, t, y)
         preds = [None] * geo.L
         if self.base in ('loss', 'disagree', 'oracle'):
-            with ctx:
-                preds = [net(z, t, y).float() for net in nets]
+            with ctx: # two levels: the coarsest model is never used, and its candidates always split (any gain will do)
+                preds = [None if (self.two and l == 0) else net(z, t, y).float() for l, net in enumerate(nets)]
+            if self.two:
+                preds[0] = preds[1]
         flick = None
         if self.cache is None or self.cache.shape[0] != B or self.calls % route_every == 0:
-            layout = layout_of(router_scores(self.base, z, t, preds=preds, x_true=self.x_true), self.K, self.exact)
+            layout = layout_of(router_scores(self.base, z, t, preds=preds, x_true=self.x_true), self.K, self.exact, self.two)
             if self.prev is not None and self.prev.shape == layout.shape: # flicker: area re-tokenized since the last layout
                 flick = 1 - layout_agreement(self.prev, layout, geo).mean()
             self.cache = self.prev = layout
@@ -440,7 +473,7 @@ from plot_style import SURFACE, INK, INK_2, CATEGORICAL, MARKERS, style_axis, li
 
 ORDER = ['uniform', 'random', 'pixel', 'dino', 'loss', 'disagree', 'dino_gate', 'dino_div', 'centre', 'loss_exact'] # fixed slots
 COLORS = dict(zip(ORDER, CATEGORICAL[:6] + ['#f3c45e', '#a87200', INK_2, '#a8336b'])) # dino's terms: lighter / darker dino; exact: darker
-color = lambda name: COLORS.get(name, INK_2)
+color = lambda name: COLORS.get(name.removesuffix('_2level'), INK_2) # a 2-level variant: its router's colour
 marker = lambda name: MARKERS[ORDER.index(name) % len(MARKERS)] if name in ORDER else 'o'
 fid_of = lambda k: results['fid'][k]['fid'] if k in results['fid'] else float('nan')
 legend_levels = lambda fig, title: fig.legend(handles=[Patch(color=LEVEL_COLORS[l], label=f'{p}px') for l, p in enumerate(patches)],
@@ -608,7 +641,10 @@ def run(key, net=None, level=None):
     return r
 
 def stitched_key(r, K):
-    # a uniform layout of one level is that level's model alone
+    # a uniform layout of one level is that level's model alone; uniform_2level is uniform (coarse-first never uses the
+    # coarsest level at K >= its children's count)
+    if r == 'uniform_2level':
+        r = 'uniform'
     return f'uniform_{patches[LEVEL_TOKENS[K]]}px' if r == 'uniform' and K in LEVEL_TOKENS else f'{r}_K{K}'
 
 print(f"models: {', '.join(f'{p}px' for p in patches)} at {img}px | FID-{num_images / 1000:g}k, {sampling_method} "
@@ -617,7 +653,9 @@ for l in range(geo.L):
     run(f'uniform_{patches[l]}px', level=l)
 for K in budgets:
     for r in router_list:
-        if not (r == 'uniform' and K in LEVEL_TOKENS): # that level's model alone: an anchor
+        if r.endswith('_2level') and K <= geo.counts[1]: # below: impossible; at: the middle model alone (an anchor)
+            continue
+        if not (stitched_key(r, K).startswith('uniform_') and stitched_key(r, K).endswith('px')): # a model alone: an anchor
             run(stitched_key(r, K), StitchedNet(r, K))
 for r in attr_list:
     if not (r == 'uniform' and attr_tokens in LEVEL_TOKENS):
@@ -685,7 +723,7 @@ if regions:
             for K in budgets: # error removed vs the coarse-first uniform layout at the same K (measured against x)
                 e_uni = stitched_error(layout_of(router.neutral.expand(len(x), -1), K), E)
                 for name in ('oracle', 'oracle_exact', 'loss', 'loss_exact'):
-                    b, ex = base_router(name)
+                    b, ex, _ = base_router(name)
                     alloc[(name, K)].append((e_uni - stitched_error(layout_of(gains if b == 'oracle' else h['loss'], K, ex), E)).cpu())
             allv = dict(h, gain=gains)
             for (a, b) in cross:
@@ -695,8 +733,10 @@ if regions:
                 viz['gains'] = gains[:n].cpu()
                 viz['loss-oracle'] = layout_of(gains, attr_tokens)[:n].cpu()
                 for r in router_list:
-                    b, ex = base_router(r)
-                    viz[r] = layout_of(router.neutral.expand(len(x), -1) if b == 'uniform' else h[b], attr_tokens, ex)[:n].cpu()
+                    b, ex, two = base_router(r)
+                    if two and attr_tokens < geo.counts[1]:
+                        continue
+                    viz[r] = layout_of(router.neutral.expand(len(x), -1) if b == 'uniform' else h[b], attr_tokens, ex, two)[:n].cpu()
         per_patch = lambda v, l: v / (n_images * geo.counts[l])
         results['regions'][f'{t_val:g}'] = {
             'gain_per_patch': {f'{patches[l]}->{patches[l + 1]}px': {b: per_patch(tot[b][l], l) for b in tot} for l in range(geo.L - 1)},
