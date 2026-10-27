@@ -25,6 +25,11 @@ Parts (every generation uses the same seed, so the same noise and labels: sample
                           reach large gains among its children. loss_exact: the loss router's own objective, optimized.
                  X_2level router X on two levels only (16 / 8 px at 128px): the coarsest level is never used, layouts
                           split the uniform 16px layout (K >= 64); no 32px model. uniform_2level = uniform.
+                 X_pooled the batch's B * K tokens to its best 16px -> 8px splits in any image (two levels; tokens per image
+                          vary, as with sequence packing); X_perimage: each image all-16px or all-8px by its total gain, the
+                          same average budget (the control: between-image vs within-image variation). Absolute scores only
+                          (loss, disagree, random). Pools over each generation batch (--gen_batch_size images; generation
+                          is class-ordered, so a batch spans ~gen_batch_size / (num_images / num_classes) classes).
                Flicker: the fraction of the image whose patch size changes from one layout to the next within a
                trajectory (every re-route), from the sample pass.
                "gap closed" = (FID_16 - FID) / (FID_16 - FID_8): the share of the 16px -> 8px improvement reached.
@@ -42,7 +47,9 @@ Parts (every generation uses the same seed, so the same noise and labels: sample
                is how much closer the image's pool features get to the real image's when that region is upgraded to the
                finer model. Plus the heuristics' correlations with each other, and the measured error each allocation
                removes vs the uniform layout at the same K: greedy vs exact, on the measured (oracle) and expected
-               (loss) gains.
+               (loss) gains. And partial splits, a no-training lower bound for binary (16x8) splits: refining only the
+               best half of a 16px patch for +2 tokens (the other half at 16px quality) next to whole-patch splits (+3),
+               allocated exactly at each K; with how concentrated a patch's gain is in its best half / quadrant.
   recon        (--recon, opt-in) Reconstruction FID: held-out images noised to t0 and sampled from there with stitched
                layouts, including the loss-oracle (layout re-chosen every step from the measured gains against the true
                image). A router beating the loss-oracle on FID means loss is the wrong target for splitting.
@@ -85,7 +92,6 @@ import torch.nn.functional as F
 from data_jit import MemmapImages, to_model_input
 from jit_common import load_denoiser, generate_and_score
 from fid import InceptionMetrics, load_ref_stats, to_uint8, precision_recall
-from diagnostics import seam_ratio
 from model_quadtree import QuadGeometry, QuadRouter, allocate, cell_maps, layout_agreement, draw_layout, LEVEL_COLORS
 
 # -----------------------------------------------------------------------------
@@ -163,19 +169,36 @@ for K in budgets + [attr_tokens]:
     geo.check_budget(K)
 router_list = [r for r in routers.split(',') if r]
 attr_list = [r for r in attr_routers.split(',') if r]
-ROUTERS = ('loss', 'dino', 'pixel', 'disagree', 'random', 'uniform', 'oracle') # each also as X_exact, X_2level, X_exact_2level
+ROUTERS = ('loss', 'dino', 'pixel', 'disagree', 'random', 'uniform', 'oracle') # also X_exact, + _2level / _pooled / _perimage
 for r in router_list + attr_list + (recon_routers.split(',') if recon else []):
-    name = r.removesuffix('_2level').removesuffix('_exact')
+    name = r.removesuffix('_pooled').removesuffix('_perimage').removesuffix('_2level').removesuffix('_exact')
+    assert not r.endswith(('_pooled', '_perimage')) or name in ('loss', 'disagree', 'random', 'oracle'), \
+        f"'{r}': pooling compares scores across images, so it needs absolute ones (loss, disagree, random, oracle), " \
+        f"not dino / pixel (standardized per image)"
     assert name in ROUTERS and (name != 'oracle' or r in recon_routers.split(',')), \
-        f"unknown router '{r}': one of {ROUTERS} (oracle: --recon only), optionally + _exact, then + _2level"
+        f"unknown router '{r}': one of {ROUTERS} (oracle: --recon only), optionally + _exact, then + _2level / _pooled / _perimage"
 # one run per output: two processes resuming the same files would each overwrite the other's results
 lock = out + '.lock'
-if os.path.exists(lock):
+
+def lock_holder():
+    # the PID in the lock file if that process is alive and is an analysis run (a run killed hard leaves its lock, and
+    # the PID may since belong to an unrelated process), else None
     try:
-        os.kill(int(open(lock).read()), 0)
-        sys.exit(f'another analysis (PID {open(lock).read().strip()}) is writing {out}.*: wait for it, or pass another --out')
+        pid = int(open(lock).read().strip())
+        os.kill(pid, 0)
     except (OSError, ValueError):
-        pass # stale lock from a run that died
+        return None
+    try:
+        with open(f'/proc/{pid}/cmdline', 'rb') as fh: # Linux
+            return pid if b'analyze_patch_sizes' in fh.read() else None
+    except OSError:
+        import subprocess # macOS: no /proc
+        cmd = subprocess.run(['ps', '-o', 'command=', '-p', str(pid)], capture_output=True, text=True).stdout
+        return pid if 'analyze_patch_sizes' in cmd else None
+
+if os.path.exists(lock) and lock_holder() is not None:
+    sys.exit(f'another analysis (PID {lock_holder()}) is writing {out}.*: wait for it, or pass another --out '
+             f'(if no analysis is running, delete {lock})')
 with open(lock, 'w') as fh:
     fh.write(str(os.getpid()))
 import atexit
@@ -183,7 +206,8 @@ atexit.register(lambda: os.path.exists(lock) and os.remove(lock))
 edges = [float(v) for v in attr_t.split(',')]
 windows = list(zip(edges[:-1], edges[1:]))
 router = QuadRouter(geo, geo.n0, 'uniform', gate_tau=gate_tau, num_classes=num_classes, img=img)
-if regions or 'dino' in set(router_list) | set(attr_list) | (set(recon_routers.split(',')) if recon else set()):
+bare = lambda r: r.removesuffix('_pooled').removesuffix('_perimage').removesuffix('_2level').removesuffix('_exact')
+if regions or 'dino' in {bare(r) for r in router_list + attr_list + (recon_routers.split(',') if recon else [])}:
     router.load_dino(dino)
 router.to(device)
 LEVEL_TOKENS = {geo.counts[l]: l for l in range(geo.L)} # uniform layouts of one level: K = 16 / 64 / 256 at 128px
@@ -349,16 +373,128 @@ def layout_of(scores, K, exact=False, two=False):
     return allocate_exact(scores, K) if exact else allocate(scores, K, geo, router.children, router.parent)
 
 def base_router(name):
-    # 'loss_exact_2level' -> ('loss', True, True): scores, exact allocation, two levels only (never the coarsest)
-    two = name.endswith('_2level')
+    """
+    'loss_exact_2level' -> ('loss', True, True, None): scores, exact allocation, two levels only (never the coarsest), and
+    the budget pooling: None (K per image), 'pooled' (the batch's B * K tokens to its best middle-level splits, any image)
+    or 'perimage' (each image entirely middle or entirely finest level, the same average budget); both imply two levels.
+    """
+    pool = next((p for p in ('pooled', 'perimage') if name.endswith('_' + p)), None)
+    if pool:
+        name = name.removesuffix('_' + pool)
+    two = name.endswith('_2level') or pool is not None
     name = name.removesuffix('_2level')
     exact = name.endswith('_exact')
-    return name.removesuffix('_exact'), exact, two
+    return name.removesuffix('_exact'), exact, two, pool
+
+def strip_router(r):
+    return r.removesuffix('_pooled').removesuffix('_perimage').removesuffix('_2level').removesuffix('_exact')
+
+def knapsack(vals, budget):
+    """
+    vals [B, n, C]: the value of giving item i option c, which costs c (-inf: not allowed). The choice per item [B, n]
+    maximizing the total value at total cost <= budget (exact: max-plus convolutions over the items, then backtracking).
+    """
+    B, n, _ = vals.shape
+    acc, args = vals[:, 0], []
+    for i in range(1, n):
+        acc, a = maxplus(acc, vals[:, i])
+        args.append(a)
+    rows = torch.arange(B, device=vals.device)
+    k = acc[:, :budget + 1].argmax(1)
+    choice = torch.zeros(B, n, dtype=torch.long, device=vals.device)
+    for i in range(n - 1, 0, -1):
+        choice[:, i] = args[i - 1][rows, k]
+        k = k - choice[:, i]
+    choice[:, 0] = k
+    return choice
+
+def partial_split_gains(gain_cells):
+    """
+    Per middle-level patch [B, n1]: the gain of refining it entirely (its four quadrants) and of refining only its best half
+    (top / bottom / left / right pair of quadrants), with which half, from a cell gain map [B, G, G] (middle-level error
+    minus finest-level error per cell). Binary splits allow the latter: half a 16px patch to 8px for +2 tokens.
+    """
+    B, g1, f = gain_cells.shape[0], geo.grids[1], G // geo.grids[1]
+    assert f == 2, 'partial splits assume the finest level halves the middle one'
+    q = gain_cells.view(B, g1, 2, g1, 2).permute(0, 1, 3, 2, 4).reshape(B, g1 * g1, 2, 2)
+    halves = torch.stack([q[:, :, 0].sum(-1), q[:, :, 1].sum(-1), q[:, :, :, 0].sum(-1), q[:, :, :, 1].sum(-1)], dim=-1)
+    best, which = halves.max(-1)
+    return q.sum((-1, -2)), best, which, halves, q.flatten(2).max(-1).values
+
+def partial_split_removed(sel_cells, eval_cells, K):
+    """
+    Error removed from the all-middle-level layout at budget K (per image [B]) by quadtree splits only (+3 tokens per
+    patch) and with partial splits too (+2 for the best half, the other half kept at the middle level's quality: a lower
+    bound for rectangular patches, which would do better there). Options are chosen on sel_cells' gains (exactly, by
+    knapsack) and scored on eval_cells'.
+    """
+    full_s, best_s, which_s, _, _ = partial_split_gains(sel_cells)
+    full_e, _, _, halves_e, _ = partial_split_gains(eval_cells)
+    half_e = halves_e.gather(-1, which_s[..., None])[..., 0]
+    ninf = torch.full_like(full_s, float('-inf'))
+    zero = torch.zeros_like(full_s)
+    out = {}
+    for name, vals in (('quadtree', torch.stack([zero, ninf, ninf, full_s], -1)), ('partial', torch.stack([zero, ninf, best_s, full_s], -1))):
+        c = knapsack(vals, K - geo.counts[1])
+        out[name] = torch.where(c == 3, full_e, torch.where(c == 2, half_e, zero)).sum(1)
+    return out
 
 def stitched_error(layout, E):
     # a layout's error: every finest cell's error from the model at its token's size [B]
     lev = cell_maps(layout, geo)[1]
     return torch.stack(E).gather(0, lev.unsqueeze(0))[0].flatten(1).sum(1)
+
+def pooled_levels(scores, K, pool):
+    """
+    Cell level maps [B, G, G] for two-level layouts with the budget pooled over the batch: 'pooled' splits the B * m
+    best middle-level patches of the batch (m = (K - N1) / 3 per image on average), 'perimage' puts the
+    round(B (K - N1) / (N2 - N1)) images with the largest total middle-level score entirely at the finest level.
+    """
+    B, n1, g1 = scores.shape[0], geo.counts[1], geo.grids[1]
+    s = scores[:, geo.offsets[1]:geo.offsets[1] + n1].float()
+    if pool == 'pooled':
+        n = B * ((K - n1) // 3)
+        split = torch.zeros(B * n1, dtype=torch.bool, device=s.device)
+        split[s.flatten().topk(n).indices] = True
+        split = split.view(B, g1, g1)
+    else:
+        n = round(B * (K - n1) / (geo.counts[2] - n1))
+        split = torch.zeros(B, dtype=torch.bool, device=s.device)
+        split[s.sum(1).topk(n).indices] = True
+        split = split.view(B, 1, 1).expand(B, g1, g1)
+    f = G // g1
+    return 1 + split.long().repeat_interleave(f, 1).repeat_interleave(f, 2)
+
+LEVEL_IDS = torch.stack([geo.offsets[l] + (torch.arange(G)[:, None] // (G // geo.grids[l])) * geo.grids[l]
+                         + torch.arange(G)[None, :] // (G // geo.grids[l]) for l in range(geo.L)]) # [L, G, G] candidate ids
+
+def tok_map(lev):
+    # the candidate (token) covering each cell [N, G, G], from a cell level map
+    ids = LEVEL_IDS.to(lev.device)
+    return ids[lev.long(), torch.arange(G, device=lev.device)[:, None], torch.arange(G, device=lev.device)[None, :]]
+
+def layout_from_levels(lev):
+    # one image's layout (its tokens' candidate ids, ascending) [1, K_i] from its level map [G, G]
+    return tok_map(lev[None]).flatten().unique()[None]
+
+def tokens_per_image(lev):
+    # tokens of each image [B] from its level map: a level-l token covers (G / grid_l)^2 cells
+    return sum((lev == l).flatten(1).float().sum(1) / (G // geo.grids[l]) ** 2 for l in range(geo.L))
+
+def seam_ratio_levels(img, lev):
+    """
+    diagnostics.seam_ratio from level maps (any tokens per image): mean |neighbour difference| across token boundaries /
+    inside tokens, over all boundaries and over boundaries between two levels.
+    """
+    f = img.shape[-1] // G
+    tok = tok_map(lev).repeat_interleave(f, 1).repeat_interleave(f, 2)
+    lv = lev.repeat_interleave(f, 1).repeat_interleave(f, 2)
+    img = img.float()
+    d = torch.cat([(img[:, :, :, 1:] - img[:, :, :, :-1]).abs().mean(1).flatten(), (img[:, :, 1:] - img[:, :, :-1]).abs().mean(1).flatten()])
+    ct = torch.cat([(tok[:, :, 1:] != tok[:, :, :-1]).flatten(), (tok[:, 1:] != tok[:, :-1]).flatten()])
+    cl = torch.cat([(lv[:, :, 1:] != lv[:, :, :-1]).flatten(), (lv[:, 1:] != lv[:, :-1]).flatten()])
+    inside = d[~ct].mean()
+    return (d[ct].mean() / inside).item(), (d[cl].mean() / inside).item() if cl.any() else float('nan')
 
 def level_area(lev):
     # fraction of the image at each level [L] (a device tensor: no sync) from a cell level map [B, G, G]
@@ -371,17 +507,21 @@ class StitchedNet(nn.Module):
     """
     The three uniform models as one network: a router's layout picks which model's prediction each region takes. Outside
     `window` (t) the 16px model alone; `render` maps a level to the level whose model renders its regions (attribution).
-    mode 'X_exact': router X's scores, exact allocation. Under CFG, loss / disagree / oracle route each half on its own
-    predictions. Logs the area per level and the flicker (fraction of the image whose patch size changed since the previous
+    mode 'X_exact': router X's scores, exact allocation; '_2level', '_pooled', '_perimage': see base_router. Works on cell
+    level maps (cache: the current one), so tokens per image may vary. Under CFG both halves of a call take the
+    conditional half's layout. Logs the area per level and the flicker (fraction of the image whose patch size changed since the previous
     layout of the trajectory) per call as device tensors, read once by summary(); after a trajectory, cache holds its final
     layout. No host syncs per call (except to test t against a window), so the GPU never waits on Python between models.
     """
-    def __init__(self, mode, K, window=(0.0, 1.0), render=None):
+    def __init__(self, mode, K, window=(0.0, 1.0), render=None, cfg_pairs=None):
         super().__init__()
         self.mode, self.K, self.window, self.render = mode, K, window, render or {}
-        self.base, self.exact, self.two = base_router(mode)
+        # with guidance every call is [conditional; unconditional] (FastDenoiser batches them; the interval is all of t):
+        # both halves take the conditional half's layout, so guidance combines two predictions of one stitching
+        self.cfg_pairs = cfg != 1.0 if cfg_pairs is None else cfg_pairs
+        self.base, self.exact, self.two, self.pool = base_router(mode)
         self.x_true, self.cache, self.calls, self.prev = None, None, 0, None
-        self.log = [] # (t, area [L], flicker or None) per call
+        self.log = [] # (t, area [L], flicker or None, tokens per image [mean, std, min, max]) per call
         # the models this configuration can use, known up front (the levels a layout can contain, after render)
         levels = set(range(geo.L))
         if self.base == 'uniform': # one fixed layout
@@ -397,25 +537,31 @@ class StitchedNet(nn.Module):
         pass
 
     def summary(self):
-        # {t: mean area per level}, {t: mean flicker} over every call logged so far; clears the log
+        # {t: mean area per level}, {t: mean flicker}, tokens per image {mean, std, min, max} over every call logged so
+        # far; clears the log
         if not self.log:
-            return {}, {}
+            return {}, {}, {}
         ts = torch.stack([l[0] for l in self.log]).float().cpu().numpy().round(4)
         areas = torch.stack([l[1] for l in self.log]).cpu().numpy()
-        fl = [(t, f) for t, (_, _, f) in zip(ts, self.log) if f is not None]
+        tok = torch.stack([l[3] for l in self.log]).cpu().numpy()
+        tokens = {'mean': float(tok[:, 0].mean()), 'std': float(np.sqrt((tok[:, 1] ** 2).mean())), 'min': float(tok[:, 2].min()),
+                  'max': float(tok[:, 3].max())}
+        fl = [(t, f) for t, (_, _, f, _) in zip(ts, self.log) if f is not None]
         flv = torch.stack([f for _, f in fl]).cpu().numpy() if fl else []
         area_t = {f'{t:g}': areas[ts == t].mean(0).tolist() for t in np.unique(ts)}
         flick_t = {}
         for (t, _), v in zip(fl, flv):
             flick_t.setdefault(f'{t:g}', []).append(float(v))
         self.log = []
-        return area_t, {k: float(np.mean(v)) for k, v in flick_t.items()}
+        return area_t, {k: float(np.mean(v)) for k, v in flick_t.items()}, tokens
 
     @torch.no_grad()
     def forward(self, z, t, y):
         B, t0 = z.shape[0], t.flatten()[0]
         if self.window != (0.0, 1.0) and not (self.window[0] <= t0.item() < self.window[1]):
-            self.log.append((t0, torch.tensor([float(l == 1) for l in range(geo.L)], device=z.device), None))
+            n1 = float(geo.counts[1]) # every image: the middle level's tokens
+            self.log.append((t0, torch.tensor([float(l == 1) for l in range(geo.L)], device=z.device), None,
+                             torch.tensor([n1, 0.0, n1, n1], device=z.device)))
             return nets[1](z, t, y)
         preds = [None] * geo.L
         if self.base in ('loss', 'disagree', 'oracle'):
@@ -425,15 +571,24 @@ class StitchedNet(nn.Module):
                 preds[0] = preds[1]
         flick = None
         if self.cache is None or self.cache.shape[0] != B or self.calls % route_every == 0:
-            layout = layout_of(router_scores(self.base, z, t, preds=preds, x_true=self.x_true), self.K, self.exact, self.two)
-            if self.prev is not None and self.prev.shape == layout.shape: # flicker: area re-tokenized since the last layout
-                flick = 1 - layout_agreement(self.prev, layout, geo).mean()
-            self.cache = self.prev = layout
+            h = B // 2 if self.cfg_pairs else B
+            half = lambda v: None if v is None else v[:h]
+            scores = router_scores(self.base, z[:h], t[:h], preds=[half(p) for p in preds], x_true=half(self.x_true))
+            if self.pool:
+                lev = pooled_levels(scores, self.K, self.pool)
+            else:
+                lev = cell_maps(layout_of(scores, self.K, self.exact, self.two), geo)[1]
+            if self.cfg_pairs:
+                lev = lev.repeat(2, 1, 1)
+            if self.prev is not None and self.prev.shape == lev.shape: # flicker: area re-tokenized since the last layout
+                flick = (self.prev != lev).float().mean()
+            self.cache = self.prev = lev
         self.calls += 1
-        lev = cell_maps(self.cache, geo)[1]
+        lev = self.cache
+        ntok = tokens_per_image(lev)
         for src, dst in self.render.items():
             lev = torch.where(lev == src, torch.full_like(lev, dst), lev)
-        self.log.append((t0, level_area(lev), flick))
+        self.log.append((t0, level_area(lev), flick, torch.stack([ntok.mean(), ntok.std(unbiased=False), ntok.min(), ntok.max()])))
         lev_px = lev.repeat_interleave(f_cell, 1).repeat_interleave(f_cell, 2).unsqueeze(1)
         x_hat = torch.zeros(z.shape, device=z.device, dtype=torch.float32)
         for l in self.used:
@@ -473,7 +628,7 @@ from plot_style import SURFACE, INK, INK_2, CATEGORICAL, MARKERS, style_axis, li
 
 ORDER = ['uniform', 'random', 'pixel', 'dino', 'loss', 'disagree', 'dino_gate', 'dino_div', 'centre', 'loss_exact'] # fixed slots
 COLORS = dict(zip(ORDER, CATEGORICAL[:6] + ['#f3c45e', '#a87200', INK_2, '#a8336b'])) # dino's terms: lighter / darker dino; exact: darker
-color = lambda name: COLORS.get(name.removesuffix('_2level'), INK_2) # a 2-level variant: its router's colour
+color = lambda name: COLORS.get(name.removesuffix('_pooled').removesuffix('_perimage').removesuffix('_2level'), INK_2) # variants: their router's colour
 marker = lambda name: MARKERS[ORDER.index(name) % len(MARKERS)] if name in ORDER else 'o'
 fid_of = lambda k: results['fid'][k]['fid'] if k in results['fid'] else float('nan')
 legend_levels = lambda fig, title: fig.legend(handles=[Patch(color=LEVEL_COLORS[l], label=f'{p}px') for l, p in enumerate(patches)],
@@ -533,8 +688,8 @@ def fig_samples(K):
     fig, axes = plt.subplots(2 * nv, len(cols), figsize=(1.9 * len(cols), 1.95 * 2 * nv + 0.8), facecolor=SURFACE, squeeze=False)
     for j, c in enumerate(cols):
         ims = torch.from_numpy(samples[c + '__images'][:nv]).float().div(127.5).sub(1)
-        lay = samples.get(c + '__final')
-        drawn = draw_layout(ims, torch.from_numpy(lay[:nv]), geo) if lay is not None else ims
+        lev = final_levels(c)
+        drawn = torch.cat([draw_layout(ims[i:i + 1], layout_from_levels(lev[i]), geo) for i in range(nv)]) if lev is not None else ims
         for i in range(nv):
             blank(axes[2 * i, j]); blank(axes[2 * i + 1, j])
             axes[2 * i, j].imshow(to_np(ims[i]))
@@ -551,6 +706,14 @@ def fig_samples(K):
     fig.tight_layout(rect=(0, 0, 1, 1 - 0.9 / (1.95 * 2 * nv + 0.8)))
     fig.savefig(out + f'_samples_K{K}.png', dpi=140, facecolor=SURFACE)
     plt.close(fig)
+
+def final_levels(key):
+    # a configuration's final cell level maps [N, G, G] (older results stored layouts), or None
+    if key + '__lev' in samples:
+        return torch.from_numpy(samples[key + '__lev']).long()
+    if key + '__final' in samples:
+        return cell_maps(torch.from_numpy(samples[key + '__final']), geo)[1]
+    return None
 
 seam_x = lambda k: results['seams'][k]['stitched'][0] / results['seams'][k]['placebo_16px'][0] if k in results['seams'] else float('nan')
 
@@ -582,11 +745,12 @@ def seams(key):
     same layouts drawn on the 16px and 8px models' samples of the same noise (placebos: no stitching, so no seams).
     """
     a16, a8 = f'uniform_{patches[1]}px__images', f'uniform_{patches[2]}px__images'
-    if key + '__final' not in samples or a16 not in samples or a8 not in samples:
+    lev = final_levels(key)
+    if lev is None or a16 not in samples or a8 not in samples:
         return
-    lay = torch.from_numpy(samples[key + '__final']).to(device)
-    ims = lambda k: torch.from_numpy(samples[k][:len(lay)]).to(device).float().div(127.5).sub(1)
-    r = {name: seam_ratio(ims(k), lay, geo) for name, k in (('stitched', key + '__images'), ('placebo_16px', a16), ('placebo_8px', a8))}
+    lev = lev.to(device)
+    ims = lambda k: torch.from_numpy(samples[k][:len(lev)]).to(device).float().div(127.5).sub(1)
+    r = {name: seam_ratio_levels(ims(k), lev) for name, k in (('stitched', key + '__images'), ('placebo_16px', a16), ('placebo_8px', a8))}
     results['seams'][key] = r
     print(f"{key:<28} seams (across / inside tokens; between levels): {r['stitched'][0]:.3f}; {r['stitched'][1]:.3f} | "
           f"same layout on the {patches[1]}px model's samples {r['placebo_16px'][0]:.3f}; {r['placebo_16px'][1]:.3f}, "
@@ -599,19 +763,20 @@ def run(key, net=None, level=None):
     """
     stitched = net is not None
     todo = [w for w, need in (('samples', key + '__images' not in samples or len(samples[key + '__images']) < n_samples
-                              or (stitched and (key + '__final' not in samples or key not in results['flicker']))),
+                              or (stitched and (final_levels(key) is None or key not in results['flicker']))),
                               (f'FID-{num_images / 1000:g}k', fid and key not in results['fid'])) if need]
     if todo:
         print(f"[{key}] {' + '.join(todo)}")
     if key + '__images' not in samples or len(samples[key + '__images']) < n_samples or \
-            (stitched and (key + '__final' not in samples or key not in results['flicker'])):
+            (stitched and (final_levels(key) is None or key not in results['flicker'])):
         t_start = time.time()
         samples[key + '__images'] = sample_batch(net, level).numpy()
         print(f"[{key}] {n_samples} samples in {time.time() - t_start:.0f}s")
         if stitched:
             # a t window the trajectory never reached leaves the 16px model's layout
-            final = net.cache if net.cache is not None else layout_of(router.neutral.expand(n_samples, -1), geo.counts[1])
-            samples[key + '__final'] = final[:n_samples].cpu().numpy()
+            final = net.cache if net.cache is not None else torch.ones(n_samples, G, G, dtype=torch.long)
+            samples[key + '__lev'] = final[:n_samples].cpu().numpy().astype(np.int8)
+            samples.pop(key + '__final', None)
             by_t = net.summary()[1]
             results['flicker'][key] = {'mean': float(np.mean(list(by_t.values()))) if by_t else 0.0, 'by_t': by_t}
             print(f"{key:<28} flicker (image re-tokenized per re-route): {results['flicker'][key]['mean']:.1%}")
@@ -628,16 +793,19 @@ def run(key, net=None, level=None):
         area, area_t = [float(l == level) for l in range(geo.L)], {}
     else:
         o = with_net(net, lambda den: generate_and_score(den, metrics, ref_stats, num_images, num_classes, device, ctx, **kw))
-        area_t = net.summary()[0]
+        area_t, _, tokens = net.summary()
         area = np.mean(list(area_t.values()), axis=0).tolist()
     r = {'fid': o['fid'], 'is': o['is'], 'area': area, 'area_by_t': area_t}
+    if net is not None:
+        r['tokens'] = tokens
     if pr_real is not None:
         r['precision'], r['recall'] = precision_recall(pr_real, o['features'].to(device))
     results['fid'][key] = r
     save(); draw_progress()
     pr = f", P {r['precision']:.3f}, R {r['recall']:.3f}" if 'precision' in r else ''
+    tk = f" | tokens {r['tokens']['mean']:.0f} +- {r['tokens']['std']:.0f} [{r['tokens']['min']:.0f}, {r['tokens']['max']:.0f}]" if 'tokens' in r else ''
     print(f"{key:<28} FID-{num_images / 1000:g}k {r['fid']:7.2f}, IS {r['is']:6.1f}{pr} | {(time.time() - t_start) / 60:.1f} min | area "
-          + ' '.join(f'{p}px {a:.0%}' for p, a in zip(patches, area)))
+          + ' '.join(f'{p}px {a:.0%}' for p, a in zip(patches, area)) + tk)
     return r
 
 def stitched_key(r, K):
@@ -653,7 +821,7 @@ for l in range(geo.L):
     run(f'uniform_{patches[l]}px', level=l)
 for K in budgets:
     for r in router_list:
-        if r.endswith('_2level') and K <= geo.counts[1]: # below: impossible; at: the middle model alone (an anchor)
+        if base_router(r)[2] and K <= geo.counts[1]: # two levels: below impossible; at: the middle model alone (an anchor)
             continue
         if not (stitched_key(r, K).startswith('uniform_') and stitched_key(r, K).endswith('px')): # a model alone: an anchor
             run(stitched_key(r, K), StitchedNet(r, K))
@@ -707,6 +875,8 @@ if regions:
         names_x = ['gain'] + HEURISTICS
         cross = {(a, b): [] for a in names_x for b in names_x}
         alloc = {(name, K): [] for name in ('oracle', 'oracle_exact', 'loss', 'loss_exact') for K in budgets}
+        partial = {(sel, kind, K): [] for sel in ('oracle', 'loss') for kind in ('quadtree', 'partial') for K in budgets if K > geo.counts[1]}
+        conc = {'half': [0.0, 0.0], 'quadrant': [0.0, 0.0]} # share of patches' positive gain in their best half / quadrant
         for i in range(0, n_images, batch_size):
             x, y, e = X[i:i + batch_size], Y[i:i + batch_size], NOISE[i:i + batch_size]
             preds, h = region_pass(x, y, e, t_val)
@@ -723,8 +893,18 @@ if regions:
             for K in budgets: # error removed vs the coarse-first uniform layout at the same K (measured against x)
                 e_uni = stitched_error(layout_of(router.neutral.expand(len(x), -1), K), E)
                 for name in ('oracle', 'oracle_exact', 'loss', 'loss_exact'):
-                    b, ex, _ = base_router(name)
+                    b, ex, _, _ = base_router(name)
                     alloc[(name, K)].append((e_uni - stitched_error(layout_of(gains if b == 'oracle' else h['loss'], K, ex), E)).cpu())
+            g_meas = E[1] - E[2] # measured, and expected (the 8px estimate standing in for x), per cell
+            g_exp = cell_err(preds[1], preds[2])
+            full_m, best_m, _, _, quad_m = partial_split_gains(g_meas.clamp_min(0)) # concentration of the positive gain
+            conc['half'][0] += best_m.sum().item(); conc['half'][1] += full_m.sum().item()
+            conc['quadrant'][0] += quad_m.sum().item(); conc['quadrant'][1] += full_m.sum().item()
+            for K in budgets:
+                if K > geo.counts[1]:
+                    for sel, cells in (('oracle', g_meas), ('loss', g_exp)):
+                        for kind, v in partial_split_removed(cells, g_meas, K).items():
+                            partial[(sel, kind, K)].append(v.cpu())
             allv = dict(h, gain=gains)
             for (a, b) in cross:
                 cross[(a, b)].append(torch.stack([spearman(sa, sb) for sa, sb in zip(per_level(allv[a]), per_level(allv[b]))]).mean(0).cpu())
@@ -733,8 +913,8 @@ if regions:
                 viz['gains'] = gains[:n].cpu()
                 viz['loss-oracle'] = layout_of(gains, attr_tokens)[:n].cpu()
                 for r in router_list:
-                    b, ex, two = base_router(r)
-                    if two and attr_tokens < geo.counts[1]:
+                    b, ex, two, pool = base_router(r)
+                    if (two and attr_tokens < geo.counts[1]) or pool:
                         continue
                     viz[r] = layout_of(router.neutral.expand(len(x), -1) if b == 'uniform' else h[b], attr_tokens, ex, two)[:n].cpu()
         per_patch = lambda v, l: v / (n_images * geo.counts[l])
@@ -742,7 +922,9 @@ if regions:
             'gain_per_patch': {f'{patches[l]}->{patches[l + 1]}px': {b: per_patch(tot[b][l], l) for b in tot} for l in range(geo.L - 1)},
             'loss_corr': {name: [torch.cat(c).nanmean().item() for c in corr[name]] for name in HEURISTICS},
             'cross_corr': {f'{a}|{b}': torch.cat(v).nanmean().item() for (a, b), v in cross.items()},
-            'allocation_gain_vs_uniform': {f'{name}_K{K}': torch.cat(v).mean().item() for (name, K), v in alloc.items()}}
+            'allocation_gain_vs_uniform': {f'{name}_K{K}': torch.cat(v).mean().item() for (name, K), v in alloc.items()},
+            'partial_splits': {f'{sel}_{kind}_K{K}': torch.cat(v).mean().item() for (sel, kind, K), v in partial.items()},
+            'gain_concentration': {k: a / max(b, 1e-12) for k, (a, b) in conc.items()}}
 
     # Inception-feature split gains on a subset
     for t_val in [float(v) for v in feature_ts.split(',')]:
@@ -787,6 +969,16 @@ if regions:
             a = rr['allocation_gain_vs_uniform']
             print(f'  t={tk:<5} ' + '   '.join(f"K={K}: oracle {a[f'oracle_K{K}']:+.3g} / {a[f'oracle_exact_K{K}']:+.3g}, "
                                             f"loss {a[f'loss_K{K}']:+.3g} / {a[f'loss_exact_K{K}']:+.3g}" for K in budgets))
+    print('\npartial splits (binary-split lower bound: half a 16px patch to 8px for +2 tokens, the rest at 16px quality): measured '
+          'error removed vs all-16px, quadtree splits only / with partial splits, chosen on measured (oracle) or expected (loss) '
+          'gains; and the gain-weighted share of a patch\'s gain in its best half / quadrant (1/2, 1/4: spread evenly)')
+    for tk, rr in results['regions'].items():
+        if 'partial_splits' in rr:
+            a, c = rr['partial_splits'], rr['gain_concentration']
+            Ks = sorted({int(k.rsplit('_K', 1)[1]) for k in a})
+            print(f'  t={tk:<5} best half {c["half"]:.0%}, best quadrant {c["quadrant"]:.0%} | ' + '   '.join(
+                f"K={K}: oracle {a[f'oracle_quadtree_K{K}']:+.3g} / {a[f'oracle_partial_K{K}']:+.3g}, loss {a[f'loss_quadtree_K{K}']:+.3g} / "
+                f"{a[f'loss_partial_K{K}']:+.3g}" for K in Ks))
     print(f'\nrank correlation with the split gain per region, {patches[0]}px | {patches[1]}px parents (feat: Inception-feature gains):')
     print('  ' + ' ' * 7 + ''.join(f'{name:>14}' for name in HEURISTICS))
     for tk, rr in results['regions'].items():
@@ -832,7 +1024,7 @@ if recon:
         for r in recon_routers.split(','):
             key = f't0{t0:g}_{r}_K{attr_tokens}'
             if key not in results['recon']:
-                results['recon'][key] = recon_fid(StitchedNet(r, attr_tokens), t0); save()
+                results['recon'][key] = recon_fid(StitchedNet(r, attr_tokens, cfg_pairs=False), t0); save() # recon: cfg 1
             print(f'reconstruction from t0={t0:g}, {r} K={attr_tokens}: FID {results["recon"][key]:.2f}')
 
 print(f'\nwrote {out}.json, {out}_samples.npz')
