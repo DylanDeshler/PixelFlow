@@ -437,6 +437,21 @@ configuration uses the same noise and labels. The full description is in the scr
     1 means no seams;
   - flicker: the share of the image re-tokenized from one layout to the next within a trajectory.
 
+- **heatmap** (`--heatmap_only=True`, about 15–30 minutes at 5k images): FID of the one-step clean estimate from held-out
+  images noised to each t, for uniform and each router at each K.
+  - Each model runs once per t, and every layout is composited from their predictions.
+  - The figure `_heatmap.png` shows uniform's share of the 16px → 8px gap closed, and each router minus uniform on one
+    shared scale.
+  - It measures the estimate at each t, not samples, so it guides where budget and placement matter in t. The `--t_schedules`
+    runs then test that with real sampling.
+- **t-varying budgets** (`--t_schedules=lin+192,lin-192,switch,switchrev --schedule_tokens=160`): K changes with t while
+  the average tokens per network call (compute per sample) is matched to `--schedule_tokens`.
+  - `lin±d` varies K linearly by d tokens per unit t: `+` puts more tokens near the clean end, `−` near the noise end.
+  - `switch` uses the 16px model alone, then the 8px model alone from the t that matches the average; `switchrev` is
+    the reverse. These involve no spatial routing at all.
+
+  Both run for `--schedule_routers` (default `loss_exact_2level,uniform`), so {router, uniform} × {constant,
+  t-varying} separates time allocation from spatial allocation.
 - **layouts** (`--layouts_only=True` for only these, about a minute): every method's layout on the same held-out
   images noised to each t in `--layout_ts`, side by side, in `_layouts_t{t}_K{K}.png`. Each method's agreement is
   measured against the measured-gain oracle under the same allocation rules (exact or greedy, levels, pooling).
@@ -461,6 +476,24 @@ three panels:
 - FID vs tokens per router: measured points, with quadratic fits in log2 K over K = 64–256;
 - the drop-in view: FID change vs uniform at the same K;
 - the compute view: tokens saved vs uniform at the same FID.
+
+### Comparing tokenization families: `compare_tokenizations.py`
+
+This compares how well each tokenization can describe held-out images at a matched token count K, with every token
+given the same small capacity: a constant, linear or quadratic polynomial per colour channel. No diffusion model is
+involved; it's a filter before any architecture work. Each family is allocated on the image itself, so it measures what
+each family could represent, not a router.
+
+| family | regions |
+|---|---|
+| `uniform` | content-blind coarse-first, centre-out layout |
+| `quadtree8`, `quadtree4` | aligned squares, with 8px or 4px leaves |
+| `merge` (B) | irregular regions grown bottom-up from 2×2 px units |
+| `gauss` (C) | soft 2D Gaussian tokens with normalized blending, fit by Adam from the quadtree solution |
+
+```bash
+python compare_tokenizations.py --data_dir=/data/in1k_128     # -> in1k_128_tokenizations{.json,.png,_viz.png}
+```
 
 ## PixelDiT baseline
 

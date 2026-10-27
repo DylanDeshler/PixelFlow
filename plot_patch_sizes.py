@@ -18,7 +18,7 @@ import numpy as np
 
 # -----------------------------------------------------------------------------
 json_path = '' # analyze_patch_sizes.py output
-routers = 'uniform,random,dino,loss,loss_exact' # + X_2level (dashed)
+routers = 'uniform,random,dino,loss,loss_exact' # + X_2level (dashed), X_pooled (dash-dot), X_perimage (dotted)
 out = '' # default: {json without .json}_main.png
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
@@ -33,12 +33,14 @@ p32, p16, p8 = res['patches']
 n_img = res.get('config', {}).get('num_images', 10000)
 out = out or json_path.removesuffix('.json') + '_main.png'
 
+two_level = lambda r: r.endswith(('_2level', '_pooled', '_perimage'))
+
 # per router: K -> FID over the trade range (64..256), the 8px model at K = 256
 anchors = {16: fid[f'uniform_{p32}px'], 64: fid[f'uniform_{p16}px'], 256: fid[f'uniform_{p8}px']}
 series = {}
 for r in routers.split(','):
     pts = {256: anchors[256]}
-    if r == 'uniform' or r.endswith('_2level'): # 2-level layouts start from the 16px model at K = 64
+    if r == 'uniform' or two_level(r): # 2-level layouts start from the 16px model at K = 64
         pts[64] = anchors[64]
     for k, v in fid.items():
         if k.startswith(f'{r}_K') and k[len(r) + 2:].isdigit():
@@ -48,7 +50,7 @@ for r in routers.split(','):
 fit = {r: np.polyfit(np.log2(list(p)), list(p.values()), 2) for r, p in series.items()}
 f_at = lambda r, K: np.polyval(fit[r], np.log2(K))
 Kr = np.geomspace(64, 256, 200)
-measured = lambda r: [K for K in series[r] if K < 256 and not (K == 64 and r.endswith('_2level'))]
+measured = lambda r: [K for K in series[r] if K < 256 and not (K == 64 and two_level(r))]
 
 def k_uniform(f):
     # the budget at which uniform reaches FID f: the fit over 64..256, log-linear to the 32px model below 64
@@ -68,13 +70,13 @@ from plot_style import SURFACE, INK, INK_2, style_axis, end_labels
 COLORS = {'uniform': '#2a78d6', 'random': '#1baf7a', 'dino': '#eda100', 'loss': '#e87ba4', 'loss_exact': '#a8336b', 'pixel': '#008300'}
 MARKERS = {'uniform': 'o', 'random': 's', 'dino': '^', 'loss': 'D', 'loss_exact': 'P', 'pixel': 'v'}
 # a 2-level variant (16 / 8 px only): its router's colour and marker, dashed line, hollow marker
-base = lambda r: r.removesuffix('_2level')
+base = lambda r: r.removesuffix('_pooled').removesuffix('_perimage').removesuffix('_2level')
 for r in list(series):
     COLORS.setdefault(r, COLORS.get(base(r), INK_2))
-    MARKERS.setdefault(r, MARKERS.get(base(r), 'o'))
-LS = lambda r: '--' if r.endswith('_2level') else '-'
+    MARKERS.setdefault(r, 'h' if r.endswith('_pooled') else 'X' if r.endswith('_perimage') else MARKERS.get(base(r), 'o'))
+LS = lambda r: '-.' if r.endswith('_pooled') else ':' if r.endswith('_perimage') else '--' if r.endswith('_2level') else '-'
 mk = dict(markersize=8, markeredgecolor=SURFACE, markeredgewidth=2, linestyle='none')
-mk_of = lambda r: dict(mk, markerfacecolor=SURFACE, markeredgecolor=COLORS[r]) if r.endswith('_2level') else mk
+mk_of = lambda r: dict(mk, markerfacecolor=SURFACE, markeredgecolor=COLORS[r]) if two_level(r) else mk
 
 def log2_axis(ax, ks):
     ax.set_xscale('log', base=2)
@@ -96,7 +98,7 @@ for K, name in ((16, f'all {p32}px'), (64, f'all {p16}px'), (256, f'all {p8}px')
 style_axis(ax, 'tokens per image K', f'FID-{n_img / 1000:g}k (lower is better)', 'FID vs tokens: measured (markers), fit (lines)')
 log2_axis(ax, sorted({16} | {K for p in series.values() for K in p}))
 ax.legend(handles=[Line2D([], [], color=COLORS[r], marker=MARKERS[r], linewidth=2, markersize=7, label=r, linestyle=LS(r),
-                          markerfacecolor=SURFACE if r.endswith('_2level') else COLORS[r]) for r in series],
+                          markerfacecolor=SURFACE if two_level(r) else COLORS[r]) for r in series],
           frameon=False, fontsize=8, labelcolor=INK_2, loc='upper right')
 
 # 2. matched tokens
@@ -106,7 +108,7 @@ for r in series:
     if r == 'uniform':
         continue
     ax.plot(Kr, f_at(r, Kr) - f_at('uniform', Kr), color=COLORS[r], linewidth=2, linestyle=LS(r))
-    ks = [K for K in measured(r) if K in series['uniform'] and K > 64 or (K == 64 and not r.endswith('_2level'))]
+    ks = [K for K in measured(r) if K in series['uniform'] and K > 64 or (K == 64 and not two_level(r))]
     d = [series[r][K] - series['uniform'][K] for K in ks]
     ax.plot(ks, d, MARKERS[r], color=COLORS[r], **mk_of(r))
     ys.append(d); labs.append(f'{r} {d[-1]:+.1f}')

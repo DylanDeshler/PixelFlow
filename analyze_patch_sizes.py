@@ -38,6 +38,16 @@ Parts (every generation uses the same seed, so the same noise and labels: sample
                  by patch size  the same layouts with the 8px regions rendered by the 16px model (what splitting buys)
                                 and with the 32px regions rendered by the 16px model (what merging costs)
                The by-K view is the stitched part's K sweep.
+  heatmap      (--heatmap / --heatmap_only, opt-in; ~an hour at 5k images) FID of the one-step clean estimate from
+               held-out images noised to each t in --heatmap_ts, for every --heatmap_routers layout at every K in
+               --heatmap_tokens: each model runs once per t and the layouts are composited from their predictions. Where in t
+               the budget (uniform: share of the 16px -> 8px gap closed) and its placement (router - uniform) matter for the
+               estimate; a guide for t-varying budgets, which --t_schedules then tests with real sampling.
+  schedules    (--t_schedules, opt-in) A t-varying budget at a matched average: K(t) over the sampler's call times
+               with the same mean tokens per call (compute per sample) as a constant --schedule_tokens. lin<d>: linear in
+               t (d tokens per unit t; + more near clean, - more near noise); switch: the 16px model alone, then the 8px
+               model alone from the t that matches the mean (switchrev: the reverse), no spatial routing at all. Run for
+               --schedule_routers, so {router, uniform} x {constant, t-varying} separates time from space.
   regions      (--regions, default on; minutes) Which regions benefit, per t: on held-out images noised to each t in --ts,
                the split gain of every candidate patch (the error the finer model removes over its region: e32 - e16,
                e16 - e8; split exactly into structure (8px block means) + detail), and every heuristic's rank
@@ -81,6 +91,7 @@ Outputs: {out}.json (every number), {out}_samples.npz (--n_samples images per co
   {out}_heuristics.png   rank correlation of each heuristic with the loss / feature split gains vs t, per level, and
                          the heuristics' correlations with each other at --viz_t
   {out}_layouts_t{t}_K{K}.png  every method's layout side by side
+  {out}_heatmap.png      one-step estimate FID over t x K: uniform's gap closed, each router minus uniform
   {out}_gains.png        gain maps per region with the loss-oracle's, feature-oracle's and routers' layouts at --viz_t
 """
 
@@ -112,6 +123,11 @@ routers = 'loss,loss_exact,dino,pixel,random,uniform' # + disagree; any router +
 attr_routers = 'loss,dino'
 attr_tokens = 64
 attr_t = '0,0.5,0.8,1' # t window edges for the by-t attribution
+# t-varying budgets at a matched average (tokens per network call): K(t) per schedule, for each router at each mean K
+t_schedules = '' # e.g. lin+192,lin-192,switch,switchrev: lin<d> = K changing by d tokens per unit t (+: more near clean),
+                 # switch(rev) = the 16px model alone, then the 8px model alone (reversed) from the t that matches the mean
+schedule_routers = 'loss_exact_2level,uniform'
+schedule_tokens = '160' # the mean K
 fid = True # FID per configuration (False: samples, seams and figures only, ~a minute per configuration)
 n_samples = 32 # samples per configuration (same seed and labels, spread over the classes) for seams and figures
 show_samples = 6 # of those, in each samples figure
@@ -145,6 +161,14 @@ layout_methods = 'uniform,random,pixel,dino,loss,loss_exact,loss_exact_2level,lo
 layout_ts = '0.3,0.6,0.9'
 layout_tokens = '' # default: --tokens (budgets below the 16px count are skipped for two-level methods)
 layout_batch = 64 # images routed together (pooled methods pool over these); the first viz_images are shown
+# heatmap: FID of the one-step clean estimate from held-out images noised to each t, for every router x K (two levels):
+# each model runs once per t, every layout is composited from their predictions (cheap: no sampling trajectories)
+heatmap = False
+heatmap_only = False
+heatmap_images = 5000
+heatmap_ts = '0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,0.95'
+heatmap_tokens = '64,82,100,124,160,196,226,256'
+heatmap_routers = 'uniform,loss_exact_2level,pixel_2level'
 out = '' # output prefix; default {data_dir name}_patch_sizes
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 # -----------------------------------------------------------------------------
@@ -221,9 +245,15 @@ windows = list(zip(edges[:-1], edges[1:]))
 router = QuadRouter(geo, geo.n0, 'uniform', gate_tau=gate_tau, num_classes=num_classes, img=img)
 bare = lambda r: r.removesuffix('_pooled').removesuffix('_perimage').removesuffix('_2level').removesuffix('_exact')
 layout_list = [r for r in layout_methods.split(',') if r] if (layouts or layouts_only) else []
+for r in (schedule_routers.split(',') if t_schedules else []):
+    assert bare(r) in ('loss', 'dino', 'pixel', 'disagree', 'random', 'uniform'), f"unknown schedule router '{r}'"
 for r in layout_list: # the oracle (true image) is allowed here: a reference layout, not a router
     assert bare(r) in ('loss', 'dino', 'pixel', 'disagree', 'random', 'uniform', 'oracle'), f"unknown layout method '{r}'"
-if regions or 'dino' in {bare(r) for r in router_list + attr_list + layout_list + (recon_routers.split(',') if recon else [])}:
+heatmap_list = [r for r in heatmap_routers.split(',') if r] if (heatmap or heatmap_only) else []
+for r in heatmap_list: # two-level composites of the 16px / 8px models (K = N1 .. N2)
+    assert bare(r) in ('loss', 'dino', 'pixel', 'disagree', 'random', 'uniform') and (bare(r) == 'uniform' or r.endswith(('_2level', '_pooled', '_perimage'))), \
+        f"heatmap router '{r}': uniform or a two-level router (X_2level, X_pooled, X_perimage)"
+if regions or 'dino' in {bare(r) for r in router_list + attr_list + layout_list + heatmap_list + (recon_routers.split(',') if recon else [])}:
     router.load_dino(dino)
 router.to(device)
 LEVEL_TOKENS = {geo.counts[l]: l for l in range(geo.L)} # uniform layouts of one level: K = 16 / 64 / 256 at 128px
@@ -240,7 +270,7 @@ if os.path.exists(out + '.json'):
     with open(out + '.json') as fh:
         prev = json.load(fh)
     if all(prev.get('config', {}).get(k) == config[k] for k in FID_KEYS):
-        for part in ('fid', 'recon', 'seams', 'flicker', 'regions', 'layouts'):
+        for part in ('fid', 'recon', 'seams', 'flicker', 'regions', 'layouts', 'schedules', 'heatmap'):
             results[part] = prev.get(part, {})
         if os.path.exists(out + '_samples.npz'):
             samples = dict(np.load(out + '_samples.npz'))
@@ -455,6 +485,53 @@ def partial_split_removed(sel_cells, eval_cells, K):
         out[name] = torch.where(c == 3, full_e, torch.where(c == 2, half_e, zero)).sum(1)
     return out
 
+def call_times():
+    # the times at which the sampler calls the network, in order (JiT's grid; Heun: 2 calls per step, the last step Euler)
+    den = models[1]
+    den.steps, den.method = num_sampling_steps, sampling_method
+    ts = den.sampling_timesteps('cpu').tolist()
+    if sampling_method == 'heun':
+        return [v for i in range(len(ts) - 2) for v in (ts[i], ts[i + 1])] + [ts[-2]]
+    return ts[:-1] # euler / ancestral: one call per step
+
+def budget_schedule(spec, K_mean):
+    """
+    {round(t, 4): K} over the sampler's call times, with the mean over calls (= compute per sample) matched to K_mean as
+    closely as valid budgets allow (two levels: N1 + 3m, N1 <= K <= N2). lin<d>: K = K_mean + d (t - c), clipped and
+    snapped, c solved by bisection; switch / switchrev: N1 then N2 (N2 then N1), switching at the call that matches the mean.
+    Returns (schedule, achieved mean).
+    """
+    calls = call_times()
+    n1, n2 = geo.counts[1], geo.counts[2]
+    snap = lambda K: int(min(n2, max(n1, n1 + 3 * round((K - n1) / 3))))
+    if spec in ('switch', 'switchrev'):
+        # switch at a whole time point (Heun calls most times twice): add times, cleanest first for switch (noisiest
+        # first for switchrev), at the finest level while that brings the mean closer to K_mean
+        times = sorted({round(t, 4) for t in calls}, reverse=(spec == 'switch'))
+        count = {t: sum(round(c, 4) == t for c in calls) for t in times}
+        fine, n_fine, target = set(), 0, len(calls) * (K_mean - n1) / (n2 - n1)
+        for t in times:
+            if abs(n_fine + count[t] - target) >= abs(n_fine - target):
+                break
+            fine.add(t); n_fine += count[t]
+        Ks = [n2 if round(t, 4) in fine else n1 for t in calls]
+    else:
+        assert spec.startswith('lin'), f"unknown schedule '{spec}': lin<d>, switch, switchrev"
+        d = float(spec[3:])
+        f = lambda c: [snap(K_mean + d * (t - c)) for t in calls]
+        lo, hi = -10.0, 10.0 # mean(f(c)) decreases in c for d > 0 (increases for d < 0)
+        for _ in range(60):
+            mid = (lo + hi) / 2
+            if (np.mean(f(mid)) > K_mean) == (d > 0):
+                lo = mid
+            else:
+                hi = mid
+        Ks = f((lo + hi) / 2)
+    sched = {}
+    for t, K in zip(calls, Ks):
+        sched.setdefault(round(t, 4), K)
+    return sched, float(np.mean([sched[round(t, 4)] for t in calls])) # the mean the sampler realizes
+
 def stitched_error(layout, E):
     # a layout's error: every finest cell's error from the model at its token's size [B]
     lev = cell_maps(layout, geo)[1]
@@ -529,25 +606,28 @@ class StitchedNet(nn.Module):
     layout of the trajectory) per call as device tensors, read once by summary(); after a trajectory, cache holds its final
     layout. No host syncs per call (except to test t against a window), so the GPU never waits on Python between models.
     """
-    def __init__(self, mode, K, window=(0.0, 1.0), render=None, cfg_pairs=None):
+    def __init__(self, mode, K, window=(0.0, 1.0), render=None, cfg_pairs=None, schedule=None):
         super().__init__()
         self.mode, self.K, self.window, self.render = mode, K, window, render or {}
         # with guidance every call is [conditional; unconditional] (FastDenoiser batches them; the interval is all of t):
         # both halves take the conditional half's layout, so guidance combines two predictions of one stitching
         self.cfg_pairs = cfg != 1.0 if cfg_pairs is None else cfg_pairs
         self.base, self.exact, self.two, self.pool = base_router(mode)
+        self.schedule, self.cur_K = schedule, None # schedule: {round(t, 4): K} (t-varying budget), else K throughout
         self.x_true, self.cache, self.calls, self.prev = None, None, 0, None
         self.log = [] # (t, area [L], flicker or None, tokens per image [mean, std, min, max]) per call
         # the models this configuration can use, known up front (the levels a layout can contain, after render)
         levels = set(range(geo.L))
-        if self.base == 'uniform': # one fixed layout
-            levels = set(geo.level[allocate(router.neutral[None].cpu(), K, geo, geo.children, geo.parent)[0]].tolist())
+        if self.base == 'uniform': # one fixed layout per budget
+            levels = set()
+            for k in (set(schedule.values()) if schedule else {K}):
+                levels |= set(geo.level[allocate(router.neutral[None].cpu(), k, geo, geo.children, geo.parent)[0]].tolist())
         if self.two:
             levels.discard(0)
         self.used = sorted({self.render.get(l, l) for l in levels})
 
     def begin_sampling(self): # called by the sampler at the start of every trajectory
-        self.cache, self.calls, self.prev = None, 0, None
+        self.cache, self.calls, self.prev, self.cur_K = None, 0, None, None
 
     def end_sampling(self):
         pass
@@ -586,14 +666,16 @@ class StitchedNet(nn.Module):
             if self.two:
                 preds[0] = preds[1]
         flick = None
-        if self.cache is None or self.cache.shape[0] != B or self.calls % route_every == 0:
+        K = self.K if self.schedule is None else self.schedule[min(self.schedule, key=lambda s: abs(s - t0.item()))] # (host t)
+        if self.cache is None or self.cache.shape[0] != B or self.calls % route_every == 0 or K != self.cur_K:
+            self.cur_K = K
             h = B // 2 if self.cfg_pairs else B
             half = lambda v: None if v is None else v[:h]
             scores = router_scores(self.base, z[:h], t[:h], preds=[half(p) for p in preds], x_true=half(self.x_true))
             if self.pool:
-                lev = pooled_levels(scores, self.K, self.pool)
+                lev = pooled_levels(scores, K, self.pool)
             else:
-                lev = cell_maps(layout_of(scores, self.K, self.exact, self.two), geo)[1]
+                lev = cell_maps(layout_of(scores, K, self.exact, self.two), geo)[1]
             if self.cfg_pairs:
                 lev = lev.repeat(2, 1, 1)
             if self.prev is not None and self.prev.shape == lev.shape: # flicker: area re-tokenized since the last layout
@@ -914,6 +996,101 @@ if layout_list:
     if layouts_only:
         sys.exit(0)
 
+# -----------------------------------------------------------------------------
+# heatmap: one-step estimate FID over t x K
+
+@torch.no_grad()
+def heatmap_part():
+    """
+    For each t in heatmap_ts: heatmap_images held-out images noised to t (the same noise for every cell), the 16px and 8px
+    models' clean estimates (guided with --cfg: u + cfg (c - u), as the sampler combines them; layouts from the conditional
+    predictions, as in sampling), and for every router and K the composite estimate (8px model where the layout is at
+    8px). FID of every composite against the reference statistics. This is the quality of the estimate at t, not of
+    samples (a trajectory can't be composed from per-step results), so read it relative: per t, a router vs uniform at the
+    same K, in units of the 16px -> 8px difference at that t.
+    """
+    Ks = [int(k) for k in heatmap_tokens.split(',')]
+    n1, n2 = geo.counts[1], geo.counts[2]
+    mid = [K for K in Ks if n1 < K < n2]
+    idx = np.sort(np.random.default_rng(seed + 3).choice(len(data), min(heatmap_images, len(data)), replace=False))
+    hm = results.setdefault('heatmap', {})
+    for t_val in [float(v) for v in heatmap_ts.split(',')]:
+        tk = f'{t_val:g}'
+        cells = ['16px', '8px'] + [f'{r}_K{K}' for r in heatmap_list for K in mid]
+        if tk in hm and all(c in hm[tk] for c in cells):
+            continue
+        feats = {c: [] for c in cells}
+        logits = {c: [] for c in cells}
+        t_start = time.time()
+        for i in range(0, len(idx), gen_batch_size):
+            xb, yb = data.get(idx[i:i + gen_batch_size])
+            xb, yb = to_model_input(xb, flip=False, device=device), torch.from_numpy(yb).to(device)
+            e = torch.randn(xb.shape, generator=torch.Generator(device=device).manual_seed(seed + 3 + i), device=device) * noise_scale
+            t = torch.full((len(xb),), t_val, device=device)
+            z = t_val * xb + (1 - t_val) * e
+            with ctx:
+                c16, c8 = nets[1](z, t, yb).float(), nets[2](z, t, yb).float()
+                if cfg != 1.0:
+                    null = torch.full_like(yb, num_classes)
+                    u16, u8 = nets[1](z, t, null).float(), nets[2](z, t, null).float()
+                    g16, g8 = u16 + cfg * (c16 - u16), u8 + cfg * (c8 - u8)
+                else:
+                    g16, g8 = c16, c8
+            def add(cell, x):
+                f_, l_ = metrics.features(to_uint8(x))
+                feats[cell].append(f_); logits[cell].append(l_)
+            add('16px', g16); add('8px', g8)
+            for r in heatmap_list:
+                for K in mid:
+                    lev = method_levels(r, z, t, [c16, c16, c8], None, K)
+                    lev_px = lev.repeat_interleave(f_cell, 1).repeat_interleave(f_cell, 2).unsqueeze(1)
+                    add(f'{r}_K{K}', torch.where(lev_px == 2, g8, g16))
+        hm[tk] = {c: metrics.compute(torch.cat(feats[c]), torch.cat(logits[c]), ref_stats)[0] for c in cells}
+        save()
+        row = hm[tk]
+        gap = row['16px'] - row['8px'] or float('nan')
+        print(f"heatmap t={tk} ({time.time() - t_start:.0f}s): 16px {row['16px']:.1f}, 8px {row['8px']:.1f} | gap closed at K="
+              + ','.join(map(str, mid)) + ': ' + ' | '.join(f"{r} " + ' '.join(f"{(row['16px'] - row[f'{r}_K{K}']) / gap:.0%}" for K in mid) for r in heatmap_list))
+    heatmap_figure(Ks, mid)
+
+def heatmap_figure(Ks, mid):
+    hm = results['heatmap']
+    ts_ = sorted(hm, key=float)
+    others = [r for r in heatmap_list if base_router(r)[0] != 'uniform']
+    uni = next((r for r in heatmap_list if base_router(r)[0] == 'uniform'), None)
+    def closed(r, t):
+        row = hm[t]
+        gap = row['16px'] - row['8px'] or float('nan')
+        return [(row['16px'] - (row['16px'] if K == geo.counts[1] else row['8px'] if K == geo.counts[2] else row[f'{r}_K{K}'])) / gap for K in Ks]
+    panels = ([('uniform: share of the 16px -> 8px gap closed', np.array([closed(uni, t) for t in ts_]), 'Blues', (0, 1))] if uni else []) \
+        + [(f'{r} - uniform (share of the gap; + = {r} better)', np.array([closed(r, t) for t in ts_]) - np.array([closed(uni, t) for t in ts_]), 'RdBu', None)
+           for r in others if uni]
+    if not panels:
+        return
+    diffs = [M for _, M, _, lim in panels if lim is None] # one symmetric scale for every router panel, so they compare
+    m = max([np.nanmax(np.abs(M)) for M in diffs if np.isfinite(M).any()] + [1e-6]) if diffs else 1.0
+    panels = [(ti, M, cm, lim if lim is not None else (-m, m)) for ti, M, cm, lim in panels]
+    fig, axes = plt.subplots(1, len(panels), figsize=(6.2 * len(panels), 0.42 * len(ts_) + 2.2), facecolor=SURFACE, squeeze=False)
+    for ax, (title, M, cmap, lim) in zip(axes[0], panels):
+        im = ax.imshow(M, cmap=cmap, vmin=lim[0], vmax=lim[1], aspect='auto')
+        heatmap_style(ax, im, fig, [str(K) for K in Ks], [f't={t}' for t in ts_], title, 'share of the gap')
+        ax.set_xlabel('tokens per image K', color=INK_2, fontsize=8)
+        for i in range(M.shape[0]):
+            for j in range(M.shape[1]):
+                strong = (M[i, j] - lim[0]) / (lim[1] - lim[0]) > 0.6 if cmap == 'Blues' else abs(M[i, j]) > 0.6 * lim[1]
+                ax.text(j, i, f'{M[i, j]:.0%}', ha='center', va='center', fontsize=6, color=SURFACE if strong else INK)
+    fig.suptitle(f'one-step estimate FID-{heatmap_images / 1000:g}k from held-out images noised to t (cfg {cfg}): where in t the budget and '
+                 f'its placement matter (the estimate at t, not samples)', color=INK, fontsize=10, x=0.01, ha='left')
+    fig.tight_layout(rect=(0, 0, 1, 0.92))
+    fig.savefig(out + '_heatmap.png', dpi=140, facecolor=SURFACE)
+    plt.close(fig)
+    print(f'wrote {out}_heatmap.png')
+
+if heatmap_list:
+    heatmap_part()
+    if heatmap_only:
+        sys.exit(0)
+
 print(f"models: {', '.join(f'{p}px' for p in patches)} at {img}px | FID-{num_images / 1000:g}k, {sampling_method} "
       f"{num_sampling_steps} steps, cfg {cfg} | routers {router_list} at K {budgets} | attribution {attr_list} at K={attr_tokens}")
 for l in range(geo.L):
@@ -931,6 +1108,16 @@ for r in attr_list:
         run(f'{r}_K{attr_tokens}_t{lo:g}-{hi:g}', StitchedNet(r, attr_tokens, window=(lo, hi)))
     run(f'{r}_K{attr_tokens}_nosplit', StitchedNet(r, attr_tokens, render={geo.L - 1: 1}))
     run(f'{r}_K{attr_tokens}_nomerge', StitchedNet(r, attr_tokens, render={0: 1}))
+for K in [int(k) for k in schedule_tokens.split(',')] if t_schedules else []:
+    for spec in t_schedules.split(','):
+        sched, mean = budget_schedule(spec, K)
+        print(f'schedule {spec} at mean K={K}: achieved {mean:.1f} tokens per call, K(t) from {sched[min(sched)]} '
+              f'(t={min(sched):g}) to {sched[max(sched)]} (t={max(sched):g})')
+        results.setdefault('schedules', {})[f'{spec}_K{K}'] = {'mean': mean, 'K_by_t': {f'{t:g}': k for t, k in sorted(sched.items())}}
+        for r in schedule_routers.split(','):
+            if spec.startswith('switch') and base_router(r)[0] != 'uniform':
+                continue # all-16px / all-8px layouts: every router gives the same ones
+            run(f'{stitched_key(r, K)}_{spec}', StitchedNet(r, K, schedule=sched))
 
 if f'uniform_{patches[1]}px' in results['fid'] and f'uniform_{patches[2]}px' in results['fid']:
     F16, F8 = fid_of(f'uniform_{patches[1]}px'), fid_of(f'uniform_{patches[2]}px')
