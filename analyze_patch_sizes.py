@@ -114,7 +114,7 @@ cfg = 1.0
 num_sampling_steps = 50
 sampling_method = 'heun'
 gen_batch_size = 128
-compile = False # torch.compile every network (one-time compile per batch shape; outputs match to bf16 rounding)
+compile = True # torch.compile every network (one-time compile per batch shape; outputs match to bf16 rounding)
 dino = 'dinov2_vitb14_reg'
 gate_tau = 1.0
 # regions: which regions benefit, and the heuristics' correlation with that
