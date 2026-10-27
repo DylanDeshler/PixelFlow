@@ -437,6 +437,10 @@ configuration uses the same noise and labels. The full description is in the scr
     1 means no seams;
   - flicker: the share of the image re-tokenized from one layout to the next within a trajectory.
 
+- **layouts** (`--layouts_only=True` for only these, about a minute): every method's layout on the same held-out
+  images noised to each t in `--layout_ts`, side by side, in `_layouts_t{t}_K{K}.png`. Each method's agreement is
+  measured against the measured-gain oracle under the same allocation rules (exact or greedy, levels, pooling).
+
   Run with `--fid=False` to get only these, at about a minute per configuration, e.g. on top of a finished FID run.
   The regions part also reports how much measured error the greedy vs the exact allocation removes. It also reports partial splits, a
   no-training lower bound for binary (16×8) splits: refining only the best half of a 16px patch for +2 tokens, next to

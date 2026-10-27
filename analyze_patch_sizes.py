@@ -50,6 +50,11 @@ Parts (every generation uses the same seed, so the same noise and labels: sample
                (loss) gains. And partial splits, a no-training lower bound for binary (16x8) splits: refining only the
                best half of a 16px patch for +2 tokens (the other half at 16px quality) next to whole-patch splits (+3),
                allocated exactly at each K; with how concentrated a patch's gain is in its best half / quadrant.
+  layouts      (--layouts, default on; --layouts_only for just these, ~a minute) Every method in --layout_methods on the
+               same held-out images noised to each t in --layout_ts, at each budget: the layouts drawn side by side next
+               to the image and the 16px estimate the routers see, with each method's agreement with the measured-gain
+               oracle under the same allocation rules (exact or greedy, levels, pooling; the oracle sees the true image: a
+               reference, not a router).
   recon        (--recon, opt-in) Reconstruction FID: held-out images noised to t0 and sampled from there with stitched
                layouts, including the loss-oracle (layout re-chosen every step from the measured gains against the true
                image). A router beating the loss-oracle on FID means loss is the wrong target for splitting.
@@ -75,6 +80,7 @@ Outputs: {out}.json (every number), {out}_samples.npz (--n_samples images per co
                          its final layout drawn; FID and seams in the titles
   {out}_heuristics.png   rank correlation of each heuristic with the loss / feature split gains vs t, per level, and
                          the heuristics' correlations with each other at --viz_t
+  {out}_layouts_t{t}_K{K}.png  every method's layout side by side
   {out}_gains.png        gain maps per region with the loss-oracle's, feature-oracle's and routers' layouts at --viz_t
 """
 
@@ -132,6 +138,13 @@ recon_routers = 'oracle,loss,dino,random,uniform'
 # figures
 viz_t = 0.85 # one of --ts (and --feature_ts for the feature-oracle column)
 viz_images = 8
+# layouts: every method's layout on the same noised held-out images, side by side (cheap: one prediction per model)
+layouts = True
+layouts_only = False # just the layout figures (~a minute), no sampling
+layout_methods = 'uniform,random,pixel,dino,loss,loss_exact,loss_exact_2level,loss_pooled,loss_perimage,oracle,oracle_2level'
+layout_ts = '0.3,0.6,0.9'
+layout_tokens = '' # default: --tokens (budgets below the 16px count are skipped for two-level methods)
+layout_batch = 64 # images routed together (pooled methods pool over these); the first viz_images are shown
 out = '' # output prefix; default {data_dir name}_patch_sizes
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 # -----------------------------------------------------------------------------
@@ -207,7 +220,10 @@ edges = [float(v) for v in attr_t.split(',')]
 windows = list(zip(edges[:-1], edges[1:]))
 router = QuadRouter(geo, geo.n0, 'uniform', gate_tau=gate_tau, num_classes=num_classes, img=img)
 bare = lambda r: r.removesuffix('_pooled').removesuffix('_perimage').removesuffix('_2level').removesuffix('_exact')
-if regions or 'dino' in {bare(r) for r in router_list + attr_list + (recon_routers.split(',') if recon else [])}:
+layout_list = [r for r in layout_methods.split(',') if r] if (layouts or layouts_only) else []
+for r in layout_list: # the oracle (true image) is allowed here: a reference layout, not a router
+    assert bare(r) in ('loss', 'dino', 'pixel', 'disagree', 'random', 'uniform', 'oracle'), f"unknown layout method '{r}'"
+if regions or 'dino' in {bare(r) for r in router_list + attr_list + layout_list + (recon_routers.split(',') if recon else [])}:
     router.load_dino(dino)
 router.to(device)
 LEVEL_TOKENS = {geo.counts[l]: l for l in range(geo.L)} # uniform layouts of one level: K = 16 / 64 / 256 at 128px
@@ -224,7 +240,7 @@ if os.path.exists(out + '.json'):
     with open(out + '.json') as fh:
         prev = json.load(fh)
     if all(prev.get('config', {}).get(k) == config[k] for k in FID_KEYS):
-        for part in ('fid', 'recon', 'seams', 'flicker', 'regions'):
+        for part in ('fid', 'recon', 'seams', 'flicker', 'regions', 'layouts'):
             results[part] = prev.get(part, {})
         if os.path.exists(out + '_samples.npz'):
             samples = dict(np.load(out + '_samples.npz'))
@@ -814,6 +830,89 @@ def stitched_key(r, K):
     if r == 'uniform_2level':
         r = 'uniform'
     return f'uniform_{patches[LEVEL_TOKENS[K]]}px' if r == 'uniform' and K in LEVEL_TOKENS else f'{r}_K{K}'
+
+# -----------------------------------------------------------------------------
+# layouts: every method on the same noised held-out images
+
+@torch.no_grad()
+def method_levels(name, z, t, preds, x_true, K):
+    # a method's cell level maps [B, G, G] at budget K, routed as in sampling (CFG-free: the conditional predictions)
+    b, ex, two, pool = base_router(name)
+    p = list(preds)
+    if two:
+        p[0] = p[1]
+    scores = router_scores(b, z, t, preds=p, x_true=x_true)
+    return pooled_levels(scores, K, pool) if pool else cell_maps(layout_of(scores, K, ex, two), geo)[1]
+
+@torch.no_grad()
+def layout_figures():
+    Ks = [int(k) for k in (layout_tokens or tokens).split(',')]
+    rng_idx = np.sort(np.random.default_rng(seed + 2).choice(len(data), min(layout_batch, len(data)), replace=False))
+    xb, yb = data.get(rng_idx)
+    xb, yb = to_model_input(xb, flip=False, device=device), torch.from_numpy(yb).to(device)
+    cls = [names_all[i] for i in yb.tolist()]
+    e = torch.randn(xb.shape, generator=torch.Generator(device=device).manual_seed(seed + 2), device=device) * noise_scale
+    nv = min(viz_images, len(xb))
+    results.setdefault('layouts', {})
+    for t_val in [float(v) for v in layout_ts.split(',')]:
+        t = torch.full((len(xb),), t_val, device=device)
+        z = t_val * xb + (1 - t_val) * e
+        with torch.no_grad(), ctx:
+            preds = [net(z, t, yb).float() for net in nets]
+        est = null_estimate(z, t)
+        for K in Ks:
+            levs, info = {}, {}
+            for m in layout_list:
+                if base_router(m)[2] and K < geo.counts[1]:
+                    continue
+                levs[m] = method_levels(m, z, t, preds, xb, K)
+            refs = {} # the oracle under the same allocation rules (exact, levels, pooling): 'loss_exact_2level' -> 'oracle_exact_2level'
+            for m, lev in levs.items():
+                ref = 'oracle' + m[len(base_router(m)[0]):]
+                if ref not in refs:
+                    refs[ref] = levs[ref] if ref in levs else method_levels(ref, z, t, preds, xb, K)
+                agree = (lev == refs[ref]).float().flatten(1).mean(1).mean().item() if m != ref else float('nan')
+                ntok = tokens_per_image(lev)
+                info[m] = {'oracle_agreement': agree, 'tokens_mean': ntok.mean().item(), 'tokens_std': ntok.std(unbiased=False).item(),
+                           'area': level_area(lev).tolist()}
+            results['layouts'][f't{t_val:g}_K{K}'] = info
+            cols = ['image', f'{patches[1]}px estimate'] + list(levs)
+            fig, axes = plt.subplots(nv, len(cols), figsize=(1.6 * len(cols), 1.7 * nv + 1.0), facecolor=SURFACE, squeeze=False)
+            for i in range(nv):
+                for j, c in enumerate(cols):
+                    ax = axes[i, j]
+                    blank(ax)
+                    if c == 'image':
+                        ax.imshow(to_np(xb[i]))
+                        ax.set_ylabel(cls[i][:16], color=INK_2, fontsize=7)
+                    elif c.endswith('estimate'):
+                        ax.imshow(to_np(est[i]))
+                    else:
+                        ax.imshow(to_np(draw_layout(xb[i:i + 1].cpu(), layout_from_levels(levs[c][i].cpu()), geo)[0]))
+                        if base_router(c)[3]:
+                            ax.set_xlabel(f'{tokens_per_image(levs[c][i:i + 1]).item():.0f} tokens', color=INK_2, fontsize=7)
+                    if i == 0:
+                        title = c
+                        if c in info:
+                            a = info[c]['oracle_agreement']
+                            title += f"\n{'oracle agree ' + format(a, '.0%') if a == a else ('reference' if c.startswith('oracle') else '')}"
+                        ax.set_title(title, color=INK, fontsize=7)
+            legend_levels(fig, 'token boundaries (finer side)')
+            fig.suptitle(f'layouts at t={t_val:g}, K={K} tokens per image (pooled: on average) on the same noised held-out '
+                         f'images; oracle: the measured gains against the true image (a reference, not a router)',
+                         color=INK, fontsize=9, x=0.01, ha='left')
+            fig.tight_layout(rect=(0, 0, 1, 1 - 0.7 / (1.7 * nv + 1.0)))
+            fig.savefig(out + f'_layouts_t{t_val:g}_K{K}.png', dpi=140, facecolor=SURFACE)
+            plt.close(fig)
+            print(f'layouts t={t_val:g} K={K}: oracle agreement ' + ', '.join(
+                f"{m} {v['oracle_agreement']:.0%}" for m, v in info.items() if v['oracle_agreement'] == v['oracle_agreement'])
+                  + f" -> {out}_layouts_t{t_val:g}_K{K}.png")
+    save()
+
+if layout_list:
+    layout_figures()
+    if layouts_only:
+        sys.exit(0)
 
 print(f"models: {', '.join(f'{p}px' for p in patches)} at {img}px | FID-{num_images / 1000:g}k, {sampling_method} "
       f"{num_sampling_steps} steps, cfg {cfg} | routers {router_list} at K {budgets} | attribution {attr_list} at K={attr_tokens}")
