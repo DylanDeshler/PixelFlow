@@ -414,6 +414,9 @@ configuration uses the same noise and labels. The full description is in the scr
   - **dino, pixel:** on the 16px null-label estimate, as in training.
   - **random, uniform.**
   - **disagree** (optional): equals loss for 16px parents.
+  - **`<router>_exact`** (default: `loss_exact`): the router's scores with the exact allocation instead of the greedy.
+    A small dynamic program over the tree finds the layout that maximizes the summed scores. The greedy never splits a
+    32px patch whose own gain is small to reach large gains among its children.
 - **attribution** at `--attr_tokens`:
   - by t: stitching only inside each t window, with the 16px model elsewhere;
   - by patch size: the same layouts with the 8px regions, or the 32px regions, rendered by the 16px model (what
@@ -422,6 +425,14 @@ configuration uses the same noise and labels. The full description is in the scr
   Every heuristic's rank correlation with it: loss, i.e. how much of the realized gain is predictable from z_t; dino and its gate and divergence terms; pixel; disagree; centre; random.,
   also in Inception feature space, plus the heuristics' correlations with each other.
 - **recon** (`--recon`): reconstruction FID from t0, including the loss-oracle that sees the true image.
+- **samples, seams and flicker**, per configuration, from 32 samples (same seed and labels everywhere):
+  - `_samples_K{K}.png`: each image, then with its final layout drawn;
+  - seam ratio: boundary vs inside-token contrast, relative to the same layouts on the 16px model's samples, where
+    1 means no seams;
+  - flicker: the share of the image re-tokenized from one layout to the next within a trajectory.
+
+  Run with `--fid=False` to get only these, at about a minute per configuration, e.g. on top of a finished FID run.
+  The regions part also reports how much measured error the greedy vs the exact allocation removes.
 
 Results are saved after every generation, and a rerun with the same `--out` skips finished ones. Cost is in units of
 the 8px model generating the same images: a stitched configuration is about 1.3 for the models, plus 0.25 for the

@@ -20,6 +20,11 @@ Parts (every generation uses the same seed, so the same noise and labels: sample
                  disagree ||x_coarse - x_fine||^2 per region (= loss for 16px parents; ignores the 16px model's own
                           error for 32px parents)
                  random, uniform (coarse-first, centre-out)
+                 X_exact  router X's scores with the exact allocation (allocate_exact) instead of the greedy: the
+                          layout maximizing the summed scores, where the greedy never splits a node with a small gain to
+                          reach large gains among its children. loss_exact: the loss router's own objective, optimized.
+               Flicker: the fraction of the image whose patch size changes from one layout to the next within a
+               trajectory (every re-route), from the sample pass.
                "gap closed" = (FID_16 - FID) / (FID_16 - FID_8): the share of the 16px -> 8px improvement reached.
   attribution  For each router in --attr_routers at --attr_tokens:
                  by t           stitching only for t in each window of --attr_t, the 16px model elsewhere
@@ -33,7 +38,9 @@ Parts (every generation uses the same seed, so the same noise and labels: sample
                pixel, loss (expected gains: how much of the realized gain is predictable from z_t), disagree,
                centre, random. The same in Inception feature space (FID's) on a subset: a patch's gain
                is how much closer the image's pool features get to the real image's when that region is upgraded to the
-               finer model. Plus the heuristics' correlations with each other.
+               finer model. Plus the heuristics' correlations with each other, and the measured error each allocation
+               removes vs the uniform layout at the same K: greedy vs exact, on the measured (oracle) and expected
+               (loss) gains.
   recon        (--recon, opt-in) Reconstruction FID: held-out images noised to t0 and sampled from there with stitched
                layouts, including the loss-oracle (layout re-chosen every step from the measured gains against the true
                image). A router beating the loss-oracle on FID means loss is the wrong target for splitting.
@@ -41,23 +48,31 @@ Parts (every generation uses the same seed, so the same noise and labels: sample
 Caveats.
   * The three models differ in compute per pixel and bottleneck compression as well as patch size; a budget-K QuadJiT
     is one network, so this is a guide to the gains, not a prediction of a trained model.
-  * Stitched sampling can show seams between the models' predictions, which a single network wouldn't have.
+  * Stitched sampling can show seams between the models' predictions, which a single network wouldn't have. Measured
+    by the seam ratio (mean |neighbour difference| across token boundaries / inside tokens) of every configuration's
+    samples with their final layouts, against the same layouts on the 16px / 8px models' samples of the same noise
+    (placebos: no stitching). "seams x1.00" = no more boundary contrast than the placebo. The samples figures show
+    every image clean and with its layout, to judge by eye.
   * A stitched configuration runs the models its layout needs (all three: ~1.3x the 8px model's cost), plus the 16px
     routing estimate (dino / pixel: ~0.25x) and DINOv2 at 224px (dino: ~1x). --route_every reuses a layout for that many
     network calls of a trajectory.
   * Results are written after every generation; rerunning with the same --out and FID settings skips finished ones.
+    --fid=False: samples, seams and figures only (~a minute per configuration), e.g. on top of a finished FID run.
 
-Outputs: {out}.json (every number), {out}_samples.npz (the first images of every configuration, with layouts), and
+Outputs: {out}.json (every number), {out}_samples.npz (--n_samples images per configuration, with final layouts), and
   {out}_fid.png          FID vs K per router, with the anchors
   {out}_attribution.png  FID change vs the 16px model: full stitching, per t window, without splits / merges
-  {out}_samples.png      the same noise through the 16px / 8px models and every router at --attr_tokens, layouts drawn
+  {out}_samples_K{K}.png the same noise through the 16px / 8px models and every router at K: each image, then with
+                         its final layout drawn; FID and seams in the titles
   {out}_heuristics.png   rank correlation of each heuristic with the loss / feature split gains vs t, per level, and
                          the heuristics' correlations with each other at --viz_t
   {out}_gains.png        gain maps per region with the loss-oracle's, feature-oracle's and routers' layouts at --viz_t
 """
 
 import os
+import sys
 import json
+import time
 from contextlib import nullcontext
 
 import numpy as np
@@ -68,6 +83,7 @@ import torch.nn.functional as F
 from data_jit import MemmapImages, to_model_input
 from jit_common import load_denoiser, generate_and_score
 from fid import InceptionMetrics, load_ref_stats, to_uint8, precision_recall
+from diagnostics import seam_ratio
 from model_quadtree import QuadGeometry, QuadRouter, allocate, cell_maps, layout_agreement, draw_layout, LEVEL_COLORS
 
 # -----------------------------------------------------------------------------
@@ -78,15 +94,19 @@ seed = 0
 # stitched sampling FID
 num_images = 10000
 tokens = '64,100,160' # budgets K (16 + 3m at 128px)
-routers = 'loss,dino,pixel,random,uniform' # + disagree
+routers = 'loss,loss_exact,dino,pixel,random,uniform' # + disagree; any router + _exact: exact allocation
 attr_routers = 'loss,dino'
 attr_tokens = 64
 attr_t = '0,0.5,0.8,1' # t window edges for the by-t attribution
+fid = True # FID per configuration (False: samples, seams and figures only, ~a minute per configuration)
+n_samples = 32 # samples per configuration (same seed and labels, spread over the classes) for seams and figures
+show_samples = 6 # of those, in each samples figure
 route_every = 1 # reuse a layout for this many network calls of a trajectory (1 = re-route every call)
 cfg = 1.0
 num_sampling_steps = 50
 sampling_method = 'heun'
 gen_batch_size = 128
+compile = False # torch.compile every network (one-time compile per batch shape; outputs match to bf16 rounding)
 dino = 'dinov2_vitb14_reg'
 gate_tau = 1.0
 # regions: which regions benefit, and the heuristics' correlation with that
@@ -113,6 +133,7 @@ config = {k: globals()[k] for k in config_keys}
 # -----------------------------------------------------------------------------
 
 assert ckpts and data_dir, 'pass --ckpts (three plain-JiT checkpoints) and --data_dir'
+sys.stdout.reconfigure(line_buffering=True) # progress lines reach a redirected log (nohup ... > log) as they happen
 out = out or f"{os.path.basename(os.path.normpath(data_dir))}_patch_sizes"
 ctx = torch.autocast(device_type='cuda', dtype=torch.bfloat16) if 'cuda' in device else nullcontext()
 
@@ -123,8 +144,11 @@ models, steps = [d for d, _ in loaded], [m.get('iter_num') for _, m in loaded]
 print('checkpoints at iteration ' + ', '.join(f'{d.net.patch_size}px {s}' for d, s in zip(models, steps)))
 if len(set(steps)) > 1:
     print('WARNING: the checkpoints are at different iterations, so the comparison mixes patch size with training length')
+patches = [d.net.patch_size for d in models]
+if compile:
+    for d in models:
+        d.net = torch.compile(d.net)
 nets = [d.net for d in models]
-patches = [n.patch_size for n in nets]
 img, num_classes = models[0].img_size, models[0].num_classes
 assert all(d.img_size == img and d.num_classes == num_classes for d in models), 'the checkpoints disagree on resolution / classes'
 assert len({d.noise_scale for d in models}) == 1, 'the checkpoints disagree on noise_scale'
@@ -150,17 +174,18 @@ names_all = data.class_names()
 
 # results so far: finished generations are reused if they were made with the same models and sampling settings
 FID_KEYS = ('ckpts', 'ema', 'seed', 'num_images', 'cfg', 'num_sampling_steps', 'sampling_method', 'route_every', 'dino',
-            'gate_tau', 'viz_t', 'viz_images', 'recon_num_images')
-results = {'patches': patches, 'fid': {}, 'regions': {}, 'recon': {}}
+            'gate_tau', 'recon_num_images', 'gen_batch_size') # gen_batch_size: which noise each image gets
+results = {'patches': patches, 'fid': {}, 'seams': {}, 'flicker': {}, 'regions': {}, 'recon': {}}
 samples = {}
 if os.path.exists(out + '.json'):
     with open(out + '.json') as fh:
         prev = json.load(fh)
     if all(prev.get('config', {}).get(k) == config[k] for k in FID_KEYS):
-        results['fid'], results['recon'] = prev.get('fid', {}), prev.get('recon', {})
+        for part in ('fid', 'recon', 'seams', 'flicker'):
+            results[part] = prev.get(part, {})
         if os.path.exists(out + '_samples.npz'):
             samples = dict(np.load(out + '_samples.npz'))
-        print(f"resuming {out}.json: {len(results['fid'])} generations done")
+        print(f"resuming {out}.json: {len(results['fid'])} FIDs done")
     else:
         print(f'{out}.json was made with different FID settings: starting over (pass another --out to keep it)')
 results['config'] = config
@@ -225,64 +250,164 @@ def router_scores(name, z, t, preds=None, x_true=None):
     with ctx:
         return router.dino_scores(est).float() if name == 'dino' else router.pixel_scores(est).float()
 
-def layout_of(scores, K):
-    return allocate(scores, K, geo, router.children, router.parent)
+def maxplus(a, b):
+    # max-plus convolution over the last dim: out[k] = max_j a[k - j] + b[j], and the maximizing j (b's share)
+    la, lb = a.shape[-1], b.shape[-1]
+    k = torch.arange(la + lb - 1, device=a.device)[:, None]
+    j = torch.arange(lb, device=a.device)[None, :]
+    i = k - j
+    m = a[..., i.clamp(0, la - 1)] + b[..., None, :]
+    m = m.masked_fill(~((i >= 0) & (i < la)), float('-inf'))
+    return m.max(-1)
+
+def allocate_exact(scores, K):
+    """
+    The layout maximizing the summed scores of the splits made, under the same rules as the greedy (a node splits only if
+    its parent does; exactly m = (K - N0) / 3 splits). Exact for additive scores (the loss router's expected gains), where
+    the greedy is myopic: it never splits a node with a small gain to reach large gains among its children.
+    Dynamic program: f_node[s] = best total with s splits in the node's subtree (0 unsplit; else its own score + the best
+    share of s - 1 among its children, combined by max-plus convolution), then the same across the N0 roots; the stored
+    maximizers give the splits back.
+    """
+    B, dev = scores.shape[0], scores.device
+    m = geo.check_budget(K)
+    scores = scores.float()
+    children = router.children
+    f = torch.zeros(B, geo.counts[-1], 1, device=dev) # finest level: no splits
+    kid_choices = {} # level -> list of argmax tensors combining children 0..c
+    for l in range(geo.L - 2, -1, -1):
+        sl = scores[:, geo.offsets[l]:geo.offsets[l] + geo.counts[l]]
+        kids = children[geo.offsets[l]:geo.offsets[l] + geo.counts[l]] - geo.offsets[l + 1] # [n_l, 4] within level l + 1
+        g = f[:, kids] # [B, n_l, 4, S + 1]
+        acc, kid_choices[l] = g[:, :, 0], []
+        for c in range(1, 4):
+            acc, arg = maxplus(acc, g[:, :, c])
+            kid_choices[l].append(arg)
+        f = torch.cat([torch.zeros(B, geo.counts[l], 1, device=dev), sl[..., None] + acc], dim=-1)
+    acc, root_choices = f[:, 0], []
+    for r in range(1, geo.n0):
+        acc, arg = maxplus(acc, f[:, r])
+        root_choices.append(arg)
+    # back out the splits per root, then per level
+    rows = torch.arange(B, device=dev)
+    k = torch.full((B,), m, dtype=torch.long, device=dev)
+    s_nodes = torch.zeros(B, geo.n0, dtype=torch.long, device=dev)
+    for r in range(geo.n0 - 1, 0, -1):
+        s_nodes[:, r] = root_choices[r - 1][rows, k]
+        k = k - s_nodes[:, r]
+    s_nodes[:, 0] = k
+    split = torch.zeros(B, geo.n, dtype=torch.bool, device=dev)
+    for l in range(geo.L - 1):
+        split[:, geo.offsets[l]:geo.offsets[l] + geo.counts[l]] = s_nodes > 0
+        if l == geo.L - 2:
+            break
+        rem = (s_nodes - 1).clamp_min(0) # splits shared among the children
+        nl = geo.counts[l]
+        kid_s = torch.zeros(B, nl, 4, dtype=torch.long, device=dev)
+        idx = torch.arange(nl, device=dev)[None, :]
+        for c in range(3, 0, -1):
+            kid_s[:, :, c] = kid_choices[l][c - 1][rows[:, None], idx, rem]
+            rem = rem - kid_s[:, :, c]
+        kid_s[:, :, 0] = rem
+        kid_s = kid_s * (s_nodes > 0)[..., None]
+        kids = children[geo.offsets[l]:geo.offsets[l] + nl] - geo.offsets[l + 1]
+        s_next = torch.zeros(B, geo.counts[l + 1], dtype=torch.long, device=dev)
+        s_next[:, kids.flatten()] = kid_s.flatten(1)
+        s_nodes = s_next
+    in_tree = torch.ones(B, geo.n, dtype=torch.bool, device=dev)
+    in_tree[:, geo.n0:] = split[:, router.parent[geo.n0:]]
+    leaves = in_tree & ~split
+    return torch.arange(geo.n, device=dev).expand(B, -1)[leaves].view(B, K)
+
+def layout_of(scores, K, exact=False):
+    return allocate_exact(scores, K) if exact else allocate(scores, K, geo, router.children, router.parent)
+
+def base_router(name):
+    # 'loss_exact' -> ('loss', True)
+    return (name[:-len('_exact')], True) if name.endswith('_exact') else (name, False)
+
+def stitched_error(layout, E):
+    # a layout's error: every finest cell's error from the model at its token's size [B]
+    lev = cell_maps(layout, geo)[1]
+    return torch.stack(E).gather(0, lev.unsqueeze(0))[0].flatten(1).sum(1)
 
 def level_area(lev):
-    # fraction of the image at each level [L] from a cell level map [B, G, G]
-    return [(lev == l).float().mean().item() for l in range(geo.L)]
+    # fraction of the image at each level [L] (a device tensor: no sync) from a cell level map [B, G, G]
+    return torch.stack([(lev == l).float().mean() for l in range(geo.L)])
 
 # -----------------------------------------------------------------------------
 # stitched sampling
 
 class StitchedNet(nn.Module):
     """
-    The three uniform models as one network: a router's layout picks which model's prediction each region takes. Only the
-    models a layout uses are run (loss / disagree / oracle need all three). Outside `window` (t) the 16px model alone; `render`
-    maps a level to the level whose model renders its regions (attribution). Records the area per level per t and the
-    first batch's layout at viz_t. Under CFG, loss / disagree / oracle route each half on its own predictions.
+    The three uniform models as one network: a router's layout picks which model's prediction each region takes. Outside
+    `window` (t) the 16px model alone; `render` maps a level to the level whose model renders its regions (attribution).
+    mode 'X_exact': router X's scores, exact allocation. Under CFG, loss / disagree / oracle route each half on its own
+    predictions. Logs the area per level and the flicker (fraction of the image whose patch size changed since the previous
+    layout of the trajectory) per call as device tensors, read once by summary(); after a trajectory, cache holds its final
+    layout. No host syncs per call (except to test t against a window), so the GPU never waits on Python between models.
     """
     def __init__(self, mode, K, window=(0.0, 1.0), render=None):
         super().__init__()
         self.mode, self.K, self.window, self.render = mode, K, window, render or {}
-        self.x_true, self.cache, self.calls = None, None, 0
-        self.area, self.viz_layout = {}, None
+        self.base, self.exact = base_router(mode)
+        self.x_true, self.cache, self.calls, self.prev = None, None, 0, None
+        self.log = [] # (t, area [L], flicker or None) per call
+        # the models this configuration can use, known up front (the levels a layout can contain, after render)
+        levels = set(range(geo.L))
+        if self.base == 'uniform': # one fixed layout
+            levels = set(geo.level[allocate(router.neutral[None].cpu(), K, geo, geo.children, geo.parent)[0]].tolist())
+        self.used = sorted({self.render.get(l, l) for l in levels})
 
     def begin_sampling(self): # called by the sampler at the start of every trajectory
-        self.cache, self.calls = None, 0
+        self.cache, self.calls, self.prev = None, 0, None
 
     def end_sampling(self):
         pass
 
+    def summary(self):
+        # {t: mean area per level}, {t: mean flicker} over every call logged so far; clears the log
+        if not self.log:
+            return {}, {}
+        ts = torch.stack([l[0] for l in self.log]).float().cpu().numpy().round(4)
+        areas = torch.stack([l[1] for l in self.log]).cpu().numpy()
+        fl = [(t, f) for t, (_, _, f) in zip(ts, self.log) if f is not None]
+        flv = torch.stack([f for _, f in fl]).cpu().numpy() if fl else []
+        area_t = {f'{t:g}': areas[ts == t].mean(0).tolist() for t in np.unique(ts)}
+        flick_t = {}
+        for (t, _), v in zip(fl, flv):
+            flick_t.setdefault(f'{t:g}', []).append(float(v))
+        self.log = []
+        return area_t, {k: float(np.mean(v)) for k, v in flick_t.items()}
+
     @torch.no_grad()
     def forward(self, z, t, y):
-        B, tv = z.shape[0], t.flatten()[0].item()
-        if not (self.window[0] <= tv < self.window[1]):
-            self.area.setdefault(round(tv, 4), []).append([float(l == 1) for l in range(geo.L)])
+        B, t0 = z.shape[0], t.flatten()[0]
+        if self.window != (0.0, 1.0) and not (self.window[0] <= t0.item() < self.window[1]):
+            self.log.append((t0, torch.tensor([float(l == 1) for l in range(geo.L)], device=z.device), None))
             return nets[1](z, t, y)
         preds = [None] * geo.L
-        if self.mode in ('loss', 'disagree', 'oracle'):
+        if self.base in ('loss', 'disagree', 'oracle'):
             with ctx:
                 preds = [net(z, t, y).float() for net in nets]
+        flick = None
         if self.cache is None or self.cache.shape[0] != B or self.calls % route_every == 0:
-            self.cache = layout_of(router_scores(self.mode, z, t, preds=preds, x_true=self.x_true), self.K)
+            layout = layout_of(router_scores(self.base, z, t, preds=preds, x_true=self.x_true), self.K, self.exact)
+            if self.prev is not None and self.prev.shape == layout.shape: # flicker: area re-tokenized since the last layout
+                flick = 1 - layout_agreement(self.prev, layout, geo).mean()
+            self.cache = self.prev = layout
         self.calls += 1
         lev = cell_maps(self.cache, geo)[1]
-        if self.viz_layout is None and tv >= viz_t:
-            self.viz_layout = self.cache[:viz_images].cpu()
         for src, dst in self.render.items():
             lev = torch.where(lev == src, torch.full_like(lev, dst), lev)
-        self.area.setdefault(round(tv, 4), []).append(level_area(lev))
+        self.log.append((t0, level_area(lev), flick))
         lev_px = lev.repeat_interleave(f_cell, 1).repeat_interleave(f_cell, 2).unsqueeze(1)
         x_hat = torch.zeros(z.shape, device=z.device, dtype=torch.float32)
-        for l in range(geo.L):
-            m = lev_px == l
-            if not m.any():
-                continue
+        for l in self.used:
             if preds[l] is None:
                 with ctx:
                     preds[l] = nets[l](z, t, y).float()
-            x_hat = torch.where(m, preds[l], x_hat)
+            x_hat = torch.where(lev_px == l, preds[l], x_hat)
         return x_hat.to(z.dtype)
 
 def with_net(net, fn):
@@ -304,34 +429,181 @@ if os.path.exists(bank_path): # precision / recall against train features, as tr
     pr_idx = np.sort(np.random.default_rng(0).choice(len(bank), min(num_images, len(bank)), replace=False))
     pr_real = torch.from_numpy(bank[pr_idx].astype(np.float32)).to(device)
 
+# -----------------------------------------------------------------------------
+# figures (redrawn after every new result, so a partial run has them too)
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+from plot_style import SURFACE, INK, INK_2, CATEGORICAL, MARKERS, style_axis, line, heatmap_style
+
+ORDER = ['uniform', 'random', 'pixel', 'dino', 'loss', 'disagree', 'dino_gate', 'dino_div', 'centre', 'loss_exact'] # fixed slots
+COLORS = dict(zip(ORDER, CATEGORICAL[:6] + ['#f3c45e', '#a87200', INK_2, '#a8336b'])) # dino's terms: lighter / darker dino; exact: darker
+color = lambda name: COLORS.get(name, INK_2)
+marker = lambda name: MARKERS[ORDER.index(name) % len(MARKERS)] if name in ORDER else 'o'
+fid_of = lambda k: results['fid'][k]['fid'] if k in results['fid'] else float('nan')
+legend_levels = lambda fig, title: fig.legend(handles=[Patch(color=LEVEL_COLORS[l], label=f'{p}px') for l, p in enumerate(patches)],
+                                              loc='upper right', ncol=geo.L, frameon=False, fontsize=8, title=title, title_fontsize=8)
+to_np = lambda t: ((t.float().clamp(-1, 1) + 1) / 2).permute(1, 2, 0).cpu().numpy()
+
+def blank(ax):
+    ax.set_xticks([]); ax.set_yticks([])
+    for side in ax.spines.values():
+        side.set_visible(False)
+
+def fig_fid():
+    fig, ax = plt.subplots(figsize=(6.5, 4.4), facecolor=SURFACE)
+    Ks_all = sorted(set(budgets) | set(LEVEL_TOKENS))
+    for r in router_list:
+        Ks = Ks_all if r == 'uniform' else budgets
+        line(ax, Ks, [fid_of(stitched_key(r, K)) for K in Ks], color(r), marker(r), r)
+    for l, ls in ((1, '--'), (2, ':')):
+        ax.axhline(fid_of(f'uniform_{patches[l]}px'), color=INK_2, linewidth=1, linestyle=ls, label=f'{patches[l]}px model alone')
+    ax.set_xscale('log', base=2)
+    ax.set_xticks(Ks_all, [str(k) for k in Ks_all])
+    ax.minorticks_off()
+    style_axis(ax, 'tokens per image K', f'FID-{num_images / 1000:g}k', 'stitched sampling from the three uniform models')
+    ax.legend(frameon=False, fontsize=8, labelcolor=INK_2)
+    fig.tight_layout()
+    fig.savefig(out + '_fid.png', dpi=140, facecolor=SURFACE)
+    plt.close(fig)
+
+def fig_attribution():
+    F16, F8 = fid_of(f'uniform_{patches[1]}px'), fid_of(f'uniform_{patches[2]}px')
+    rows = ['full'] + [f't {lo:g}-{hi:g} only' for lo, hi in windows] + ['without splits', 'without merges']
+    suffix = [''] + [f'_t{lo:g}-{hi:g}' for lo, hi in windows] + ['_nosplit', '_nomerge']
+    fig, ax = plt.subplots(figsize=(7.5, 0.45 * len(rows) * len(attr_list) + 1.6), facecolor=SURFACE)
+    h = 0.8 / len(attr_list)
+    for j, r in enumerate(attr_list):
+        vals = [fid_of(stitched_key(r, attr_tokens) if s == '' else f'{r}_K{attr_tokens}{s}') - F16 for s in suffix]
+        ax.barh(np.arange(len(rows)) + (j - (len(attr_list) - 1) / 2) * h, vals, height=h * 0.9, color=color(r), label=r)
+    ax.axvline(0, color=INK_2, linewidth=1)
+    ax.axvline(F8 - F16, color=INK_2, linewidth=1, linestyle=':', label=f'{patches[2]}px model alone')
+    ax.set_yticks(np.arange(len(rows)), rows)
+    ax.invert_yaxis()
+    style_axis(ax, f'FID-{num_images / 1000:g}k change vs the {patches[1]}px model (negative = better)', '',
+               f'where the gain comes from, K={attr_tokens} ({patches[1]}px model outside the window / for the removed level)')
+    ax.legend(frameon=False, fontsize=8, labelcolor=INK_2)
+    fig.tight_layout()
+    fig.savefig(out + '_attribution.png', dpi=140, facecolor=SURFACE)
+    plt.close(fig)
+
+def fig_samples(K):
+    # the same noise and labels through the 16px / 8px models and every router at K: each image clean, then with its
+    # final layout drawn
+    cols = list(dict.fromkeys([f'uniform_{patches[1]}px', f'uniform_{patches[2]}px'] + [stitched_key(r, K) for r in router_list]))
+    cols = [c for c in cols if c + '__images' in samples]
+    if len(cols) < 2:
+        return
+    nv = min(show_samples, len(samples[cols[0] + '__images']))
+    fig, axes = plt.subplots(2 * nv, len(cols), figsize=(1.9 * len(cols), 1.95 * 2 * nv + 0.8), facecolor=SURFACE, squeeze=False)
+    for j, c in enumerate(cols):
+        ims = torch.from_numpy(samples[c + '__images'][:nv]).float().div(127.5).sub(1)
+        lay = samples.get(c + '__final')
+        drawn = draw_layout(ims, torch.from_numpy(lay[:nv]), geo) if lay is not None else ims
+        for i in range(nv):
+            blank(axes[2 * i, j]); blank(axes[2 * i + 1, j])
+            axes[2 * i, j].imshow(to_np(ims[i]))
+            axes[2 * i + 1, j].imshow(to_np(drawn[i]))
+        title = c.replace(f'_K{K}', '') if c.endswith(f'_K{K}') else c.replace('uniform_', '') + ' alone'
+        if c in results['fid']:
+            title += f"\nFID {fid_of(c):.1f}"
+        if c in results['seams']:
+            title += f"\nseams x{seam_x(c):.2f}"
+        axes[0, j].set_title(title, color=INK, fontsize=8)
+    legend_levels(fig, 'final layout (finer side)')
+    fig.suptitle(f'K={K}: same noise and labels; rows: sample, then its final layout\n'
+                 f'seams = seam ratio / the {patches[1]}px placebo\'s (1 = none)', color=INK, fontsize=10, x=0.01, ha='left')
+    fig.tight_layout(rect=(0, 0, 1, 1 - 0.9 / (1.95 * 2 * nv + 0.8)))
+    fig.savefig(out + f'_samples_K{K}.png', dpi=140, facecolor=SURFACE)
+    plt.close(fig)
+
+seam_x = lambda k: results['seams'][k]['stitched'][0] / results['seams'][k]['placebo_16px'][0] if k in results['seams'] else float('nan')
+
+def draw_progress():
+    if f'uniform_{patches[1]}px' in results['fid']:
+        fig_fid()
+        if attr_list:
+            fig_attribution()
+    for K in sorted(set(budgets) | {attr_tokens}):
+        fig_samples(K)
+
+SAMPLE_LABELS = torch.from_numpy(np.linspace(0, num_classes - 1, n_samples).round().astype(np.int64)).to(device)
+
+def sample_batch(net=None, level=None):
+    # n_samples images (uint8) from the uniform model at `level` or a stitched net: the same seed and labels for every one
+    def go(den):
+        den.eval()
+        den.cfg_scale, den.cfg_interval, den.steps, den.method = cfg, (0.0, 1.0), num_sampling_steps, sampling_method
+        den.eta, den.fixed_shape = 1.0, False
+        with torch.random.fork_rng(devices=[device] if 'cuda' in str(device) else []), torch.no_grad(), ctx:
+            torch.manual_seed(seed)
+            return den.generate(SAMPLE_LABELS)
+    return to_uint8(go(models[level]) if net is None else with_net(net, go)).cpu()
+
+def seams(key):
+    """
+    Seam ratio of a stitched configuration's samples (mean |neighbour difference| across token boundaries / inside tokens,
+    over all boundaries and over boundaries between levels; diagnostics.seam_ratio) with their final layouts, next to the
+    same layouts drawn on the 16px and 8px models' samples of the same noise (placebos: no stitching, so no seams).
+    """
+    a16, a8 = f'uniform_{patches[1]}px__images', f'uniform_{patches[2]}px__images'
+    if key + '__final' not in samples or a16 not in samples or a8 not in samples:
+        return
+    lay = torch.from_numpy(samples[key + '__final']).to(device)
+    ims = lambda k: torch.from_numpy(samples[k][:len(lay)]).to(device).float().div(127.5).sub(1)
+    r = {name: seam_ratio(ims(k), lay, geo) for name, k in (('stitched', key + '__images'), ('placebo_16px', a16), ('placebo_8px', a8))}
+    results['seams'][key] = r
+    print(f"{key:<28} seams (across / inside tokens; between levels): {r['stitched'][0]:.3f}; {r['stitched'][1]:.3f} | "
+          f"same layout on the {patches[1]}px model's samples {r['placebo_16px'][0]:.3f}; {r['placebo_16px'][1]:.3f}, "
+          f"{patches[2]}px {r['placebo_8px'][0]:.3f}; {r['placebo_8px'][1]:.3f}")
+
 def run(key, net=None, level=None):
     """
-    FID-{num_images} of one configuration (a stitched net, or the uniform model at `level`), stored under key; skipped
-    if already done (resume).
+    One configuration (a stitched net, or the uniform model at `level`) stored under key: its samples and seams, then its
+    FID-{num_images} (with --fid). Finished parts are skipped (resume); the figures are redrawn after every new result.
     """
-    if key in results['fid']:
-        return results['fid'][key]
-    first = []
-    keep = lambda x, labels: first.append(x[:viz_images].cpu()) if not first else None
-    kw = dict(cfg=cfg, interval=(0.0, 1.0), steps=num_sampling_steps, method=sampling_method, batch_size=gen_batch_size,
-              seed=seed, on_batch=keep)
+    stitched = net is not None
+    todo = [w for w, need in (('samples', key + '__images' not in samples or len(samples[key + '__images']) < n_samples
+                              or (stitched and (key + '__final' not in samples or key not in results['flicker']))),
+                              (f'FID-{num_images / 1000:g}k', fid and key not in results['fid'])) if need]
+    if todo:
+        print(f"[{key}] {' + '.join(todo)}")
+    if key + '__images' not in samples or len(samples[key + '__images']) < n_samples or \
+            (stitched and (key + '__final' not in samples or key not in results['flicker'])):
+        t_start = time.time()
+        samples[key + '__images'] = sample_batch(net, level).numpy()
+        print(f"[{key}] {n_samples} samples in {time.time() - t_start:.0f}s")
+        if stitched:
+            # a t window the trajectory never reached leaves the 16px model's layout
+            final = net.cache if net.cache is not None else layout_of(router.neutral.expand(n_samples, -1), geo.counts[1])
+            samples[key + '__final'] = final[:n_samples].cpu().numpy()
+            by_t = net.summary()[1]
+            results['flicker'][key] = {'mean': float(np.mean(list(by_t.values()))) if by_t else 0.0, 'by_t': by_t}
+            print(f"{key:<28} flicker (image re-tokenized per re-route): {results['flicker'][key]['mean']:.1%}")
+        seams(key)
+        save(); draw_progress()
+    elif stitched and key not in results['seams']:
+        seams(key)
+    if not fid or key in results['fid']:
+        return results['fid'].get(key)
+    kw = dict(cfg=cfg, interval=(0.0, 1.0), steps=num_sampling_steps, method=sampling_method, batch_size=gen_batch_size, seed=seed)
+    t_start = time.time()
     if net is None:
         o = generate_and_score(models[level], metrics, ref_stats, num_images, num_classes, device, ctx, **kw)
         area, area_t = [float(l == level) for l in range(geo.L)], {}
     else:
         o = with_net(net, lambda den: generate_and_score(den, metrics, ref_stats, num_images, num_classes, device, ctx, **kw))
-        area_t = {f'{tv:g}': np.mean(v, axis=0).tolist() for tv, v in sorted(net.area.items())}
+        area_t = net.summary()[0]
         area = np.mean(list(area_t.values()), axis=0).tolist()
-        if net.viz_layout is not None:
-            samples[key + '__layout'] = net.viz_layout.numpy()
     r = {'fid': o['fid'], 'is': o['is'], 'area': area, 'area_by_t': area_t}
     if pr_real is not None:
         r['precision'], r['recall'] = precision_recall(pr_real, o['features'].to(device))
     results['fid'][key] = r
-    samples[key + '__images'] = first[0].numpy()
-    save()
+    save(); draw_progress()
     pr = f", P {r['precision']:.3f}, R {r['recall']:.3f}" if 'precision' in r else ''
-    print(f"{key:<28} FID-{num_images / 1000:g}k {r['fid']:7.2f}, IS {r['is']:6.1f}{pr} | area "
+    print(f"{key:<28} FID-{num_images / 1000:g}k {r['fid']:7.2f}, IS {r['is']:6.1f}{pr} | {(time.time() - t_start) / 60:.1f} min | area "
           + ' '.join(f'{p}px {a:.0%}' for p, a in zip(patches, area)))
     return r
 
@@ -345,23 +617,25 @@ for l in range(geo.L):
     run(f'uniform_{patches[l]}px', level=l)
 for K in budgets:
     for r in router_list:
-        k = stitched_key(r, K)
-        if k not in results['fid']:
-            run(k, StitchedNet(r, K))
+        if not (r == 'uniform' and K in LEVEL_TOKENS): # that level's model alone: an anchor
+            run(stitched_key(r, K), StitchedNet(r, K))
 for r in attr_list:
-    run(stitched_key(r, attr_tokens), StitchedNet(r, attr_tokens))
+    if not (r == 'uniform' and attr_tokens in LEVEL_TOKENS):
+        run(stitched_key(r, attr_tokens), StitchedNet(r, attr_tokens))
     for lo, hi in windows:
         run(f'{r}_K{attr_tokens}_t{lo:g}-{hi:g}', StitchedNet(r, attr_tokens, window=(lo, hi)))
     run(f'{r}_K{attr_tokens}_nosplit', StitchedNet(r, attr_tokens, render={geo.L - 1: 1}))
     run(f'{r}_K{attr_tokens}_nomerge', StitchedNet(r, attr_tokens, render={0: 1}))
 
-F16, F8 = results['fid'][f'uniform_{patches[1]}px']['fid'], results['fid'][f'uniform_{patches[2]}px']['fid']
-gap = lambda f: (F16 - f) / (F16 - F8) if F16 != F8 else float('nan')
-print(f"\nFID-{num_images / 1000:g}k vs the {patches[1]}px model ({F16:.2f}); gap closed = share of the {patches[1]}px -> "
-      f"{patches[2]}px improvement ({F16:.2f} -> {F8:.2f}) reached")
-print(f"  {'configuration':<28} {'FID':>7} {'vs 16px':>8} {'gap':>6}")
-for k, v in results['fid'].items():
-    print(f"  {k:<28} {v['fid']:7.2f} {v['fid'] - F16:+8.2f} {gap(v['fid']):6.0%}")
+if f'uniform_{patches[1]}px' in results['fid'] and f'uniform_{patches[2]}px' in results['fid']:
+    F16, F8 = fid_of(f'uniform_{patches[1]}px'), fid_of(f'uniform_{patches[2]}px')
+    gap = lambda f: (F16 - f) / (F16 - F8) if F16 != F8 else float('nan')
+    print(f"\nFID-{num_images / 1000:g}k vs the {patches[1]}px model ({F16:.2f}); gap closed = share of the {patches[1]}px -> "
+          f"{patches[2]}px improvement ({F16:.2f} -> {F8:.2f}) reached; seams = seam ratio / the {patches[1]}px placebo's (1 = none)")
+    print(f"  {'configuration':<28} {'FID':>7} {'vs 16px':>8} {'gap':>6} {'seams':>6} {'flicker':>8}")
+    for k, v in results['fid'].items():
+        fl = results['flicker'][k]['mean'] if k in results['flicker'] else float('nan')
+        print(f"  {k:<28} {v['fid']:7.2f} {v['fid'] - F16:+8.2f} {gap(v['fid']):6.0%} {seam_x(k):6.2f} {fl:8.1%}")
 
 # -----------------------------------------------------------------------------
 # regions: which regions benefit, and how each heuristic correlates with that
@@ -394,6 +668,7 @@ if regions:
         corr = {h: [[] for _ in range(geo.L - 1)] for h in HEURISTICS}
         names_x = ['gain'] + HEURISTICS
         cross = {(a, b): [] for a in names_x for b in names_x}
+        alloc = {(name, K): [] for name in ('oracle', 'oracle_exact', 'loss', 'loss_exact') for K in budgets}
         for i in range(0, n_images, batch_size):
             x, y, e = X[i:i + batch_size], Y[i:i + batch_size], NOISE[i:i + batch_size]
             preds, h = region_pass(x, y, e, t_val)
@@ -406,6 +681,12 @@ if regions:
             for name, s in h.items():
                 for l, (sl, gl) in enumerate(zip(per_level(s), per_level(gains))):
                     corr[name][l].append(spearman(sl, gl).cpu())
+            E = [cell_err(p, x) for p in preds]
+            for K in budgets: # error removed vs the coarse-first uniform layout at the same K (measured against x)
+                e_uni = stitched_error(layout_of(router.neutral.expand(len(x), -1), K), E)
+                for name in ('oracle', 'oracle_exact', 'loss', 'loss_exact'):
+                    b, ex = base_router(name)
+                    alloc[(name, K)].append((e_uni - stitched_error(layout_of(gains if b == 'oracle' else h['loss'], K, ex), E)).cpu())
             allv = dict(h, gain=gains)
             for (a, b) in cross:
                 cross[(a, b)].append(torch.stack([spearman(sa, sb) for sa, sb in zip(per_level(allv[a]), per_level(allv[b]))]).mean(0).cpu())
@@ -414,12 +695,14 @@ if regions:
                 viz['gains'] = gains[:n].cpu()
                 viz['loss-oracle'] = layout_of(gains, attr_tokens)[:n].cpu()
                 for r in router_list:
-                    viz[r] = layout_of(router.neutral.expand(len(x), -1) if r == 'uniform' else h[r], attr_tokens)[:n].cpu()
+                    b, ex = base_router(r)
+                    viz[r] = layout_of(router.neutral.expand(len(x), -1) if b == 'uniform' else h[b], attr_tokens, ex)[:n].cpu()
         per_patch = lambda v, l: v / (n_images * geo.counts[l])
         results['regions'][f'{t_val:g}'] = {
             'gain_per_patch': {f'{patches[l]}->{patches[l + 1]}px': {b: per_patch(tot[b][l], l) for b in tot} for l in range(geo.L - 1)},
             'loss_corr': {name: [torch.cat(c).nanmean().item() for c in corr[name]] for name in HEURISTICS},
-            'cross_corr': {f'{a}|{b}': torch.cat(v).nanmean().item() for (a, b), v in cross.items()}}
+            'cross_corr': {f'{a}|{b}': torch.cat(v).nanmean().item() for (a, b), v in cross.items()},
+            'allocation_gain_vs_uniform': {f'{name}_K{K}': torch.cat(v).mean().item() for (name, K), v in alloc.items()}}
 
     # Inception-feature split gains on a subset
     for t_val in [float(v) for v in feature_ts.split(',')]:
@@ -457,6 +740,13 @@ if regions:
     for tk, rr in results['regions'].items():
         if 'gain_per_patch' in rr:
             print(f'  t={tk:<5} ' + '   '.join(f"{k}: {v['total']:+.3g} = {v['structure']:+.3g} + {v['detail']:+.3g}" for k, v in rr['gain_per_patch'].items()))
+    print('\nmeasured error removed vs the uniform layout at the same K (per image): greedy / exact allocation, '
+          'on the measured gains (oracle) and on the expected ones (loss)')
+    for tk, rr in results['regions'].items():
+        if 'allocation_gain_vs_uniform' in rr:
+            a = rr['allocation_gain_vs_uniform']
+            print(f'  t={tk:<5} ' + '   '.join(f"K={K}: oracle {a[f'oracle_K{K}']:+.3g} / {a[f'oracle_exact_K{K}']:+.3g}, "
+                                            f"loss {a[f'loss_K{K}']:+.3g} / {a[f'loss_exact_K{K}']:+.3g}" for K in budgets))
     print(f'\nrank correlation with the split gain per region, {patches[0]}px | {patches[1]}px parents (feat: Inception-feature gains):')
     print('  ' + ' ' * 7 + ''.join(f'{name:>14}' for name in HEURISTICS))
     for tk, rr in results['regions'].items():
@@ -506,86 +796,7 @@ if recon:
             print(f'reconstruction from t0={t0:g}, {r} K={attr_tokens}: FID {results["recon"][key]:.2f}')
 
 print(f'\nwrote {out}.json, {out}_samples.npz')
-
-# -----------------------------------------------------------------------------
-# figures
-
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-from matplotlib.patches import Patch
-from plot_style import SURFACE, INK, INK_2, CATEGORICAL, MARKERS, style_axis, line, heatmap_style
-
-ORDER = ['uniform', 'random', 'pixel', 'dino', 'loss', 'disagree', 'dino_gate', 'dino_div', 'centre'] # fixed slots
-COLORS = dict(zip(ORDER, CATEGORICAL[:6] + ['#f3c45e', '#a87200', INK_2])) # dino's terms: lighter / darker dino
-color = lambda name: COLORS.get(name, INK_2)
-marker = lambda name: MARKERS[ORDER.index(name) % len(MARKERS)] if name in ORDER else 'o'
-fid_of = lambda k: results['fid'][k]['fid'] if k in results['fid'] else float('nan')
-legend_levels = lambda fig, title: fig.legend(handles=[Patch(color=LEVEL_COLORS[l], label=f'{p}px') for l, p in enumerate(patches)],
-                                              loc='upper right', ncol=geo.L, frameon=False, fontsize=8, title=title, title_fontsize=8)
-to_np = lambda t: ((t.float().clamp(-1, 1) + 1) / 2).permute(1, 2, 0).cpu().numpy()
-
-def blank(ax):
-    ax.set_xticks([]); ax.set_yticks([])
-    for side in ax.spines.values():
-        side.set_visible(False)
-
-# FID vs K
-fig, ax = plt.subplots(figsize=(6.5, 4.4), facecolor=SURFACE)
-Ks_all = sorted(set(budgets) | set(LEVEL_TOKENS))
-for r in router_list:
-    Ks = Ks_all if r == 'uniform' else budgets
-    line(ax, Ks, [fid_of(stitched_key(r, K)) for K in Ks], color(r), marker(r), r)
-for l, ls in ((1, '--'), (2, ':')):
-    ax.axhline(fid_of(f'uniform_{patches[l]}px'), color=INK_2, linewidth=1, linestyle=ls, label=f'{patches[l]}px model alone')
-ax.set_xscale('log', base=2)
-ax.set_xticks(Ks_all, [str(k) for k in Ks_all])
-ax.minorticks_off()
-style_axis(ax, 'tokens per image K', f'FID-{num_images / 1000:g}k', 'stitched sampling from the three uniform models')
-ax.legend(frameon=False, fontsize=8, labelcolor=INK_2)
-fig.tight_layout()
-fig.savefig(out + '_fid.png', dpi=140, facecolor=SURFACE)
-plt.close(fig)
-
-# attribution
-if attr_list:
-    rows = ['full'] + [f't {lo:g}-{hi:g} only' for lo, hi in windows] + ['without splits', 'without merges']
-    suffix = [''] + [f'_t{lo:g}-{hi:g}' for lo, hi in windows] + ['_nosplit', '_nomerge']
-    fig, ax = plt.subplots(figsize=(7.5, 0.45 * len(rows) * len(attr_list) + 1.6), facecolor=SURFACE)
-    h = 0.8 / len(attr_list)
-    for j, r in enumerate(attr_list):
-        vals = [fid_of(stitched_key(r, attr_tokens) if s == '' else f'{r}_K{attr_tokens}{s}') - F16 for s in suffix]
-        ax.barh(np.arange(len(rows)) + (j - (len(attr_list) - 1) / 2) * h, vals, height=h * 0.9, color=color(r), label=r)
-    ax.axvline(0, color=INK_2, linewidth=1)
-    ax.axvline(F8 - F16, color=INK_2, linewidth=1, linestyle=':', label=f'{patches[2]}px model alone')
-    ax.set_yticks(np.arange(len(rows)), rows)
-    ax.invert_yaxis()
-    style_axis(ax, f'FID-{num_images / 1000:g}k change vs the {patches[1]}px model (negative = better)', '',
-               f'where the gain comes from, K={attr_tokens} ({patches[1]}px model outside the window / for the removed level)')
-    ax.legend(frameon=False, fontsize=8, labelcolor=INK_2)
-    fig.tight_layout()
-    fig.savefig(out + '_attribution.png', dpi=140, facecolor=SURFACE)
-    plt.close(fig)
-
-# samples: the same noise through the anchors and every router at attr_tokens
-cols = list(dict.fromkeys([f'uniform_{patches[1]}px', f'uniform_{patches[2]}px'] + [stitched_key(r, attr_tokens) for r in router_list]))
-cols = [c for c in cols if c + '__images' in samples]
-if cols:
-    nv = min(len(samples[cols[0] + '__images']), viz_images)
-    fig, axes = plt.subplots(nv, len(cols), figsize=(1.7 * len(cols), 1.8 * nv + 0.8), facecolor=SURFACE, squeeze=False)
-    for j, c in enumerate(cols):
-        ims = torch.from_numpy(samples[c + '__images'][:nv]).float().div(127.5).sub(1)
-        if c + '__layout' in samples:
-            ims = draw_layout(ims, torch.from_numpy(samples[c + '__layout'][:nv]), geo)
-        for i in range(nv):
-            blank(axes[i, j])
-            axes[i, j].imshow(to_np(ims[i]))
-        axes[0, j].set_title(f"{c.replace('uniform_', '')}\nFID {fid_of(c):.1f}", color=INK, fontsize=8)
-    legend_levels(fig, f'layout at t={viz_t:g} (finer side)')
-    fig.suptitle('same noise and labels through each configuration', color=INK, fontsize=10, x=0.01, ha='left')
-    fig.tight_layout(rect=(0, 0, 1, 0.92))
-    fig.savefig(out + '_samples.png', dpi=140, facecolor=SURFACE)
-    plt.close(fig)
+draw_progress()
 
 if regions:
     # heuristics vs gains, and with each other
@@ -648,4 +859,4 @@ if regions:
         fig.savefig(out + '_gains.png', dpi=140, facecolor=SURFACE)
         plt.close(fig)
 
-print(f"wrote {', '.join(out + s for s in ['_fid.png', '_attribution.png', '_samples.png'] + (['_heuristics.png', '_gains.png'] if regions else []))}")
+print(f"wrote {', '.join(out + s for s in ['_fid.png', '_attribution.png'] + [f'_samples_K{K}.png' for K in sorted(set(budgets) | {attr_tokens})] + (['_heuristics.png', '_gains.png'] if regions else []))}")
