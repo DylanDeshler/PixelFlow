@@ -101,6 +101,7 @@ gauss_placer_width = 64
 gauss_placer_depth = 2
 gauss_area_bias = True # + log(frame area / initial area) on every key's logits
 gauss_shape_embed = True # learned embedding of (log scales, rotation), added to the tokens
+gauss_fused = 'auto' # CUDA Triton kernels for the input / output layers: 'auto' (rotated frames), 'always', 'never'
 pixel_depth = -1 # PixelDiT: number of pixel-level (PiT) blocks
 pixel_dim = -1 # PixelDiT: per-pixel token width
 pixeldit_prediction = 'x' # PixelDiT: 'x' (this repo's x-prediction) or 'v' (the paper's velocity output)
@@ -267,7 +268,8 @@ else:
 is_quadtree = model.startswith('QuadJiT')
 is_gauss = model.startswith('GaussJiT')
 GAUSS_FLAGS = dict(extent=gauss_extent, basis=gauss_basis, max_offset=gauss_max_offset, scale_range=gauss_scale_range, max_rotation=gauss_max_rotation, sigma=gauss_sigma,
-                   placer_width=gauss_placer_width, placer_depth=gauss_placer_depth, area_bias=gauss_area_bias, shape_embed=gauss_shape_embed)
+                   placer_width=gauss_placer_width, placer_depth=gauss_placer_depth, area_bias=gauss_area_bias, shape_embed=gauss_shape_embed,
+                   fused=gauss_fused)
 if is_gauss: # like QuadJiT: the JiT backbone options it needs, none of the input / output paths
     jit_only = dict(attn_res_adaln=not attn_res_adaln, gated_bottleneck=not gated_bottleneck, skip_pathway=not skip_pathway, dcae_stem=not dcae_stem,
                     dcae_head=not dcae_head, patch_overlap=patch_overlap == 0, head_overlap=head_overlap == 0, gate_init=gate_init == 'zero',
@@ -1005,8 +1007,11 @@ while True:
         grad_str = f", grad norm {math.sqrt(sum(v ** 2 for v in grad_norms.values())):.4f}" if log_opt else ""
         trunk_str = f", trunk-only loss {loss_trunkf:.4f}" if loss_trunkf is not None else ""
         geo_stats = denoiser.net.geometry_stats() if is_gauss else {} # the training batch's token geometry
-        geo_str = (f", geometry: offset {geo_stats['offset']:.3f}, scale [{geo_stats['scale_min']:.2f}, {geo_stats['scale_max']:.2f}], "
-                   f"rotation {geo_stats['rotation_deg']:.1f}deg") if geo_stats else ""
+        g_ = geo_stats
+        geo_str = (f", geometry: offset mean {g_['offset_mean']:.3f} / p95 {g_['offset_p95']:.3f}, scale p5/p50/p95 {g_['scale_p5']:.2f}/"
+                   f"{g_['scale_p50']:.2f}/{g_['scale_p95']:.2f} [{g_['scale_min']:.2f}, {g_['scale_max']:.2f}]"
+                   + (f", |rotation| p50/p95/max {g_['rotation_p50']:.1f}/{g_['rotation_p95']:.1f}/{g_['rotation_max']:.1f}deg"
+                      if denoiser.net.max_rotation > 0 else '')) if g_ else ""
         print(f"iter {iter_num} (epoch {iter_num / iters_per_epoch:.2f}): loss {lossf:.4f}{trunk_str}{repa_str}{grad_str}{geo_str}, time {dt*1000:.2f}ms "
               f"(data {data_seconds*1000:.0f}ms), {imgs_per_sec:.0f} img/s")
         if wandb_log:

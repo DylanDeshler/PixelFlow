@@ -517,6 +517,12 @@ oriented, scaled patches (64 at 128px for `GaussJiT-B/16`).
   | GaussJiT-B/16, rotated, fused kernels | 97.3 ms | 1315 | 6.4 GB |
   | GaussJiT-B/16, rotated, PyTorch path | 288.1 ms | 444 | 10.9 GB |
 
+  The fused kernels cover the whole input and output layers: window, frame coordinates, masks, pixel reads, basis,
+  Gaussian weights and accumulation into the image. Their backward passes return each token's 5 geometry gradients
+  directly, so nothing per pixel is stored for the backward pass. `--gauss_fused` selects where they're used: `auto`
+  (rotated frames; the default), `always` (axis-aligned too), or `never`. The table above predates this full fusion, so
+  peak memory for rotated frames should now be lower than shown.
+
   `python gauss_kernels.py` checks the kernels against PyTorch references. Errors are about 1e-3 on GPU (TF32 matrix
   multiplies, like the rest of the bf16 model) and about 1e-7 under `TRITON_INTERPRET=1` on CPU.
   - The placer's last layer is zero-initialized, so training starts from a regular grid of overlapping square frames,

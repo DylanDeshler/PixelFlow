@@ -112,7 +112,7 @@ class GaussJiT(nn.Module):
                  attn_drop=0.0, proj_drop=0.0, num_classes=1000, bottleneck_dim=128, attn_res='none', attn_res_block_size=0,
                  adaln_single=False, layernorm=False, extent=0.75, basis=0, max_offset=0.25, scale_range=1.33,
                  max_rotation=0.0, sigma=0.3, placer_width=64, placer_depth=2, area_bias=True, shape_embed=True,
-                 chunks=8, fused=True, in_context_len=0, in_context_start=0, family='gauss'):
+                 chunks=8, fused='auto', in_context_len=0, in_context_start=0, family='gauss'):
         super().__init__()
         assert in_context_len == 0, 'GaussJiT has no in-context class tokens'
         assert attn_res in ('none', 'full', 'block')
@@ -128,7 +128,10 @@ class GaussJiT(nn.Module):
         self.grid = input_size // patch_size
         self.tokens = self.grid ** 2
         self.area_bias, self.sigma, self.chunks = area_bias, sigma, chunks
-        self.fused = fused # rotated frames: Triton kernels (gauss_kernels.py) when on CUDA, else the chunked PyTorch path
+        # fully fused Triton kernels (gauss_kernels.encode_op / render_op) on CUDA: 'auto' for rotated frames (axis-aligned use the
+        # separable PyTorch path), 'always' for both, 'never' (the chunked PyTorch path everywhere)
+        assert fused in ('auto', 'always', 'never'), f"fused must be 'auto', 'always' or 'never', got {fused}"
+        self.fused = fused
         # pixel windows around each token (whole pixels around floor(mu)): the encoder's covers the largest rotated frame;
         # the decoder's reaches where the Gaussian weight falls to 1e-3 of its peak, and always contains the pixel's own
         # anchor cell (so every pixel has positive weight)
@@ -338,33 +341,26 @@ class GaussJiT(nn.Module):
         return outs
 
     def _encode_fused(self, x_flat, mu, h, theta):
-        # rotated frames on CUDA: the per-pixel basis evaluated inside Triton kernels (gauss_kernels.project), never stored
+        # rotated frames on CUDA: gauss_kernels.encode_op does the window, masks, pixel reads and basis projection per token
+        # in one kernel (and the geometry gradients in its backward); only the image and the geometry are kept for backward
         B, C = x_flat.shape[:2]
-        K, n = mu.shape[1], self.basis_n
-        idx, _, u, v = self.window_coords(mu, h, theta, self.offsets_enc, reflect=True)
-        m = ((u.abs() < 1) & (v.abs() < 1)).float()
-        P = idx.shape[2]
-        f = x_flat.gather(2, idx.view(B, 1, K * P).expand(B, C, -1)).view(B, C, K, P).transpose(1, 2) * m[:, :, None]
-        scale = m.sum(-1).clamp_min(1).rsqrt()
-        coef = gauss_kernels.project(f.reshape(B * K, C, P), u.reshape(B * K, P), v.reshape(B * K, P), scale.reshape(-1), n)
+        K, n, H = mu.shape[1], self.basis_n, self.input_size
+        geom = torch.cat([mu, h, theta[..., None]], -1).reshape(B * K, 5)
+        coef, _ = gauss_kernels.encode_op(x_flat.view(B, C, H, H), geom, K, n, self.window_enc)
         return coef.view(B, K, C, n, n)
 
     def _render_fused(self, coef, mu, h, theta):
-        # rotated frames on CUDA: each token's values at its window's pixels from gauss_kernels.evaluate, Gaussian-blended
+        # rotated frames on CUDA: gauss_kernels.render_op evaluates, weights and accumulates every token's window into the
+        # image in one kernel (its backward returns the coefficient and geometry gradients); nothing per pixel is stored
         B, K, C, n, _ = coef.shape
         H = self.input_size
-        idx, inside, u, v = self.window_coords(mu, h, theta, self.offsets_dec)
-        P = idx.shape[2]
-        w = torch.exp(-(u ** 2 + v ** 2) / (2 * self.sigma ** 2)) * inside.float()
-        vals = gauss_kernels.evaluate(coef.reshape(B * K, C, n, n), u.reshape(B * K, P), v.reshape(B * K, P),
-                                      torch.full((B * K,), 1.0 / n, device=coef.device)).view(B, K, C, P)
-        flat = idx.reshape(B, 1, K * P)
-        num = torch.zeros(B, C, H * H, device=coef.device).scatter_add_(2, flat.expand(B, C, -1), (vals * w[:, :, None]).transpose(1, 2).reshape(B, C, -1))
-        den = torch.zeros(B, 1, H * H, device=coef.device).scatter_add_(2, flat, w.reshape(B, 1, -1))
-        return (num / den.clamp_min(1e-30)).view(B, C, H, H)
+        geom = torch.cat([mu, h, theta[..., None]], -1).reshape(B * K, 5)
+        num, den = gauss_kernels.render_op(coef.reshape(B * K, C, n, n), geom, B, H, self.window, float(self.sigma))
+        return num / den.clamp_min(1e-30)
 
     def use_fused(self, device):
-        return not self.separable and self.fused and gauss_kernels.kernels_available(device)
+        wanted = self.fused == 'always' or (self.fused == 'auto' and not self.separable)
+        return wanted and gauss_kernels.kernels_available(device)
 
     def encode(self, x, mu, h, theta):
         # basis coefficients of every token [B, K, C * n^2]
@@ -438,15 +434,21 @@ class GaussJiT(nn.Module):
         return torch.exp(-(u ** 2 + v ** 2) / (2 * self.sigma ** 2))
 
     def geometry_stats(self):
-        # summary of the last forward's geometry: mean |offset| and scale spread in anchor units, mean |rotation| (degrees)
+        # distribution of the last forward's geometry over tokens: |offset| (anchor spacings), per-axis scale (relative to
+        # the initial frame), |rotation| (degrees): mean, percentiles (p5, p50, p95), min, max
         if self.last_geometry is None:
             return {}
         mu, h, theta = self.last_geometry
         S = self.patch_size
-        off = ((mu - self.anchors) / S).norm(dim=-1)
-        f = h / (self.extent * S)
-        return {'offset': off.mean().item(), 'scale_min': f.min().item(), 'scale_max': f.max().item(),
-                'log_scale_std': f.log().std().item(), 'rotation_deg': theta.abs().mean().item() * 180 / math.pi}
+        q = torch.tensor([0.05, 0.5, 0.95], device=mu.device)
+        out = {}
+        for name, z in (('offset', ((mu - self.anchors) / S).norm(dim=-1)), ('scale', h / (self.extent * S)),
+                        ('rotation', theta.abs() * 180 / math.pi)):
+            z = z.flatten().float()
+            p5, p50, p95 = torch.quantile(z[:2 ** 20], q).tolist() # quantile's input limit; a batch has far fewer values
+            out.update({f'{name}_mean': z.mean().item(), f'{name}_p5': p5, f'{name}_p50': p50, f'{name}_p95': p95,
+                        f'{name}_min': z.min().item(), f'{name}_max': z.max().item()})
+        return out
 
 
 def draw_geometry(images, mu, h, theta, extent=0.75, color='#a8336b', points=96, core=True):
