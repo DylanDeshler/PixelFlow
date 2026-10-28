@@ -504,23 +504,29 @@ oriented, scaled patches (64 at 128px for `GaussJiT-B/16`).
   only by the denoising loss.
   - Offsets are bounded to ±0.25 of the spacing and scales to ×1.33^±1 per axis.
   - Frames are axis-aligned by default. This keeps the basis separable, so encoding and decoding are two small matrix
-    multiplies per token. `--gauss_max_rotation=0.785` allows ±45° rotation. On CUDA, rotated frames use fused Triton
-    kernels (`gauss_kernels.py`), which evaluate the basis in registers. They're registered as custom ops, so
-    `torch.compile` fuses everything around them.
+    multiplies per token. `--gauss_max_rotation=0.785` allows ±45° rotation.
 
-  The fused kernels cover the whole input and output layers: window, frame coordinates, masks, pixel reads, basis,
-  Gaussian weights and accumulation into the image. Their backward passes return each token's 5 geometry gradients
-  directly, so nothing per pixel is stored for the backward pass. `--gauss_fused` selects where they're used: `auto`
-  (rotated frames; the default), `always` (axis-aligned too: less memory, slower), or `never`.
+  On CUDA, the input and output layers run as fused Triton kernels (`gauss_kernels.py`). They're registered as custom ops,
+  so `torch.compile` fuses everything around them.
+  - Each token's kernel covers the whole layer: frame coordinates, masks, pixel reads, basis, Gaussian weights and
+    accumulation into the image.
+  - The backward passes return each token's 5 geometry gradients directly, so nothing per pixel is stored.
+  - Each token visits only its own bounding box: its frame for the encoder, and for the decoder its Gaussian out to weight
+    1e-3 (but at least as far as the pixels it may own, so coverage holds).
+  - Axis-aligned frames use separable kernels (row, then column matrix multiplies). Rotated frames evaluate the 2D basis
+    per pixel, which costs about n² per pixel instead.
+  - `--gauss_fused=never` uses the chunked PyTorch path instead. It's slower and uses more memory.
 
-  Measured on an L40S (128px, bf16, compiled, forward and backward):
+  Measured on an L40S (128px, bf16, compiled, forward and backward, `--gauss_scale_range=3`):
 
-  | model | batch 128: step | batch 1024: step | img/s | peak memory at 1024 |
+  | model | batch 256, frames at init | batch 256, frames at max scale | batch 1024, max scale | peak memory at 1024 |
   |---|---|---|---|---|
-  | JiT-B/16 | 62.7 ms | 561 ms | 1826 | 32.7 GB |
-  | GaussJiT-B/16, axis-aligned (separable PyTorch) | 77.3 ms | 705 ms | 1453 | 39.0 GB |
-  | GaussJiT-B/16, axis-aligned, `--gauss_fused=always` | 91.8 ms | 791 ms | 1295 | 34.7 GB |
-  | GaussJiT-B/16, rotated (fused kernels) | 98.5 ms | 842 ms | 1216 | 34.7 GB |
+  | JiT-B/16 | 94.8 ms | | 401 ms | 30.0 GB |
+  | GaussJiT-B/16, axis-aligned (fused, the default) | 106 ms | 115 ms | 486 ms | 32.3 GB |
+  | GaussJiT-B/16, axis-aligned, `--gauss_fused=never` | 168 ms | 168 ms | out of memory | |
+  | GaussJiT-B/16, rotated | 137 ms | 274 ms | 1104 ms | 32.3 GB |
+
+  The cost tracks the frames' size: "max scale" pins every frame at ×3, the worst case.
 
   `python gauss_kernels.py` checks the kernels against PyTorch references. Errors are about 1e-3 on GPU (TF32 matrix
   multiplies, like the rest of the bf16 model) and about 1e-7 under `TRITON_INTERPRET=1` on CPU.
@@ -541,7 +547,7 @@ oriented, scaled patches (64 at 128px for `GaussJiT-B/16`).
   16px patches at initialization.
 
 ```bash
-python train_jit.py config/jit_in1k_128.py config/model_gaussjit_b16.py --optimizer_type=muon --attn_res=full --adaln_single=True
+python train_jit.py config/jit_in1k_128.py config/model_gaussjit_b16.py --optimizer_type=muon
 ```
 
 Options: `--gauss_max_offset`, `--gauss_scale_range`, `--gauss_max_rotation`, `--gauss_extent`, `--gauss_basis`, `--gauss_sigma`,
@@ -551,8 +557,8 @@ The presets use `bottleneck_dim=288`, which keeps JiT's 6× compression of a tok
 channel) has 2.25× a 16px patch's values, and 128 × 2.25 = 288. If you change `--gauss_extent` or `--gauss_basis`, rescale it the same
 way.
 
-The input and output layers run in fp32 for precision, chunked and recomputed in the backward pass (PyTorch path) or inside
-the kernels (fused path). Peak memory is in the table above.
+The input and output layers run in fp32 for precision (TF32 matrix multiplies in the kernels), inside the kernels on CUDA or
+chunked and recomputed in the backward pass on the PyTorch path. Peak memory is in the table above.
 
 ## PixelDiT baseline
 

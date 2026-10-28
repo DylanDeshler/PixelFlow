@@ -25,14 +25,16 @@ Encoder: a token's n x n x 3 coefficients are the projection of the actual pixel
 Decoder: each token's final layer predicts n x n x 3 coefficients; its value at a pixel is the basis evaluated exactly at the
   pixel's frame coordinates, sum C psi(v) psi(u) / n (the inverse DCT at the aligned frame). Pixels blend the tokens near
   them with normalized Gaussian weights of the frame coordinates, exp(-(u^2 + v^2) / (2 sigma^2)) / sum over tokens (a
-  local softmax, as Slot Attention's partition of the image), truncated only where the weights are negligible. Every pixel
-  lies in its own anchor's token's window and Gaussians are positive, so every pixel is covered whatever the geometry.
+  local softmax, as Slot Attention's partition of the image), truncated only where the weights are negligible: each token
+  renders within its Gaussian's bounding box out to u^2 + v^2 = u_cut^2 (weights 1e-3), at least out to the pixels it may
+  own. Every pixel lies within its own anchor's token's box and Gaussians are positive, so every pixel is covered whatever
+  the geometry.
 Both are computed over a fixed window of pixels around each token, in chunks of tokens, and recomputed in the backward pass
 (activation checkpointing), so the pixel x basis intermediates are never stored. Axis-aligned frames (max_rotation = 0, the
 default: tokens still shift and scale each axis independently) make the basis separable, psi(v_y) psi(u_x), so encoding and
-decoding are two small matmuls per token (as a 2D DCT) instead of a basis evaluation at every pixel of the window: ~2.5x
-cheaper per training step than with rotation (in PyTorch; on CUDA, rotated frames use the fused Triton kernels in
-gauss_kernels.py, which evaluate the basis in registers instead of storing it).
+decoding are two small matmuls per token (as a 2D DCT) instead of a basis evaluation at every pixel of the window. On CUDA,
+the fused Triton kernels in gauss_kernels.py do both layers per token in registers, over each token's own bounding box
+(separable kernels for axis-aligned frames), storing nothing per pixel.
 Positions: the footprint-integrated sin-cos and RoPE at the continuous centres (in anchor units, detached: geometry is
 learned through the sampling and the blending), a learned shape embedding of (log scales, rotation), and the area
 attention bias (log of the frame's area relative to the anchor cell).
@@ -131,8 +133,8 @@ class GaussJiT(nn.Module):
         self.grid = input_size // patch_size
         self.tokens = self.grid ** 2
         self.area_bias, self.sigma, self.chunks = area_bias, sigma, chunks
-        # fully fused Triton kernels (gauss_kernels.encode_op / render_op) on CUDA: 'auto' for rotated frames (axis-aligned use the
-        # separable PyTorch path), 'always' for both, 'never' (the chunked PyTorch path everywhere)
+        # fully fused Triton kernels (gauss_kernels.encode_op / render_op): 'auto' / 'always' wherever available (CUDA; separable
+        # kernels for axis-aligned frames), 'never' (the chunked PyTorch path everywhere)
         assert fused in ('auto', 'always', 'never'), f"fused must be 'auto', 'always' or 'never', got {fused}"
         self.fused = fused
         # pixel windows around each token (whole pixels around floor(mu)): the encoder's covers the largest rotated frame;
@@ -141,9 +143,10 @@ class GaussJiT(nn.Module):
         h_max = extent * patch_size * self.scale_max
         rot = min(max_rotation, math.pi / 4)
         self.window_enc = 2 * math.ceil(h_max * (math.cos(rot) + math.sin(rot))) + 3
-        u_cut = sigma * math.sqrt(2 * math.log(1e3))
+        u_cut = gauss_kernels.render_cut(sigma)
         own = max_offset * patch_size * math.sqrt(2) + patch_size / math.sqrt(2) + 1
         self.window = 2 * math.ceil(max(u_cut * h_max, own)) + 3
+        self.r_own = math.ceil(own) + 1 # each token renders within its Gaussian's box (u^2 + v^2 < u_cut^2), at least this far
 
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = LabelEmbedder(num_classes, hidden_size)
@@ -273,12 +276,20 @@ class GaussJiT(nn.Module):
         coef = torch.einsum('bkcp,bkpq,bkpa->bkcqa', vals, pv, pu)
         return coef / m.sum(-1).clamp_min(1).sqrt()[..., None, None, None]
 
+    def render_radius(self, h, theta):
+        # per token, the decoder's box radii around floor(mu) [B, k] (x, y): gauss_kernels.render_radius
+        geom = torch.cat([h.new_zeros(h.shape), h, theta[..., None]], -1).reshape(-1, 5)
+        rx, ry = gauss_kernels.render_radius(geom, self.sigma, self.r_own, (self.window - 1) // 2)
+        return rx.view(h.shape[:-1]), ry.view(h.shape[:-1])
+
     def _decode_chunk(self, coef, mu, h, theta):
         # each token's values and Gaussian blending weights at the pixels of its window: (numerator [B, C, H*H] contribution,
         # weight [B, 1, H*H] contribution)
         B, k, C, n, _ = coef.shape
         H = self.input_size
         idx, inside, u, v = self.window_coords(mu, h, theta, self.offsets_dec)
+        rx, ry = self.render_radius(h, theta)
+        inside = inside & (self.offsets_dec.abs() <= torch.stack([rx, ry], -1)[:, :, None]).all(-1)
         w = torch.exp(-(u ** 2 + v ** 2) / (2 * self.sigma ** 2)) * inside.float() # [B, k, P]
         vals = torch.einsum('bkcqa,bkpq,bkpa->bkcp', coef, self.basis(v), self.basis(u)) / n # [B, k, C, P]
         P = idx.shape[2]
@@ -320,6 +331,8 @@ class GaussJiT(nn.Module):
         B, k, C, n, _ = coef.shape
         H = self.input_size
         q, inside, z = self.axis_coords(mu, h, self.offsets_dec_1d)
+        rx, ry = self.render_radius(h, torch.zeros_like(h[..., 0]))
+        inside = inside & (self.offsets_dec_1d.abs() <= torch.stack([rx, ry], -1)[..., None])
         W = q.shape[-1]
         g = torch.exp(-z ** 2 / (2 * self.sigma ** 2)) * inside.float() # [B, k, 2, W]: the Gaussian factors per axis
         vals = self.basis(z[:, :, 1])[:, :, None] @ coef @ self.basis(z[:, :, 0]).transpose(-1, -2)[:, :, None] / n # [B, k, C, Wy, Wx]
@@ -346,26 +359,28 @@ class GaussJiT(nn.Module):
         return outs
 
     def _encode_fused(self, x_flat, mu, h, theta):
-        # rotated frames on CUDA: gauss_kernels.encode_op does the window, masks, pixel reads and basis projection per token
-        # in one kernel (and the geometry gradients in its backward); only the image and the geometry are kept for backward
+        # gauss_kernels.encode_op does the window, masks, pixel reads and basis projection per token in one kernel (and the
+        # geometry gradients in its backward; separable kernels for axis-aligned frames); only the image and the geometry
+        # are kept for backward
         B, C = x_flat.shape[:2]
         K, n, H = mu.shape[1], self.basis_n, self.input_size
         geom = torch.cat([mu, h, theta[..., None]], -1).reshape(B * K, 5)
-        coef, _ = gauss_kernels.encode_op(x_flat.view(B, C, H, H), geom, K, n, self.window_enc)
+        coef, _ = gauss_kernels.encode_op(x_flat.view(B, C, H, H), geom, K, n, self.window_enc, self.separable)
         return coef.view(B, K, C, n, n)
 
     def _render_fused(self, coef, mu, h, theta):
-        # rotated frames on CUDA: gauss_kernels.render_op evaluates, weights and accumulates every token's window into the
-        # image in one kernel (its backward returns the coefficient and geometry gradients); nothing per pixel is stored
+        # gauss_kernels.render_op evaluates, weights and accumulates every token's box into the image in one kernel (its
+        # backward returns the coefficient and geometry gradients); nothing per pixel is stored
         B, K, C, n, _ = coef.shape
         H = self.input_size
         geom = torch.cat([mu, h, theta[..., None]], -1).reshape(B * K, 5)
-        num, den = gauss_kernels.render_op(coef.reshape(B * K, C, n, n).contiguous(), geom, B, H, self.window, float(self.sigma))
+        num, den = gauss_kernels.render_op(coef.reshape(B * K, C, n, n).contiguous(), geom, B, H, self.window, float(self.sigma),
+                                           self.r_own, self.separable)
         return num / den.clamp_min(1e-30)
 
     def use_fused(self, device):
-        wanted = self.fused == 'always' or (self.fused == 'auto' and not self.separable)
-        return wanted and gauss_kernels.kernels_available(device)
+        # 'auto' and 'always': the fused kernels wherever they're available (CUDA); 'never': the PyTorch path
+        return self.fused != 'never' and gauss_kernels.kernels_available(device)
 
     def encode(self, x, mu, h, theta):
         # basis coefficients of every token [B, K, C * n^2]
