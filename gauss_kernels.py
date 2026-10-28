@@ -493,7 +493,8 @@ if HAVE_TRITON:
 
     @render_bwd_op.register_fake
     def _(coef, geom, dnum, dden, W, sigma):
-        return torch.empty_like(coef, dtype=torch.float32), geom.new_empty((geom.shape[0], 5), dtype=torch.float32)
+        # contiguous, as the real op returns (empty_like would copy a permuted input's strides)
+        return coef.new_empty(coef.shape, dtype=torch.float32), geom.new_empty((geom.shape[0], 5), dtype=torch.float32)
 
     def _render_setup(ctx, inputs, output):
         coef, geom, B, Hh, W, sigma = inputs

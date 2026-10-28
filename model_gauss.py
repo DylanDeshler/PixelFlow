@@ -355,7 +355,7 @@ class GaussJiT(nn.Module):
         B, K, C, n, _ = coef.shape
         H = self.input_size
         geom = torch.cat([mu, h, theta[..., None]], -1).reshape(B * K, 5)
-        num, den = gauss_kernels.render_op(coef.reshape(B * K, C, n, n), geom, B, H, self.window, float(self.sigma))
+        num, den = gauss_kernels.render_op(coef.reshape(B * K, C, n, n).contiguous(), geom, B, H, self.window, float(self.sigma))
         return num / den.clamp_min(1e-30)
 
     def use_fused(self, device):
@@ -472,6 +472,94 @@ def draw_geometry(images, mu, h, theta, extent=0.75, color='#a8336b', points=96,
     for i in range(N):
         out[i, :, py[i].flatten(), px[i].flatten()] = rgb[:, None]
     return out
+
+
+# presets: JiT-B's backbone with Gaussian-placed tokens; the anchor spacing names the token count (/16: 64 tokens at 128px)
+# bottleneck_dim keeps JiT's compression ratio (768 -> 128 for a 16px patch): the default basis (2 x 0.75 x patch_size per
+# side, the initial frame's width in pixels) has (1.5)^2 = 2.25x a patch's coefficients, so 128 x 2.25 = 288
+GAUSS_PRESETS = {
+    'GaussJiT-B/16': dict(depth=12, hidden_size=768, num_heads=12, bottleneck_dim=288, patch_size=16),
+    'GaussJiT-B/8': dict(depth=12, hidden_size=768, num_heads=12, bottleneck_dim=288, patch_size=8),
+}
+
+
+TOKEN_COLORS = ['#2a78d6', '#eb6834', '#1baf7a', '#eda100', '#e87ba4', '#008300', '#7a4fc9', '#00a3c4', '#c43c3c']
+
+def token_colors(grid):
+    # one colour per anchor from 9, in a 3 x 3 repeating pattern: every token's 8 neighbours have other colours
+    import matplotlib.colors as mcolors
+    rgb = torch.tensor([mcolors.to_rgb(c) for c in TOKEN_COLORS])
+    iy, ix = torch.meshgrid(torch.arange(grid), torch.arange(grid), indexing='ij')
+    return rgb[((iy % 3) * 3 + ix % 3).flatten()] # [K, 3] in [0, 1]
+
+def draw_gaussians(ax, net, image, mu, h, theta, arrow_scale=4.0, contour=2.0):
+    """
+    On a matplotlib axis: the image (dimmed), every token's Gaussian as a filled ellipse at its `contour`-sigma level (the
+    blending weight exp(-(u^2 + v^2) / 2 sigma^2) in the token's frame: semi-axes contour * sigma * h, rotated by theta)
+    in its own colour, and an arrow from its anchor to its centre (drawn arrow_scale x longer).
+    """
+    from matplotlib.patches import Ellipse
+    import numpy as np
+    H = image.shape[-1]
+    ax.imshow(0.35 + 0.65 * ((image.float().clamp(-1, 1) + 1) / 2).permute(1, 2, 0).cpu().numpy())
+    cols = token_colors(net.grid).numpy()
+    anchors = net.anchors.cpu().numpy()
+    mu, h, theta = mu.float().cpu().numpy(), h.float().cpu().numpy(), theta.float().cpu().numpy()
+    for k in range(mu.shape[0]):
+        e = Ellipse(mu[k] - 0.5, 2 * contour * net.sigma * h[k, 0], 2 * contour * net.sigma * h[k, 1], angle=float(np.degrees(theta[k])),
+                    facecolor=(*cols[k], 0.28), edgecolor=cols[k], linewidth=0.8)
+        ax.add_patch(e)
+        d = (mu[k] - anchors[k]) * arrow_scale
+        ax.plot(anchors[k, 0] - 0.5, anchors[k, 1] - 0.5, 'o', color='k', markersize=1.2)
+        if np.hypot(*d) > 0.3:
+            ax.annotate('', xy=(anchors[k, 0] - 0.5 + d[0], anchors[k, 1] - 0.5 + d[1]), xytext=(anchors[k, 0] - 0.5, anchors[k, 1] - 0.5),
+                        arrowprops=dict(arrowstyle='-|>', color='k', lw=0.7, mutation_scale=5))
+    ax.set_xlim(-0.5, H - 0.5); ax.set_ylim(H - 0.5, -0.5)
+
+def soft_ownership(net, image, mu, h, theta):
+    # [H, W, 3]: each pixel the blend of its tokens' colours by their normalized blending weights, over the dimmed image
+    w = net.dense_weights(mu[None].float(), h[None].float(), theta[None].float())[0] # [K, H, W]
+    w = w / w.sum(0, keepdim=True).clamp_min(1e-30)
+    col = torch.einsum('khw,kc->hwc', w, token_colors(net.grid).to(w.device))
+    img = ((image.float().clamp(-1, 1) + 1) / 2).permute(1, 2, 0).to(w.device)
+    return (0.6 * col + 0.4 * img).cpu().numpy()
+
+def geometry_figure(net, path, images, columns, row_labels=None, ownership=True, title=''):
+    """
+    A figure of token geometry: one row per image; per column (title, mu [N, K, 2], h [N, K, 2], theta [N, K]) the
+    Gaussians with displacement arrows, and (ownership) the last column's soft ownership. images [N, 3, H, W] in [-1, 1].
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    N = images.shape[0]
+    ncol = 1 + len(columns) + (1 if ownership else 0)
+    fig, axes = plt.subplots(N, ncol, figsize=(2.1 * ncol, 2.15 * N + 0.7), squeeze=False, facecolor='#fcfcfb')
+    for ax in axes.flat:
+        ax.set_xticks([]); ax.set_yticks([])
+        for sp in ax.spines.values():
+            sp.set_visible(False)
+    for i in range(N):
+        axes[i, 0].imshow(((images[i].float().clamp(-1, 1) + 1) / 2).permute(1, 2, 0).cpu().numpy())
+        if row_labels:
+            axes[i, 0].set_ylabel(row_labels[i][:18], fontsize=7, color='#52514e')
+        for j, (ct, mu, h, theta) in enumerate(columns):
+            draw_gaussians(axes[i, 1 + j], net, images[i], mu[i], h[i], theta[i])
+            if i == 0:
+                axes[i, 1 + j].set_title(ct, fontsize=8)
+        if ownership:
+            ct, mu, h, theta = columns[-1]
+            axes[i, -1].imshow(soft_ownership(net, images[i], mu[i], h[i], theta[i]))
+            if i == 0:
+                axes[i, -1].set_title(f'soft ownership ({ct})', fontsize=8)
+    if i == N - 1:
+        axes[0, 0].set_title('image', fontsize=8)
+    fig.suptitle((title + '\n' if title else '') + f'each token: its Gaussian at 2 sigma (filled, own colour); arrow: anchor -> centre, '
+                 f'drawn 4x longer; ownership: pixel colour = tokens\' colours mixed by their normalized blending weights',
+                 fontsize=8, x=0.01, ha='left')
+    fig.tight_layout(rect=(0, 0, 1, 1 - 0.75 / (2.15 * N + 0.7)))
+    fig.savefig(path, dpi=130, facecolor='#fcfcfb')
+    plt.close(fig)
 
 
 # presets: JiT-B's backbone with Gaussian-placed tokens; the anchor spacing names the token count (/16: 64 tokens at 128px)

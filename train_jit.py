@@ -31,7 +31,7 @@ import numpy as np
 import torch
 
 from data_jit import MemmapImages, EpochSampler, Prefetcher, to_model_input
-from jit_common import build_denoiser, resolve_arch, describe_arch, run_dir, legacy_run_dir, ema_state_dicts, ema_weights, generate_and_score, save_labeled_grid, save_layout_grids, save_geometry_grid, GAUSS_DEFAULTS
+from jit_common import build_denoiser, resolve_arch, describe_arch, run_dir, legacy_run_dir, ema_state_dicts, ema_weights, generate_and_score, save_labeled_grid, save_layout_grids, save_geometry_grid, save_geometry_live, GAUSS_DEFAULTS
 from fid import InceptionMetrics, load_ref_stats, precision_recall
 from repa import FrozenEncoder, Projector, MaskedTransformerAdapter, BlockCapture, repa_loss, mta_loss
 from masking import TokenMasker, flow_loss
@@ -829,6 +829,20 @@ def save_samples(step):
     if sample_cfg > 0:
         settings.append((sample_cfg, (sample_interval_min, sample_interval_max), f'_cfg{sample_cfg:g}'))
     names = [class_names[i] for i in labels.tolist()]
+    if is_gauss: # the live (training) weights' geometry on held-out images, before switching to the sampling weights
+        global geo_val
+        if 'geo_val' not in globals():
+            gv = MemmapImages(os.path.join(data_dir, 'val'))
+            xg, _ = gv.get(spaced(len(gv), 6))
+            geo_val = to_model_input(xg, flip=False, device=device)
+        was = denoiser.training
+        denoiser.eval()
+        geo_t = save_geometry_live(denoiser.net, geo_val, None, os.path.join(samples_dir, f'geometry_{step}.png'), noise_scale)
+        denoiser.train(was)
+        with open(os.path.join(out_dir, 'geometry_vs_t.jsonl'), 'a') as fh: # geometry vs t over training, for plotting
+            fh.write(json.dumps({'iter': step, 'stats': {f'{t:.3f}': v for t, v in geo_t.items()}}) + '\n')
+        if wandb_log:
+            wandb.log({f'geometry_t/{k}_t{t:.2f}': v for t, st in geo_t.items() for k, v in st.items() if k in ('offset_mean', 'scale_p5', 'scale_p95', 'rotation_p95')}, step=step)
     with ema_weights(denoiser, 1):
         denoiser.eval()
         for cfg, interval, suffix in settings:

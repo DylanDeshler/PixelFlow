@@ -508,20 +508,19 @@ oriented, scaled patches (64 at 128px for `GaussJiT-B/16`).
     kernels (`gauss_kernels.py`), which evaluate the basis in registers. They're registered as custom ops, so
     `torch.compile` fuses everything around them.
 
-  Measured on an L40S (batch 128, 128px, bf16, compiled, forward and backward):
-
-  | model | step | img/s | peak memory |
-  |---|---|---|---|
-  | JiT-B/16 | 62.5 ms | 2050 | 4.9 GB |
-  | GaussJiT-B/16, axis-aligned | 77.1 ms | 1659 | 5.7 GB |
-  | GaussJiT-B/16, rotated, fused kernels | 97.3 ms | 1315 | 6.4 GB |
-  | GaussJiT-B/16, rotated, PyTorch path | 288.1 ms | 444 | 10.9 GB |
-
   The fused kernels cover the whole input and output layers: window, frame coordinates, masks, pixel reads, basis,
   Gaussian weights and accumulation into the image. Their backward passes return each token's 5 geometry gradients
   directly, so nothing per pixel is stored for the backward pass. `--gauss_fused` selects where they're used: `auto`
-  (rotated frames; the default), `always` (axis-aligned too), or `never`. The table above predates this full fusion, so
-  peak memory for rotated frames should now be lower than shown.
+  (rotated frames; the default), `always` (axis-aligned too: less memory, slower), or `never`.
+
+  Measured on an L40S (128px, bf16, compiled, forward and backward):
+
+  | model | batch 128: step | batch 1024: step | img/s | peak memory at 1024 |
+  |---|---|---|---|---|
+  | JiT-B/16 | 62.7 ms | 561 ms | 1826 | 32.7 GB |
+  | GaussJiT-B/16, axis-aligned (separable PyTorch) | 77.3 ms | 705 ms | 1453 | 39.0 GB |
+  | GaussJiT-B/16, axis-aligned, `--gauss_fused=always` | 91.8 ms | 791 ms | 1295 | 34.7 GB |
+  | GaussJiT-B/16, rotated (fused kernels) | 98.5 ms | 842 ms | 1216 | 34.7 GB |
 
   `python gauss_kernels.py` checks the kernels against PyTorch references. Errors are about 1e-3 on GPU (TF32 matrix
   multiplies, like the rest of the bf16 model) and about 1e-7 under `TRITON_INTERPRET=1` on CPU.

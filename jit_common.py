@@ -411,20 +411,94 @@ def save_layout_grids(net, x, names, prefix, history):
             labels.append(f't={history[i][1]:.2f}')
     save_labeled_grid(torch.cat(cells), labels, prefix + '_layout_steps.png', nrow=1 + len(picks))
 
-def save_geometry_grid(net, x, names, path):
+def save_geometry_grid(net, x, names, path, n=8):
     """
-    GaussJiT samples with every token's owned cell outlined and its centre marked (its effective tokenization, drawn like
-    the quadtree's boxes), from the last network call's geometry (the end of sampling; CFG batches carry the conditional
-    half first); and {path}_coverage.png: for the first 8 samples, cells, full frames, the owner map and the overlap map.
+    GaussJiT samples with the geometry of the last network call (the end of sampling; CFG batches carry the conditional
+    half first): every token's Gaussian, its displacement from its anchor, and the soft ownership (model_gauss.geometry_figure).
     """
-    from model_gauss import draw_cells, coverage_panels
+    from model_gauss import geometry_figure
     if net.last_geometry is None:
         return
-    mu, h, theta = (g[:x.shape[0]] for g in net.last_geometry)
-    save_labeled_grid(draw_cells(x, net, mu, h, theta), names, path)
-    # full coverage for the first 8 samples: cores, full frames, owner map, overlap map
-    panels, labels = coverage_panels(net, x, mu, h, theta)
-    save_labeled_grid(panels, labels, path.replace('_geometry.png', '_coverage.png'), nrow=5)
+    n = min(n, x.shape[0])
+    mu, h, theta = (g[:n] for g in net.last_geometry)
+    geometry_figure(net, path, x[:n], [('end of sampling', mu, h, theta)], row_labels=names[:n],
+                    title='geometry of the sampled images at the last sampling step (sampling weights)')
+
+def save_geometry_live(net, x, y, path, noise_scale, ts=(0.3, 0.6, 0.9), seed=0, t_grid=19):
+    """
+    The geometry the network predicts now (call with the training weights) for held-out images x noised to t:
+      {path}                      one column per t in ts (model_gauss.geometry_figure)
+      {path stem}_vs_t.png        displacement / per-axis scale / |rotation| percentiles vs t, over t_grid noise levels
+      {path stem}.gif             t sweeping from noisy to clean: the noisy input (top) and the Gaussians on the clean image
+    Returns {t: geometry stats} for logging. Shows what the placer is learning even while sampling weights (EMA) lag.
+    """
+    import math
+    import numpy as np
+    from model_gauss import geometry_figure, draw_gaussians
+    g = torch.Generator(device=x.device).manual_seed(seed)
+    e = torch.randn(x.shape, generator=g, device=x.device) * noise_scale
+    def geo_at(t_val):
+        t = torch.full((x.shape[0],), t_val, device=x.device)
+        z = t_val * x + (1 - t_val) * e
+        mu, h, theta, _ = net.geometry(z, net.t_embedder(t).float())
+        return z, mu, h, theta
+    with torch.no_grad(), torch.autocast(device_type=x.device.type, enabled=False):
+        cols = [(f't={t_val:g}', *geo_at(t_val)[1:]) for t_val in ts]
+        grid = [float(v) for v in np.linspace(0.05, 0.95, t_grid)]
+        sweep = [(t_val, *geo_at(t_val)) for t_val in grid]
+    geometry_figure(net, path, x, cols, title='geometry predicted from held-out images noised to t (training weights)')
+    stem = path.rsplit('.', 1)[0]
+    # statistics vs t
+    S, q = net.patch_size, torch.tensor([0.05, 0.5, 0.95], device=x.device)
+    stats = {}
+    for t_val, _, mu, h, theta in sweep:
+        off = ((mu - net.anchors) / S).norm(dim=-1).flatten()
+        f = (h / (net.extent * S)).flatten()
+        rot = theta.abs().flatten() * 180 / math.pi
+        stats[t_val] = {'offset_mean': off.mean().item(), 'offset_p95': torch.quantile(off, 0.95).item(),
+                        **{f'scale_{k}': v for k, v in zip(('p5', 'p50', 'p95'), torch.quantile(f, q).tolist())},
+                        'rotation_p50': torch.quantile(rot, 0.5).item(), 'rotation_p95': torch.quantile(rot, 0.95).item()}
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from plot_style import SURFACE, INK_2, style_axis, line, CATEGORICAL
+    tv = list(stats)
+    panels = [('displacement (anchor spacings)', [('mean', 'offset_mean'), ('p95', 'offset_p95')]),
+              ('per-axis scale (x initial size)', [('p5', 'scale_p5'), ('p50', 'scale_p50'), ('p95', 'scale_p95')])]
+    if net.max_rotation > 0:
+        panels.append(('|rotation| (degrees)', [('p50', 'rotation_p50'), ('p95', 'rotation_p95')]))
+    fig, axes = plt.subplots(1, len(panels), figsize=(4.6 * len(panels), 3.4), facecolor=SURFACE, squeeze=False)
+    for ax, (title, series) in zip(axes[0], panels):
+        for k, (lab, key) in enumerate(series):
+            line(ax, tv, [stats[t][key] for t in tv], CATEGORICAL[k], 'o', lab)
+        style_axis(ax, 't (1 = clean)', '', title)
+        ax.legend(frameon=False, fontsize=8, labelcolor=INK_2)
+    fig.suptitle(f'token geometry vs noise level ({x.shape[0]} held-out images x {net.tokens} tokens, training weights)', fontsize=9, x=0.01, ha='left')
+    fig.tight_layout(rect=(0, 0, 1, 0.9))
+    fig.savefig(stem + '_vs_t.png', dpi=130, facecolor=SURFACE)
+    plt.close(fig)
+    # animation over t
+    from PIL import Image
+    n = min(3, x.shape[0])
+    frames = []
+    for t_val, z, mu, h, theta in sweep:
+        fig, axes = plt.subplots(2, n, figsize=(2.3 * n, 4.9), facecolor=SURFACE, squeeze=False, dpi=72)
+        for j_ in range(n):
+            for ax in axes[:, j_]:
+                ax.set_xticks([]); ax.set_yticks([])
+                for sp in ax.spines.values():
+                    sp.set_visible(False)
+            axes[0, j_].imshow(((z[j_] / max(1e-6, z[j_].abs().max().item())).clamp(-1, 1) * 0.5 + 0.5).permute(1, 2, 0).cpu().numpy())
+            draw_gaussians(axes[1, j_], net, x[j_], mu[j_], h[j_], theta[j_])
+        axes[0, 0].set_ylabel('noisy input', fontsize=8); axes[1, 0].set_ylabel('Gaussians (arrows 4x)', fontsize=8)
+        fig.suptitle(f't = {t_val:.2f}  (1 = clean)', fontsize=10)
+        fig.tight_layout(rect=(0, 0, 1, 0.94))
+        fig.canvas.draw()
+        frames.append(Image.fromarray(np.asarray(fig.canvas.buffer_rgba())[..., :3].copy()))
+        plt.close(fig)
+    frames = [f.quantize(colors=128) for f in frames] # palette frames: a few hundred KB
+    frames[0].save(stem + '.gif', save_all=True, append_images=frames[1:] + frames[::-1][1:-1], duration=180, loop=0, optimize=True)
+    return stats
 
 # settings that don't change what is trained (budget, evaluation, logging, system), left out of run directory names;
 # diag* (diagnostics) settings are excluded too
