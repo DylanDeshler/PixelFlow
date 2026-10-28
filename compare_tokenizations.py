@@ -8,6 +8,7 @@ coefficients). No diffusion model: this filters tokenization families before any
   quadtree4   the same down to 4 px
   merge       (B) irregular regions grown bottom-up from 2x2 px units: repeatedly merge the adjacent pair whose union
               raises the fit error least, until K regions remain (exact least squares from sufficient statistics)
+  gaussfixed  soft decoding alone: Gaussians frozen at the quadtree8 layout (sigma = width / 3), only their polynomials fit
   gauss       (C) K soft 2D Gaussians: each pixel blends the tokens' polynomials (in each Gaussian's own frame) with weights
               normalized over tokens (a partition of unity, so every pixel is covered); centres, shapes and coefficients
               fit by Adam from the quadtree8 solution at the same K (its centres, widths and
@@ -16,7 +17,7 @@ coefficients). No diffusion model: this filters tokenization families before any
 Each family gets its best allocation for the image itself (fit on the clean image): an upper bound on what each could
 represent, not a router. Errors are PSNR on [0, 1] over held-out images.
 
-$ python compare_tokenizations.py --data_dir=/data/in1k_128                       # -> {out}.json, {out}.png, {out}_viz.png
+$ python compare_tokenizations.py --data_dir=/data/in1k_128          # -> {out}.json, {out}.png, {out}_viz_K{K}.png
 """
 
 import os
@@ -36,16 +37,17 @@ data_dir = ''
 n_images = 128
 seed = 0
 tokens = '64,100,160,256'
-families = 'uniform,quadtree8,quadtree4,merge,gauss'
+families = 'uniform,quadtree8,quadtree4,merge,gaussfixed,gauss'
 capacities = 'const,linear,quad'
 gauss_steps = 400
 gauss_lr = 0.02
 batch_size = 16
 gauss_batch = 8 # the Gaussian fit holds [batch, K, H*W] weights (and gradients)
 viz_images = 4
-viz_tokens = 100
+viz_tokens = '64,100,160' # one patchification figure per K
 viz_capacity = 'linear'
 out = '' # default: {data_dir name}_tokenizations
+plot_only = False # redraw the PSNR figure from an existing {out}.json (no fitting; older JSONs get the PSNR correction)
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
@@ -53,14 +55,58 @@ exec(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'configurator
 config = {k: globals()[k] for k in config_keys}
 # -----------------------------------------------------------------------------
 
-assert data_dir, 'pass --data_dir'
+assert data_dir or (plot_only and out), 'pass --data_dir (or --plot_only with --out)'
 out = out or f"{os.path.basename(os.path.normpath(data_dir))}_tokenizations"
+def psnr_figure(results):
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from plot_style import SURFACE, INK, INK_2, style_axis, CATEGORICAL
+    caps = [c for c in results['psnr']]
+    fams = list(dict.fromkeys(f for c in caps for f in results['psnr'][c]))
+    Ks_ = sorted({int(k) for c in caps for f in results['psnr'][c] for k in results['psnr'][c][f]})
+    fixed = {'uniform': '#2a78d6', 'quadtree8': '#eb6834', 'quadtree4': '#eda100', 'merge': '#1baf7a', 'gaussfixed': '#e87ba4', 'gauss': '#a8336b'}
+    marks = {'uniform': 'o', 'quadtree8': 's', 'quadtree4': 'D', 'merge': '^', 'gaussfixed': 'X', 'gauss': 'P'}
+    fig, axes = plt.subplots(1, len(caps), figsize=(5.2 * len(caps), 4.2), facecolor=SURFACE, squeeze=False)
+    for ax, cap in zip(axes[0], caps):
+        for j, fam in enumerate(fams):
+            if fam not in results['psnr'][cap]:
+                continue
+            row = results['psnr'][cap][fam]
+            ks = [K for K in Ks_ if str(K) in row]
+            ax.plot(ks, [row[str(K)] for K in ks], '-' + marks.get(fam, 'o'), color=fixed.get(fam, CATEGORICAL[j % len(CATEGORICAL)]),
+                    linewidth=2, markersize=7, markeredgecolor=SURFACE, markeredgewidth=1.5, label=fam)
+        ax.set_xscale('log', base=2); ax.set_xticks(Ks_, [str(k) for k in Ks_]); ax.minorticks_off()
+        style_axis(ax, 'tokens per image K', 'PSNR (dB, higher is better)', f'{cap} polynomial per token')
+    axes[0, 0].legend(frameon=False, fontsize=8, labelcolor=INK_2)
+    cfg_ = results.get('config', {})
+    fig.suptitle(f"how well each tokenization describes held-out images at matched tokens ({cfg_.get('n_images', '?')} images; each "
+                 f"family allocated on the image itself)", color=INK, fontsize=10, x=0.01, ha='left')
+    fig.tight_layout(rect=(0, 0, 1, 0.92))
+    fig.savefig(out + '.png', dpi=140, facecolor=SURFACE)
+    plt.close(fig)
+    print(f'wrote {out}.png')
+
+if plot_only:
+    with open(out + '.json') as fh:
+        res = json.load(fh)
+    if res.get('psnr_version', 1) < 2: # older results divided by pixels, not pixels x channels: +10 log10(3) dB
+        res['psnr'] = {c: {f: {k: v + 10 * np.log10(3) for k, v in r.items()} for f, r in d.items()} for c, d in res['psnr'].items()}
+        res['psnr_version'] = 2
+        with open(out + '.json', 'w') as fh:
+            json.dump(res, fh, indent=1)
+        print(f'{out}.json: PSNR corrected (+{10 * np.log10(3):.2f} dB)')
+    psnr_figure(res)
+    raise SystemExit
+
 data = MemmapImages(os.path.join(data_dir, 'val') if os.path.isdir(os.path.join(data_dir, 'val')) else data_dir)
 img = data.img_size
 idx = np.sort(np.random.default_rng(seed).choice(len(data), n_images, replace=False))
 X = to_model_input(data.get(idx)[0], flip=False, device=device) # [N, 3, H, W] in [-1, 1]
 Ks = [int(k) for k in tokens.split(',')]
 fam_list = [f for f in families.split(',') if f]
+FAMILIES = ('uniform', 'quadtree8', 'quadtree4', 'merge', 'gaussfixed', 'gauss')
+assert all(f in FAMILIES for f in fam_list), f'unknown families {[f for f in fam_list if f not in FAMILIES]}: choose from {FAMILIES}'
 cap_list = [c for c in capacities.split(',') if c]
 DEG = {'const': 0, 'linear': 1, 'quad': 2}
 
@@ -74,8 +120,8 @@ def basis(u, v, cap):
     return torch.stack(terms, -1)
 
 def psnr(err_sum, n_pix):
-    # summed squared error over [-1, 1] pixels (all channels) -> PSNR on [0, 1]
-    return 10 * np.log10(1.0 / (err_sum / n_pix / 4))
+    # squared error summed over [-1, 1] pixels and the 3 channels -> PSNR on [0, 1] (mean over channels)
+    return 10 * np.log10(1.0 / (err_sum / (3 * n_pix) / 4))
 
 # -----------------------------------------------------------------------------
 # quadtree (and uniform): per-node least squares, greedy allocation by error reduction
@@ -213,10 +259,11 @@ def run_merge(x, cap, Ks_desc):
 # -----------------------------------------------------------------------------
 # C: K soft 2D Gaussians with per-token polynomials, fit by Adam from the quadtree8 layout
 
-def run_gauss(x, cap, K, steps=None, lr=None):
+def run_gauss(x, cap, K, steps=None, lr=None, fixed=False):
     """
     x [B, 3, H, W] -> reconstruction, (centres [B, K, 2], covariance factors) after fitting. Pixel value
-    sum_k w_k(p) poly_k(p - mu_k) / sum_k w_k(p), w_k = exp(-|L_k^-1 (p - mu_k)|^2 / 2).
+    sum_k w_k(p) poly_k(p - mu_k) / sum_k w_k(p), w_k = exp(-|L_k^-1 (p - mu_k)|^2 / 2). fixed: the geometry stays at the
+    quadtree layout (sigma = width / 3) and only the polynomials are fit: soft decoding without adaptive geometry.
     """
     steps, lr = steps or gauss_steps, lr or gauss_lr
     B, _, H, W = x.shape
@@ -225,10 +272,10 @@ def run_gauss(x, cap, K, steps=None, lr=None):
     cy = geo.cy.to(x.device)[layout] * f # [B, K] pixel centres
     cx = geo.cx.to(x.device)[layout] * f
     w0 = geo.width.to(x.device)[layout] * f # token widths in pixels
-    mu = torch.stack([cx, cy], -1).clone().requires_grad_(True) # [B, K, 2] (x, y)
+    mu = torch.stack([cx, cy], -1).clone().requires_grad_(not fixed) # [B, K, 2] (x, y)
     # narrow enough that the normalized weights start close to the quadtree's hard partition
-    log_s = torch.log(w0 / 4).unsqueeze(-1).repeat(1, 1, 2).clone().requires_grad_(True) # per-axis scales
-    rho = torch.zeros(B, K, device=x.device, requires_grad=True) # rotation
+    log_s = torch.log(w0 / (3 if fixed else 4)).unsqueeze(-1).repeat(1, 1, 2).clone().requires_grad_(not fixed) # per-axis scales
+    rho = torch.zeros(B, K, device=x.device, requires_grad=not fixed) # rotation
     # each token's polynomial starts at its quadtree region's least-squares fit (node-local coordinates, u = rows, v = columns)
     lvl, pos = geo.level.to(x.device)[layout], geo.index_in_level.to(x.device)[layout] # [B, K]
     coef0 = None
@@ -245,7 +292,8 @@ def run_gauss(x, cap, K, steps=None, lr=None):
     yy, xx = torch.meshgrid(torch.arange(H, device=x.device) + 0.5, torch.arange(W, device=x.device) + 0.5, indexing='ij')
     P = torch.stack([xx.flatten(), yy.flatten()], -1) # [HW, 2]
     target = x.flatten(2).transpose(1, 2) # [B, HW, 3]
-    opt = torch.optim.Adam([{'params': [mu], 'lr': lr * 8}, {'params': [log_s, rho], 'lr': lr}, {'params': [coef], 'lr': lr * 5}])
+    groups = [{'params': [coef], 'lr': lr * 5}] + ([] if fixed else [{'params': [mu], 'lr': lr * 8}, {'params': [log_s, rho], 'lr': lr}])
+    opt = torch.optim.Adam(groups)
     def render():
         diff = P[None, None] - mu[:, :, None] # [B, K, HW, 2]
         c, s = torch.cos(rho)[..., None], torch.sin(rho)[..., None]
@@ -272,14 +320,15 @@ def run_gauss(x, cap, K, steps=None, lr=None):
 # -----------------------------------------------------------------------------
 # run
 
-results = {'config': config, 'psnr': {}}
-recs = {}
+results = {'config': config, 'psnr': {}, 'psnr_version': 2}
+recs = {} # K -> family -> (reconstructions, regions) for the patchification figures
+VIZ_K = [int(k) for k in str(viz_tokens).split(',') if k]
 t0 = time.time()
 for cap in cap_list:
     for fam in fam_list:
         for K in Ks:
             err_sum = 0.0
-            bs = gauss_batch if fam == 'gauss' else batch_size
+            bs = gauss_batch if fam.startswith('gauss') else batch_size
             for i in range(0, n_images, bs):
                 xb = X[i:i + bs]
                 if fam in ('uniform', 'quadtree8', 'quadtree4'):
@@ -288,10 +337,10 @@ for cap in cap_list:
                     continue # done below for all K at once
                 else:
                     with torch.enable_grad():
-                        rec, extra = run_gauss(xb, cap, K)
+                        rec, extra = run_gauss(xb, cap, K, fixed=(fam == 'gaussfixed'))
                 err_sum += (rec - xb).pow(2).sum().item()
-                if i == 0 and cap == viz_capacity and K == viz_tokens:
-                    recs[fam] = (rec[:viz_images].cpu(), extra)
+                if i == 0 and cap == viz_capacity and K in VIZ_K:
+                    recs.setdefault(K, {})[fam] = (rec[:viz_images].cpu(), extra)
             if fam != 'merge':
                 results['psnr'].setdefault(cap, {}).setdefault(fam, {})[str(K)] = psnr(err_sum, n_images * img * img)
         if fam == 'merge':
@@ -300,9 +349,11 @@ for cap in cap_list:
                 snaps = run_merge(X[j], cap, Ks)
                 for K in Ks:
                     errs[K] += (snaps[K][0].to(device) - X[j]).pow(2).sum().item()
-                if j < viz_images and cap == viz_capacity and viz_tokens in snaps:
-                    recs.setdefault('merge', ([], []))
-                    recs['merge'][0].append(snaps[viz_tokens][0]); recs['merge'][1].append(snaps[viz_tokens][1])
+                if j < viz_images and cap == viz_capacity:
+                    for K in VIZ_K:
+                        if K in snaps:
+                            m = recs.setdefault(K, {}).setdefault('merge', ([], []))
+                            m[0].append(snaps[K][0]); m[1].append(snaps[K][1])
             for K in Ks:
                 results['psnr'].setdefault(cap, {}).setdefault('merge', {})[str(K)] = psnr(errs[K], n_images * img * img)
         row = results['psnr'][cap][fam]
@@ -321,59 +372,54 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Ellipse
 from plot_style import SURFACE, INK, INK_2, style_axis
 
-COLORS = {'uniform': '#2a78d6', 'quadtree8': '#eb6834', 'quadtree4': '#eda100', 'merge': '#1baf7a', 'gauss': '#a8336b'}
-MARKERS = {'uniform': 'o', 'quadtree8': 's', 'quadtree4': 'D', 'merge': '^', 'gauss': 'P'}
-fig, axes = plt.subplots(1, len(cap_list), figsize=(5.2 * len(cap_list), 4.2), facecolor=SURFACE, squeeze=False)
-for ax, cap in zip(axes[0], cap_list):
-    for fam in fam_list:
-        v = [results['psnr'][cap][fam][str(K)] for K in Ks]
-        ax.plot(Ks, v, '-' + MARKERS[fam], color=COLORS[fam], linewidth=2, markersize=7, markeredgecolor=SURFACE, markeredgewidth=1.5, label=fam)
-    ax.set_xscale('log', base=2); ax.set_xticks(Ks, [str(k) for k in Ks]); ax.minorticks_off()
-    style_axis(ax, 'tokens per image K', 'PSNR (dB, higher is better)', f'{cap} polynomial per token')
-axes[0, 0].legend(frameon=False, fontsize=8, labelcolor=INK_2)
-fig.suptitle(f'how well each tokenization describes held-out images at matched tokens ({n_images} images, {img}px; each family '
-             f'allocated on the image itself)', color=INK, fontsize=10, x=0.01, ha='left')
-fig.tight_layout(rect=(0, 0, 1, 0.92))
-fig.savefig(out + '.png', dpi=140, facecolor=SURFACE)
-plt.close(fig)
+psnr_figure(results)
 
 to_np = lambda t: ((t.float().clamp(-1, 1) + 1) / 2).permute(1, 2, 0).cpu().numpy()
-cols = ['image'] + [f for f in fam_list if f in recs]
-nv = min(viz_images, n_images)
-fig, axes = plt.subplots(2 * nv, len(cols), figsize=(1.9 * len(cols), 3.9 * nv + 0.6), facecolor=SURFACE, squeeze=False)
-for ax in axes.flat:
-    ax.set_xticks([]); ax.set_yticks([])
-    for sp in ax.spines.values():
-        sp.set_visible(False)
-for j, c in enumerate(cols):
-    for i in range(nv):
-        top, bot = axes[2 * i, j], axes[2 * i + 1, j]
-        if c == 'image':
-            top.imshow(to_np(X[i])); bot.imshow(to_np(X[i]))
-            continue
-        if c == 'merge':
-            rec = recs['merge'][0][i]; lab = recs['merge'][1][i]
-            top.imshow(to_np(rec))
-            edge = np.zeros(lab.shape, bool)
-            edge[:, :-1] |= (lab[:, :-1] != lab[:, 1:]).numpy(); edge[:-1] |= (lab[:-1] != lab[1:]).numpy()
-            im = to_np(X[i]).copy(); im[edge] = [0.11, 0.69, 0.48]
-            bot.imshow(im)
-        elif c == 'gauss':
-            rec, (mu, s, rho) = recs['gauss']
-            top.imshow(to_np(rec[i])); bot.imshow(to_np(X[i]))
-            for k in range(mu.shape[1]):
-                bot.add_patch(Ellipse(mu[i, k].cpu().numpy() - 0.5, 2 * s[i, k, 0].item(), 2 * s[i, k, 1].item(),
-                                      angle=float(np.degrees(rho[i, k].item())), fill=False, color='#a8336b', linewidth=0.5))
-            bot.set_xlim(-0.5, img - 0.5); bot.set_ylim(img - 0.5, -0.5)
-        else:
-            rec, (layout, geo) = recs[c]
-            top.imshow(to_np(rec[i]))
-            bot.imshow(to_np(draw_layout(X[i:i + 1].cpu(), layout[i:i + 1].cpu(), geo)[0]))
-        if i == 0:
-            top.set_title(f"{c}\n{results['psnr'][viz_capacity][c][str(viz_tokens)]:.1f} dB", color=INK, fontsize=8)
-fig.suptitle(f'K={viz_tokens}, {viz_capacity} polynomial per token: reconstruction (top) and regions (bottom; Gaussians: '
-             f'1-sigma ellipses)', color=INK, fontsize=10, x=0.01, ha='left')
-fig.tight_layout(rect=(0, 0, 1, 1 - 0.6 / (3.9 * nv + 0.6)))
-fig.savefig(out + '_viz.png', dpi=140, facecolor=SURFACE)
-plt.close(fig)
-print(f'wrote {out}.png, {out}_viz.png')
+def viz_figure(K):
+    # each family's patchification at budget K: reconstruction (top) and regions on the image (bottom)
+    rk = recs.get(K, {})
+    cols = ['image'] + [f for f in fam_list if f in rk]
+    nv = min(viz_images, n_images)
+    fig, axes = plt.subplots(2 * nv, len(cols), figsize=(1.9 * len(cols), 3.9 * nv + 0.6), facecolor=SURFACE, squeeze=False)
+    for ax in axes.flat:
+        ax.set_xticks([]); ax.set_yticks([])
+        for sp in ax.spines.values():
+            sp.set_visible(False)
+    for j, c in enumerate(cols):
+        for i in range(nv):
+            top, bot = axes[2 * i, j], axes[2 * i + 1, j]
+            if c == 'image':
+                top.imshow(to_np(X[i])); bot.imshow(to_np(X[i]))
+                if i == 0:
+                    top.set_title('image', color=INK, fontsize=8)
+                continue
+            if c == 'merge':
+                rec = rk['merge'][0][i]; lab = rk['merge'][1][i]
+                top.imshow(to_np(rec))
+                edge = np.zeros(lab.shape, bool)
+                edge[:, :-1] |= (lab[:, :-1] != lab[:, 1:]).numpy(); edge[:-1] |= (lab[:-1] != lab[1:]).numpy()
+                im = to_np(X[i]).copy(); im[edge] = [0.11, 0.69, 0.48]
+                bot.imshow(im)
+            elif c.startswith('gauss'):
+                rec, (mu, s, rho) = rk[c]
+                top.imshow(to_np(rec[i])); bot.imshow(to_np(X[i]))
+                for k in range(mu.shape[1]):
+                    bot.add_patch(Ellipse(mu[i, k].cpu().numpy() - 0.5, 2 * s[i, k, 0].item(), 2 * s[i, k, 1].item(),
+                                          angle=float(np.degrees(rho[i, k].item())), fill=False, color='#a8336b', linewidth=0.5))
+                bot.set_xlim(-0.5, img - 0.5); bot.set_ylim(img - 0.5, -0.5)
+            else:
+                rec, (layout, geo) = rk[c]
+                top.imshow(to_np(rec[i]))
+                bot.imshow(to_np(draw_layout(X[i:i + 1].cpu(), layout[i:i + 1].cpu(), geo)[0]))
+            if i == 0:
+                top.set_title(f"{c}\n{results['psnr'][viz_capacity][c][str(K)]:.1f} dB", color=INK, fontsize=8)
+    fig.suptitle(f'K={K}, {viz_capacity} polynomial per token: reconstruction (top) and regions (bottom; quadtree boxes by '
+                 f'size, merge boundaries, Gaussians: 1-sigma ellipses)', color=INK, fontsize=10, x=0.01, ha='left')
+    fig.tight_layout(rect=(0, 0, 1, 1 - 0.6 / (3.9 * nv + 0.6)))
+    fig.savefig(out + f'_viz_K{K}.png', dpi=140, facecolor=SURFACE)
+    plt.close(fig)
+
+for K in VIZ_K:
+    if K in recs:
+        viz_figure(K)
+print(f"wrote {out}.png, " + ', '.join(f'{out}_viz_K{K}.png' for K in VIZ_K if K in recs))

@@ -31,7 +31,7 @@ import numpy as np
 import torch
 
 from data_jit import MemmapImages, EpochSampler, Prefetcher, to_model_input
-from jit_common import build_denoiser, resolve_arch, describe_arch, run_dir, legacy_run_dir, ema_state_dicts, ema_weights, generate_and_score, save_labeled_grid, save_layout_grids
+from jit_common import build_denoiser, resolve_arch, describe_arch, run_dir, legacy_run_dir, ema_state_dicts, ema_weights, generate_and_score, save_labeled_grid, save_layout_grids, save_geometry_grid, GAUSS_DEFAULTS
 from fid import InceptionMetrics, load_ref_stats, precision_recall
 from repa import FrozenEncoder, Projector, MaskedTransformerAdapter, BlockCapture, repa_loss, mta_loss
 from masking import TokenMasker, flow_loss
@@ -88,6 +88,17 @@ quad_rope = 'plain' # RoPE on the physical centres: 'plain', or 'integrated' (ro
 quad_area_bias = True # proportional attention: + log(token area) on every key's logits
 quad_level_embed = True # learned level embedding
 quad_route_every = 1 # sampling only: re-route every N network calls (heun makes 2 per step); training always routes
+# GaussJiT (model_gauss.py): tokens are oriented, scaled patches placed by a small conv placer on the noisy input (same
+# forward pass, trained by the denoising loss), anchored on a grid of spacing patch_size (GaussJiT-B/16: 64 tokens at 128px)
+gauss_extent = 0.75 # initial frame half-size / patch_size (0.75: frames 1.5x the anchor spacing, overlapping by a quarter each side)
+gauss_canvas = 0 # canvas samples per side for the embedding and the head (0: 2 * extent * patch_size, ~1 per pixel at init)
+gauss_max_offset = 0.25 # centre offset bound / patch_size (tanh)
+gauss_scale_range = 1.33 # half-size bound: extent * patch_size * scale_range^[-1, 1] per axis
+gauss_max_rotation = 0.7853981633974483 # rotation bound (radians)
+gauss_placer_width = 64
+gauss_placer_depth = 2
+gauss_area_bias = True # + log(frame area / initial area) on every key's logits
+gauss_shape_embed = True # learned embedding of (log scales, rotation), added to the tokens
 pixel_depth = -1 # PixelDiT: number of pixel-level (PiT) blocks
 pixel_dim = -1 # PixelDiT: per-pixel token width
 pixeldit_prediction = 'x' # PixelDiT: 'x' (this repo's x-prediction) or 'v' (the paper's velocity output)
@@ -252,6 +263,17 @@ if is_pixeldit: # the JiT-specific options don't exist in PixelDiT
 else:
     assert pixel_depth < 0 and pixel_dim < 0 and pixeldit_prediction == 'x', 'pixel_depth / pixel_dim / pixeldit_prediction are PixelDiT options'
 is_quadtree = model.startswith('QuadJiT')
+is_gauss = model.startswith('GaussJiT')
+GAUSS_FLAGS = dict(extent=gauss_extent, canvas=gauss_canvas, max_offset=gauss_max_offset, scale_range=gauss_scale_range, max_rotation=gauss_max_rotation,
+                   placer_width=gauss_placer_width, placer_depth=gauss_placer_depth, area_bias=gauss_area_bias, shape_embed=gauss_shape_embed)
+if is_gauss: # like QuadJiT: the JiT backbone options it needs, none of the input / output paths
+    jit_only = dict(attn_res_adaln=not attn_res_adaln, gated_bottleneck=not gated_bottleneck, skip_pathway=not skip_pathway, dcae_stem=not dcae_stem,
+                    dcae_head=not dcae_head, patch_overlap=patch_overlap == 0, head_overlap=head_overlap == 0, gate_init=gate_init == 'zero',
+                    in_context_len=in_context_len <= 0, masking=mask_ratio == 0, repa=not repa_encoder)
+    bad = [k for k, ok in jit_only.items() if not ok]
+    assert not bad, f'not available for GaussJiT: {bad}'
+else:
+    assert all(GAUSS_FLAGS[k] == GAUSS_DEFAULTS[k] for k in GAUSS_FLAGS), 'gauss_* options are GaussJiT options'
 if is_quadtree: # the quadtree model has the JiT backbone options it needs (attn_res, adaln_single, layernorm) and none of the input / output paths
     jit_only = dict(attn_res_adaln=not attn_res_adaln, gated_bottleneck=not gated_bottleneck, skip_pathway=not skip_pathway, dcae_stem=not dcae_stem,
                     dcae_head=not dcae_head, patch_overlap=patch_overlap == 0, head_overlap=head_overlap == 0, gate_init=gate_init == 'zero',
@@ -269,6 +291,7 @@ model_name, arch = resolve_arch(model, **{k: (None if v < 0 else v) for k, v in 
             route_dino=quad_route_dino if quad_router == 'dino' else None, route_t_min=quad_route_t_min or None,
             route_gate_tau=quad_gate_tau if quad_router == 'dino' else None, pos_embed=quad_pos, rope=quad_rope,
             area_bias=quad_area_bias, level_embed=quad_level_embed) if is_quadtree else {}),
+    **({k: v for k, v in GAUSS_FLAGS.items() if v != GAUSS_DEFAULTS[k]} if is_gauss else {}),
     attn_res=None if attn_res == 'none' else attn_res,
     attn_res_block_size=attn_res_block_size if (attn_res == 'block' and attn_res_block_size > 0) else None,
     adaln_single=adaln_single or None, attn_res_adaln=attn_res_adaln or None, gated_bottleneck=gated_bottleneck or None,
@@ -375,6 +398,11 @@ if is_quadtree:
     denoiser.net.route_every = quad_route_every
     print(f"model {model_name}: {sum(p.numel() for p in denoiser.net.parameters()) / 1e6:.1f}M params, {arch['tokens']} tokens of "
           f"{' / '.join(str(p) for p in denoiser.net.geo.patches)}px patches, router {arch.get('router', 'uniform')}")
+elif is_gauss:
+    net_ = denoiser.net
+    print(f"model {model_name}: {sum(p.numel() for p in net_.parameters()) / 1e6:.1f}M params ({sum(p.numel() for p in net_.placer.parameters()) / 1e3:.0f}k "
+          f"in the placer), {net_.tokens} Gaussian-placed tokens on a {net_.grid}x{net_.grid} anchor grid, canvas {net_.canvas}^2 "
+          f"({3 * net_.canvas ** 2}-d) over frames of 2 x {net_.extent:g} x {net_.patch_size}px at init")
 else:
     print(f"model {model_name}: {sum(p.numel() for p in denoiser.net.parameters()) / 1e6:.1f}M params, "
           f"{(img_size // arch['patch_size']) ** 2} tokens of {arch['patch_size'] ** 2 * 3}-d patches")
@@ -571,7 +599,7 @@ if diag:
     assert all(1 <= b <= n_blocks for b in probe_blocks), f'diag_probe_blocks {probe_blocks} outside 1..{n_blocks}'
     probe_ts = [float(t) for t in diag_probe_ts.split(',')]
     window_tiles = [k for k in (int(v) for v in diag_window_tiles.split(',') if v) if k < grid]
-    if is_pixeldit or is_quadtree: # the windowed-attention ablation (and attention stats) reimplement JiT's forward
+    if is_pixeldit or is_quadtree or is_gauss: # the windowed-attention ablation (and attention stats) reimplement JiT's forward
         window_tiles = []
     probe_train_x, probe_train_y = data.get(spaced(len(data), diag_probe_train_images))
     probe_val_x, probe_val_y = val_data.get(spaced(len(val_data), diag_probe_val_images))
@@ -812,6 +840,8 @@ def save_samples(step):
             if is_quadtree:
                 save_layout_grids(denoiser.net, x, names, os.path.join(samples_dir, f'samples_{step}{suffix}'), denoiser.net.router.history)
                 denoiser.net.record_layouts(False)
+            if is_gauss: # the token frames at the end of sampling, drawn on the samples
+                save_geometry_grid(denoiser.net, x, names, os.path.join(samples_dir, f'samples_{step}{suffix}_geometry.png'))
         denoiser.train()
 
 def save_checkpoint():
@@ -972,7 +1002,10 @@ while True:
         repa_str = f", repa {loss_repa.item():.4f}" if encoder is not None else ""
         grad_str = f", grad norm {math.sqrt(sum(v ** 2 for v in grad_norms.values())):.4f}" if log_opt else ""
         trunk_str = f", trunk-only loss {loss_trunkf:.4f}" if loss_trunkf is not None else ""
-        print(f"iter {iter_num} (epoch {iter_num / iters_per_epoch:.2f}): loss {lossf:.4f}{trunk_str}{repa_str}{grad_str}, time {dt*1000:.2f}ms "
+        geo_stats = denoiser.net.geometry_stats() if is_gauss else {} # the training batch's token geometry
+        geo_str = (f", geometry: offset {geo_stats['offset']:.3f}, scale [{geo_stats['scale_min']:.2f}, {geo_stats['scale_max']:.2f}], "
+                   f"rotation {geo_stats['rotation_deg']:.1f}deg") if geo_stats else ""
+        print(f"iter {iter_num} (epoch {iter_num / iters_per_epoch:.2f}): loss {lossf:.4f}{trunk_str}{repa_str}{grad_str}{geo_str}, time {dt*1000:.2f}ms "
               f"(data {data_seconds*1000:.0f}ms), {imgs_per_sec:.0f} img/s")
         if wandb_log:
             log = {
@@ -989,6 +1022,7 @@ while True:
                 log["lr_muon"] = peak_muon_lr * lr_now / lr
             if encoder is not None:
                 log["train/repa_loss"] = loss_repa.item()
+            log.update({f"geometry/{k}": v for k, v in geo_stats.items()})
             if log_opt:
                 log["grad_norm/total"] = math.sqrt(sum(v ** 2 for v in grad_norms.values()))
                 log.update({f"grad_norm/{k}": v for k, v in grad_norms.items()})
@@ -1000,6 +1034,7 @@ while True:
                   'loss': lossf, 'lr': lr_now, 'imgs_per_sec': imgs_per_sec, 'data_ms': data_seconds * 1000}
         if loss_trunkf is not None:
             record['loss_trunk'] = loss_trunkf
+        record.update({f'geometry_{k}': v for k, v in geo_stats.items()})
         if encoder is not None:
             record['repa_loss'] = loss_repa.item()
         if optimizer_type == 'muon':

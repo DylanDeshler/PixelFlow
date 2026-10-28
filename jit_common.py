@@ -16,6 +16,7 @@ from fid import to_uint8
 import model_jit
 from model_pixeldit import PixelDiT, PIXELDIT_PRESETS
 from model_quadtree import QuadtreeJiT, QUADTREE_PRESETS
+from model_gauss import GaussJiT, GAUSS_PRESETS
 
 # architecture of each JiT preset, as defined in model_jit.py (mlp_ratio is the JiT default for all of them)
 JIT_PRESETS = {
@@ -34,11 +35,18 @@ for _name, _arch in PIXELDIT_PRESETS.items():
 for _name, _arch in QUADTREE_PRESETS.items():
     JIT_PRESETS[_name] = dict(_arch, in_context_len=0, in_context_start=0, family='quadtree')
     model_jit.JiT_models[_name] = (lambda arch: lambda **kwargs: QuadtreeJiT(**arch, **kwargs))(JIT_PRESETS[_name])
+# Gaussian-placed tokens (model_gauss.py): same stack, its own network class
+for _name, _arch in GAUSS_PRESETS.items():
+    JIT_PRESETS[_name] = dict(_arch, in_context_len=0, in_context_start=0, family='gauss')
+    model_jit.JiT_models[_name] = (lambda arch: lambda **kwargs: GaussJiT(**arch, **kwargs))(JIT_PRESETS[_name])
 for _name, _arch in JIT_PRESETS.items():
     assert _name in model_jit.JiT_models, f'{_name} missing from model_jit.JiT_models'
 
 QUADTREE_DEFAULTS = dict(attn_res='none', adaln_single=False, router='uniform', route_baseline='', route_dino='dinov2_vitb14_reg',
                          route_t_min=0.0, route_gate_tau=1.0, pos_embed='integrated', rope='plain', area_bias=True, level_embed=True)
+
+GAUSS_DEFAULTS = dict(attn_res='none', adaln_single=False, extent=0.75, canvas=0, max_offset=0.25, scale_range=1.33,
+                      max_rotation=0.7853981633974483, placer_width=64, placer_depth=2, area_bias=True, shape_embed=True)
 
 def resolve_arch(model, **overrides):
     """
@@ -70,6 +78,14 @@ def describe_arch(model, arch):
                  for k in keys]
         if full['router'] in ('dino', 'pixel'):
             parts.append(f"route_baseline {full['route_baseline']}" + (f", route_dino {full['route_dino']}" if full['router'] == 'dino' else ''))
+        return f"arch: {', '.join(parts)} (preset {model}, * = overridden)"
+    if JIT_PRESETS[model].get('family') == 'gauss':
+        preset = dict(GAUSS_DEFAULTS, **JIT_PRESETS[model], mlp_ratio=4.0)
+        full = dict(preset, **arch)
+        keys = ('depth', 'hidden_size', 'num_heads', 'patch_size', 'bottleneck_dim', 'mlp_ratio', 'attn_res', 'adaln_single', 'extent',
+                'canvas', 'max_offset', 'scale_range', 'max_rotation', 'placer_width', 'placer_depth', 'area_bias', 'shape_embed')
+        parts = [(f"{k} {full[k]:g}" if isinstance(full[k], float) else f"{k} {full[k]}") + (f"* (preset {preset[k]})" if full[k] != preset[k] else '')
+                 for k in keys]
         return f"arch: {', '.join(parts)} (preset {model}, * = overridden)"
     if JIT_PRESETS[model].get('family') == 'pixeldit':
         preset = dict(JIT_PRESETS[model], mlp_ratio=4.0, prediction='x')
@@ -113,7 +129,7 @@ def describe_arch(model, arch):
 def _register(name, arch):
     # JiT's Denoiser looks the network up in model_jit.JiT_models by name, so custom architectures get registered there
     if name not in model_jit.JiT_models:
-        cls = {'pixeldit': PixelDiT, 'quadtree': QuadtreeJiT}.get(arch.get('family'), model_jit.JiT)
+        cls = {'pixeldit': PixelDiT, 'quadtree': QuadtreeJiT, 'gauss': GaussJiT}.get(arch.get('family'), model_jit.JiT)
         model_jit.JiT_models[name] = lambda **kwargs: cls(**arch, **kwargs)
 
 
@@ -395,6 +411,21 @@ def save_layout_grids(net, x, names, prefix, history):
             labels.append(f't={history[i][1]:.2f}')
     save_labeled_grid(torch.cat(cells), labels, prefix + '_layout_steps.png', nrow=1 + len(picks))
 
+def save_geometry_grid(net, x, names, path):
+    """
+    GaussJiT samples with every token's core outline drawn (its frame at 0.5 / extent: at init these tile like JiT's
+    patches), from the last network call's geometry (the end of sampling; CFG batches carry the conditional half first);
+    and {path}_coverage.png: for the first 8 samples, cores, full frames, the owner map and the overlap map.
+    """
+    from model_gauss import draw_geometry, coverage_panels
+    if net.last_geometry is None:
+        return
+    mu, h, theta = (g[:x.shape[0]] for g in net.last_geometry)
+    save_labeled_grid(draw_geometry(x, mu, h, theta, extent=net.extent), names, path)
+    # full coverage for the first 8 samples: cores, full frames, owner map, overlap map
+    panels, labels = coverage_panels(net, x, mu, h, theta)
+    save_labeled_grid(panels, labels, path.replace('_geometry.png', '_coverage.png'), nrow=5)
+
 # settings that don't change what is trained (budget, evaluation, logging, system), left out of run directory names;
 # diag* (diagnostics) settings are excluded too
 _NAME_EXCLUDE = {
@@ -429,6 +460,8 @@ _NAME_TOKENS = {
     'mask_ratio': 'mask', 'mask_prob': 'maskprob', 'mask_weighting': 'maskweight-',
     'quad_tokens': 'K', 'quad_levels': 'levels', 'quad_router': 'route-', 'quad_route_dino': 'dino-', 'quad_route_t_min': 'routetmin',
     'quad_gate_tau': 'gatetau', 'quad_pos': 'pos-', 'quad_rope': 'rope-', 'quad_area_bias': 'areabias', 'quad_level_embed': 'levelemb',
+    'gauss_extent': 'gext', 'gauss_canvas': 'gcanvas', 'gauss_max_offset': 'goff', 'gauss_scale_range': 'gscale', 'gauss_max_rotation': 'grot',
+    'gauss_placer_width': 'gplacerw', 'gauss_placer_depth': 'gplacerd', 'gauss_area_bias': 'gareabias', 'gauss_shape_embed': 'gshape',
 }
 
 def _fmt_value(v):
