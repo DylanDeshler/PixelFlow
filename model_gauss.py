@@ -6,7 +6,9 @@ Attention Residuals, adaLN-single, the bottleneck patch embedding and the final 
 
 Geometry. Anchors on a grid with spacing S = patch_size (K = (input_size / S)^2: 64 at 128px / 16px). Token k's frame:
   centre      mu_k = anchor_k + max_offset * S * tanh(o)                         (per axis)
-  half-size   h_k  = extent * S * scale_range^tanh(s)                            (per axis; extent 0.75: 1.5 S at init)
+  half-size   h_k  = extent * S * f, log f = tanh(s) * (log scale_max if s > 0 else log scale_range)
+                                                                                 (per axis; extent 0.75: 1.5 S at init; f in
+                                                                                 [1 / scale_range, scale_max], 1 at init)
   rotation    theta_k = max_rotation * tanh(r)                                    (default 0: axis-aligned frames, see below)
 with (o, s, r) the placer's 5 outputs per anchor, zero at init (the last layer is zero-initialized), so training starts from
 a regular grid of overlapping square frames. Bounded parameters keep tokens from collapsing or wandering off without any
@@ -110,7 +112,7 @@ class GaussJiT(nn.Module):
 
     def __init__(self, input_size=128, patch_size=16, in_channels=3, hidden_size=768, depth=12, num_heads=12, mlp_ratio=4.0,
                  attn_drop=0.0, proj_drop=0.0, num_classes=1000, bottleneck_dim=128, attn_res='none', attn_res_block_size=0,
-                 adaln_single=False, layernorm=False, extent=0.75, basis=0, max_offset=0.25, scale_range=1.33,
+                 adaln_single=False, layernorm=False, extent=0.75, basis=0, max_offset=0.25, scale_range=1.33, scale_max=0.0,
                  max_rotation=0.0, sigma=0.3, placer_width=64, placer_depth=2, area_bias=True, shape_embed=True,
                  chunks=8, fused='auto', in_context_len=0, in_context_start=0, family='gauss'):
         super().__init__()
@@ -124,6 +126,7 @@ class GaussJiT(nn.Module):
         self.attn_res_block_size = attn_res_block_size or max(1, round(depth / 8))
         self.skip_pathway, self.skip_stop_grad = False, False
         self.extent, self.max_offset, self.scale_range, self.max_rotation = extent, max_offset, scale_range, max_rotation
+        self.scale_max = scale_max or scale_range # upper scale bound (the lower one stays 1 / scale_range)
         self.basis_n = basis or int(round(2 * extent * patch_size)) # basis size n per axis: the initial frame's width in pixels
         self.grid = input_size // patch_size
         self.tokens = self.grid ** 2
@@ -135,7 +138,7 @@ class GaussJiT(nn.Module):
         # pixel windows around each token (whole pixels around floor(mu)): the encoder's covers the largest rotated frame;
         # the decoder's reaches where the Gaussian weight falls to 1e-3 of its peak, and always contains the pixel's own
         # anchor cell (so every pixel has positive weight)
-        h_max = extent * patch_size * scale_range
+        h_max = extent * patch_size * self.scale_max
         rot = min(max_rotation, math.pi / 4)
         self.window_enc = 2 * math.ceil(h_max * (math.cos(rot) + math.sin(rot))) + 3
         u_cut = sigma * math.sqrt(2 * math.log(1e3))
@@ -229,7 +232,8 @@ class GaussJiT(nn.Module):
         raw = self.placer(x, c).float()
         S = self.patch_size
         mu = self.anchors + self.max_offset * S * torch.tanh(raw[..., 0:2])
-        log_f = math.log(self.scale_range) * torch.tanh(raw[..., 2:4])
+        ts = torch.tanh(raw[..., 2:4]) # growing and shrinking bounded separately; scale 1 (the anchor grid's frames) at init
+        log_f = ts * torch.where(ts > 0, math.log(self.scale_max), math.log(self.scale_range))
         h = self.extent * S * log_f.exp()
         theta = self.max_rotation * torch.tanh(raw[..., 4])
         return mu, h, theta, log_f

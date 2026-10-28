@@ -94,7 +94,8 @@ gauss_extent = 0.75 # initial frame half-size / patch_size (0.75: frames 1.5x th
 gauss_basis = 0 # cosine basis functions per axis for a token's encoder and head (0: 2 * extent * patch_size, the initial frame's width:
                 # lossless at init); rescale --bottleneck_dim with it (JiT's 6x compression: 128 * (basis / 16)^2)
 gauss_max_offset = 0.25 # centre offset bound / patch_size (tanh)
-gauss_scale_range = 1.33 # half-size bound: extent * patch_size * scale_range^[-1, 1] per axis
+gauss_scale_range = 1.33 # half-size bounds: extent * patch_size * [1 / scale_range, scale_range] per axis
+gauss_scale_max = 0.0 # > 0: a separate upper bound (frames grow to extent * patch_size * scale_max; the lower bound is unchanged)
 gauss_max_rotation = 0.0 # rotation bound (radians); 0: axis-aligned frames, separable basis (~2.5x cheaper per step than rotating)
 gauss_sigma = 0.3 # blending Gaussian width in frame units (normalized over tokens: every pixel covered)
 gauss_placer_width = 64
@@ -267,7 +268,7 @@ else:
     assert pixel_depth < 0 and pixel_dim < 0 and pixeldit_prediction == 'x', 'pixel_depth / pixel_dim / pixeldit_prediction are PixelDiT options'
 is_quadtree = model.startswith('QuadJiT')
 is_gauss = model.startswith('GaussJiT')
-GAUSS_FLAGS = dict(extent=gauss_extent, basis=gauss_basis, max_offset=gauss_max_offset, scale_range=gauss_scale_range, max_rotation=gauss_max_rotation, sigma=gauss_sigma,
+GAUSS_FLAGS = dict(extent=gauss_extent, basis=gauss_basis, max_offset=gauss_max_offset, scale_range=gauss_scale_range, scale_max=gauss_scale_max, max_rotation=gauss_max_rotation, sigma=gauss_sigma,
                    placer_width=gauss_placer_width, placer_depth=gauss_placer_depth, area_bias=gauss_area_bias, shape_embed=gauss_shape_embed,
                    fused=gauss_fused)
 if is_gauss: # like QuadJiT: the JiT backbone options it needs, none of the input / output paths
