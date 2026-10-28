@@ -45,8 +45,8 @@ for _name, _arch in JIT_PRESETS.items():
 QUADTREE_DEFAULTS = dict(attn_res='none', adaln_single=False, router='uniform', route_baseline='', route_dino='dinov2_vitb14_reg',
                          route_t_min=0.0, route_gate_tau=1.0, pos_embed='integrated', rope='plain', area_bias=True, level_embed=True)
 
-GAUSS_DEFAULTS = dict(attn_res='none', adaln_single=False, extent=0.75, canvas=0, max_offset=0.25, scale_range=1.33,
-                      max_rotation=0.7853981633974483, placer_width=64, placer_depth=2, area_bias=True, shape_embed=True)
+GAUSS_DEFAULTS = dict(attn_res='none', adaln_single=False, extent=0.75, basis=0, max_offset=0.25, scale_range=1.33,
+                      max_rotation=0.0, sigma=0.3, placer_width=64, placer_depth=2, area_bias=True, shape_embed=True)
 
 def resolve_arch(model, **overrides):
     """
@@ -83,7 +83,7 @@ def describe_arch(model, arch):
         preset = dict(GAUSS_DEFAULTS, **JIT_PRESETS[model], mlp_ratio=4.0)
         full = dict(preset, **arch)
         keys = ('depth', 'hidden_size', 'num_heads', 'patch_size', 'bottleneck_dim', 'mlp_ratio', 'attn_res', 'adaln_single', 'extent',
-                'canvas', 'max_offset', 'scale_range', 'max_rotation', 'placer_width', 'placer_depth', 'area_bias', 'shape_embed')
+                'basis', 'max_offset', 'scale_range', 'max_rotation', 'sigma', 'placer_width', 'placer_depth', 'area_bias', 'shape_embed')
         parts = [(f"{k} {full[k]:g}" if isinstance(full[k], float) else f"{k} {full[k]}") + (f"* (preset {preset[k]})" if full[k] != preset[k] else '')
                  for k in keys]
         return f"arch: {', '.join(parts)} (preset {model}, * = overridden)"
@@ -413,15 +413,15 @@ def save_layout_grids(net, x, names, prefix, history):
 
 def save_geometry_grid(net, x, names, path):
     """
-    GaussJiT samples with every token's core outline drawn (its frame at 0.5 / extent: at init these tile like JiT's
-    patches), from the last network call's geometry (the end of sampling; CFG batches carry the conditional half first);
-    and {path}_coverage.png: for the first 8 samples, cores, full frames, the owner map and the overlap map.
+    GaussJiT samples with every token's owned cell outlined and its centre marked (its effective tokenization, drawn like
+    the quadtree's boxes), from the last network call's geometry (the end of sampling; CFG batches carry the conditional
+    half first); and {path}_coverage.png: for the first 8 samples, cells, full frames, the owner map and the overlap map.
     """
-    from model_gauss import draw_geometry, coverage_panels
+    from model_gauss import draw_cells, coverage_panels
     if net.last_geometry is None:
         return
     mu, h, theta = (g[:x.shape[0]] for g in net.last_geometry)
-    save_labeled_grid(draw_geometry(x, mu, h, theta, extent=net.extent), names, path)
+    save_labeled_grid(draw_cells(x, net, mu, h, theta), names, path)
     # full coverage for the first 8 samples: cores, full frames, owner map, overlap map
     panels, labels = coverage_panels(net, x, mu, h, theta)
     save_labeled_grid(panels, labels, path.replace('_geometry.png', '_coverage.png'), nrow=5)
@@ -460,7 +460,7 @@ _NAME_TOKENS = {
     'mask_ratio': 'mask', 'mask_prob': 'maskprob', 'mask_weighting': 'maskweight-',
     'quad_tokens': 'K', 'quad_levels': 'levels', 'quad_router': 'route-', 'quad_route_dino': 'dino-', 'quad_route_t_min': 'routetmin',
     'quad_gate_tau': 'gatetau', 'quad_pos': 'pos-', 'quad_rope': 'rope-', 'quad_area_bias': 'areabias', 'quad_level_embed': 'levelemb',
-    'gauss_extent': 'gext', 'gauss_canvas': 'gcanvas', 'gauss_max_offset': 'goff', 'gauss_scale_range': 'gscale', 'gauss_max_rotation': 'grot',
+    'gauss_extent': 'gext', 'gauss_basis': 'gbasis', 'gauss_sigma': 'gsigma', 'gauss_max_offset': 'goff', 'gauss_scale_range': 'gscale', 'gauss_max_rotation': 'grot',
     'gauss_placer_width': 'gplacerw', 'gauss_placer_depth': 'gplacerd', 'gauss_area_bias': 'gareabias', 'gauss_shape_embed': 'gshape',
 }
 

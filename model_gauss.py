@@ -7,17 +7,29 @@ Attention Residuals, adaLN-single, the bottleneck patch embedding and the final 
 Geometry. Anchors on a grid with spacing S = patch_size (K = (input_size / S)^2: 64 at 128px / 16px). Token k's frame:
   centre      mu_k = anchor_k + max_offset * S * tanh(o)                         (per axis)
   half-size   h_k  = extent * S * scale_range^tanh(s)                            (per axis; extent 0.75: 1.5 S at init)
-  rotation    theta_k = max_rotation * tanh(r)
+  rotation    theta_k = max_rotation * tanh(r)                                    (default 0: axis-aligned frames, see below)
 with (o, s, r) the placer's 5 outputs per anchor, zero at init (the last layer is zero-initialized), so training starts from
 a regular grid of overlapping square frames. Bounded parameters keep tokens from collapsing or wandering off without any
 auxiliary loss.
 
-Encoder: each token samples a canvas x canvas grid over its frame from the noisy image (bilinear, differentiable in the
-frame), then the bottleneck patch embedding (linear canvas -> bottleneck_dim -> hidden), as JiT's patch embedding.
-Decoder: each token's final layer predicts a canvas x canvas x 3 patch in its frame; every pixel blends the tokens covering
-it, weighted by a Hann window of its frame coordinates (cos^2(pi u / 2) cos^2(pi v / 2), smooth and zero at the frame's
-edge) and normalized over tokens (a partition of unity). A tiny weight for each pixel's own anchor's token keeps every
-pixel covered whatever the geometry. Rendering is local (a fixed window around each token) and scattered back.
+Tokens are continuous functions over their frames, so no pixel is ever resampled (no bilinear interpolation: the noise
+statistics a token sees don't depend on its sub-pixel position). With frame coordinates (u, v) in [-1, 1] and the cosine
+basis psi_a(z) = s_a cos(pi a (z + 1) / 2) (s_0 = 1, s_a = sqrt 2; at a frame aligned with n x n pixels this is the
+orthonormal DCT-II):
+Encoder: a token's n x n x 3 coefficients are the projection of the actual pixels inside its frame onto the basis,
+  C = sum_p psi(v_p) psi(u_p) x_p / sqrt(N), N = the number of those pixels (exact sums over real pixels; white noise
+  gives unit-variance coefficients at any frame size), then JiT's bottleneck embedding (linear -> bottleneck_dim -> hidden).
+  At the initial aligned frame with n = its width in pixels, this is the orthonormal DCT of the pixels: lossless.
+Decoder: each token's final layer predicts n x n x 3 coefficients; its value at a pixel is the basis evaluated exactly at the
+  pixel's frame coordinates, sum C psi(v) psi(u) / n (the inverse DCT at the aligned frame). Pixels blend the tokens near
+  them with normalized Gaussian weights of the frame coordinates, exp(-(u^2 + v^2) / (2 sigma^2)) / sum over tokens (a
+  local softmax, as Slot Attention's partition of the image), truncated only where the weights are negligible. Every pixel
+  lies in its own anchor's token's window and Gaussians are positive, so every pixel is covered whatever the geometry.
+Both are computed over a fixed window of pixels around each token, in chunks of tokens, and recomputed in the backward pass
+(activation checkpointing), so the pixel x basis intermediates are never stored. Axis-aligned frames (max_rotation = 0, the
+default: tokens still shift and scale each axis independently) make the basis separable, psi(v_y) psi(u_x), so encoding and
+decoding are two small matmuls per token (as a 2D DCT) instead of a basis evaluation at every pixel of the window: ~2.5x
+cheaper per training step than with rotation.
 Positions: the footprint-integrated sin-cos and RoPE at the continuous centres (in anchor units, detached: geometry is
 learned through the sampling and the blending), a learned shape embedding of (log scales, rotation), and the area
 attention bias (log of the frame's area relative to the anchor cell).
@@ -33,15 +45,15 @@ from model_jit import TimestepEmbedder, LabelEmbedder, FinalLayer, AttnResState,
 from model_quadtree import QuadBlock, TokenRope, integrated_sincos, rope_tables
 
 
-class CanvasEmbed(nn.Module):
-    # JiT's bottleneck patch embedding on a per-token canvas: linear (C * canvas^2 -> bottleneck), linear (-> hidden)
-    def __init__(self, canvas, in_chans, pca_dim, embed_dim):
+class CoefEmbed(nn.Module):
+    # JiT's bottleneck patch embedding on a token's basis coefficients: linear (C * n^2 -> bottleneck), linear (-> hidden)
+    def __init__(self, n, in_chans, pca_dim, embed_dim):
         super().__init__()
-        self.proj1 = nn.Linear(in_chans * canvas * canvas, pca_dim, bias=False)
+        self.proj1 = nn.Linear(in_chans * n * n, pca_dim, bias=False)
         self.proj2 = nn.Linear(pca_dim, embed_dim, bias=True)
 
-    def forward(self, patches): # [B, K, C * canvas^2]
-        return self.proj2(self.proj1(patches))
+    def forward(self, coef): # [B, K, C * n^2]
+        return self.proj2(self.proj1(coef))
 
 
 class Placer(nn.Module):
@@ -74,9 +86,9 @@ class GaussJiT(nn.Module):
 
     def __init__(self, input_size=128, patch_size=16, in_channels=3, hidden_size=768, depth=12, num_heads=12, mlp_ratio=4.0,
                  attn_drop=0.0, proj_drop=0.0, num_classes=1000, bottleneck_dim=128, attn_res='none', attn_res_block_size=0,
-                 adaln_single=False, layernorm=False, extent=0.75, canvas=0, max_offset=0.25, scale_range=1.33,
-                 max_rotation=math.pi / 4, placer_width=64, placer_depth=2, area_bias=True, shape_embed=True,
-                 in_context_len=0, in_context_start=0, family='gauss'):
+                 adaln_single=False, layernorm=False, extent=0.75, basis=0, max_offset=0.25, scale_range=1.33,
+                 max_rotation=0.0, sigma=0.3, placer_width=64, placer_depth=2, area_bias=True, shape_embed=True,
+                 chunks=8, in_context_len=0, in_context_start=0, family='gauss'):
         super().__init__()
         assert in_context_len == 0, 'GaussJiT has no in-context class tokens'
         assert attn_res in ('none', 'full', 'block')
@@ -88,22 +100,27 @@ class GaussJiT(nn.Module):
         self.attn_res_block_size = attn_res_block_size or max(1, round(depth / 8))
         self.skip_pathway, self.skip_stop_grad = False, False
         self.extent, self.max_offset, self.scale_range, self.max_rotation = extent, max_offset, scale_range, max_rotation
-        self.canvas = canvas or int(round(2 * extent * patch_size)) # ~1 sample per pixel at the initial frame size
+        self.basis_n = basis or int(round(2 * extent * patch_size)) # basis size n per axis: the initial frame's width in pixels
         self.grid = input_size // patch_size
         self.tokens = self.grid ** 2
-        self.area_bias = area_bias
-        # rendering window around each token: covers the largest (rotated) frame, plus a pixel for rounding
+        self.area_bias, self.sigma, self.chunks = area_bias, sigma, chunks
+        # pixel windows around each token (whole pixels around floor(mu)): the encoder's covers the largest rotated frame;
+        # the decoder's reaches where the Gaussian weight falls to 1e-3 of its peak, and always contains the pixel's own
+        # anchor cell (so every pixel has positive weight)
         h_max = extent * patch_size * scale_range
-        reach = h_max * (math.cos(min(max_rotation, math.pi / 4)) + math.sin(min(max_rotation, math.pi / 4)))
-        self.window = 2 * math.ceil(reach) + 3
+        rot = min(max_rotation, math.pi / 4)
+        self.window_enc = 2 * math.ceil(h_max * (math.cos(rot) + math.sin(rot))) + 3
+        u_cut = sigma * math.sqrt(2 * math.log(1e3))
+        own = max_offset * patch_size * math.sqrt(2) + patch_size / math.sqrt(2) + 1
+        self.window = 2 * math.ceil(max(u_cut * h_max, own)) + 3
 
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = LabelEmbedder(num_classes, hidden_size)
         if adaln_single:
             self.t_block = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size, bias=True))
         self.placer = Placer(in_channels, patch_size, placer_width, placer_depth, hidden_size)
-        self.x_embedder = CanvasEmbed(self.canvas, in_channels, bottleneck_dim, hidden_size)
-        self.final_layer = FinalLayer(hidden_size, self.canvas, in_channels, adaln_single=adaln_single, layernorm=layernorm)
+        self.x_embedder = CoefEmbed(self.basis_n, in_channels, bottleneck_dim, hidden_size)
+        self.final_layer = FinalLayer(hidden_size, self.basis_n, in_channels, adaln_single=adaln_single, layernorm=layernorm)
         self.shape_mlp = nn.Sequential(nn.Linear(4, hidden_size), nn.SiLU(), nn.Linear(hidden_size, hidden_size)) if shape_embed else None
         self.blocks = nn.ModuleList([
             QuadBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio,
@@ -118,12 +135,15 @@ class GaussJiT(nn.Module):
         iy, ix = torch.meshgrid(torch.arange(g), torch.arange(g), indexing='ij')
         anchors = torch.stack([ix.flatten(), iy.flatten()], -1).float() * patch_size + patch_size / 2 # [K, 2] (x, y) pixels
         self.register_buffer('anchors', anchors, persistent=False)
-        r = (torch.arange(self.canvas, dtype=torch.float32) + 0.5) / self.canvas * 2 - 1 # canvas sample positions in [-1, 1]
-        v, u = torch.meshgrid(r, r, indexing='ij')
-        self.register_buffer('canvas_uv', torch.stack([u, v], -1), persistent=False) # [canvas, canvas, 2] (u along x, v along y)
-        w = torch.arange(self.window, dtype=torch.float32) - (self.window - 1) / 2
-        wy, wx = torch.meshgrid(w, w, indexing='ij')
-        self.register_buffer('window_offsets', torch.stack([wx, wy], -1), persistent=False) # [W, W, 2]
+        n = self.basis_n
+        self.register_buffer('freqs', torch.arange(n, dtype=torch.float32), persistent=False)
+        self.register_buffer('basis_scale', torch.cat([torch.ones(1), torch.full((n - 1,), math.sqrt(2))]), persistent=False)
+        for name, W in (('offsets_enc', self.window_enc), ('offsets_dec', self.window)):
+            w = torch.arange(W, dtype=torch.float32) - (W - 1) // 2
+            wy, wx = torch.meshgrid(w, w, indexing='ij')
+            self.register_buffer(name, torch.stack([wx, wy], -1).view(-1, 2), persistent=False) # [W * W, 2] (x, y)
+            self.register_buffer(name + '_1d', w, persistent=False) # [W]
+        self.separable = max_rotation == 0 # axis-aligned frames: the 2D basis is an outer product of 1D tables
         self.last_geometry = None # the last forward's (mu, h, theta), detached: for visualizations and logging
         self.initialize_weights()
 
@@ -185,48 +205,134 @@ class GaussJiT(nn.Module):
         theta = self.max_rotation * torch.tanh(raw[..., 4])
         return mu, h, theta, log_f
 
-    def sample_canvases(self, x, mu, h, theta):
-        # each token's canvas from the image: bilinear samples at its frame's grid [B, K, C * canvas^2]
-        B, K = mu.shape[:2]
-        n = self.canvas
-        uv = self.canvas_uv # [n, n, 2]
-        c, s = torch.cos(theta)[..., None, None], torch.sin(theta)[..., None, None] # [B, K, 1, 1]
-        lu, lv = uv[..., 0] * h[..., 0, None, None], uv[..., 1] * h[..., 1, None, None] # frame -> scaled [B, K, n, n]
-        px = mu[..., 0, None, None] + c * lu - s * lv
-        py = mu[..., 1, None, None] + s * lu + c * lv
-        grid = torch.stack([px / self.input_size * 2 - 1, py / self.input_size * 2 - 1], -1).reshape(B, K * n, n, 2)
-        out = F.grid_sample(x.float(), grid, mode='bilinear', padding_mode='reflection', align_corners=False) # [B, C, K*n, n]
-        return out.view(B, -1, K, n, n).permute(0, 2, 1, 3, 4).reshape(B, K, -1)
+    def basis(self, z):
+        # the cosine basis at frame coordinates z [...] -> [..., n]
+        return torch.cos(math.pi * self.freqs * (z[..., None] + 1) / 2) * self.basis_scale
 
-    def render(self, patches, mu, h, theta, eps=1e-3):
-        """
-        Pixels from the tokens' canvases [B, K, C, n, n]: every pixel in each token's window gets the token's canvas sampled
-        at its frame coordinates, weighted by the Hann window of those coordinates (plus eps inside the token's own anchor
-        cell, so every pixel is covered), summed over tokens and normalized.
-        """
-        B, K, C, n, _ = patches.shape
+    def window_coords(self, mu, h, theta, offsets, reflect=False):
+        # pixel centres in a window around each token [B, k, P, 2], their flat indices [B, k, P], whether they're in the
+        # image, and their frame coordinates u, v [B, k, P]. reflect: pixels outside the image index their mirror image
+        # inside it (the encoder reads a full frame at the borders; the cosine basis is itself an even extension)
         H = self.input_size
-        W = self.window
-        # the window follows the token, by whole pixels (the values use the exact frame): pixel centres [B, K, W, W, 2] (x, y)
-        p = torch.floor(mu)[:, :, None, None, :] + self.window_offsets + 0.5
-        d = p - mu[:, :, None, None, :]
-        c, s = torch.cos(theta)[..., None, None], torch.sin(theta)[..., None, None]
-        u = (c * d[..., 0] + s * d[..., 1]) / h[..., 0, None, None]
-        v = (-s * d[..., 0] + c * d[..., 1]) / h[..., 1, None, None]
-        hann = lambda z: torch.where(z.abs() < 1, torch.cos(math.pi * z / 2) ** 2, torch.zeros_like(z))
-        w = hann(u) * hann(v)
-        S = self.patch_size
-        own = ((p - (self.anchors[None, :, None, None, :] - S / 2)).div(S).floor() == 0).all(-1) # pixel in the token's anchor cell
-        w = w + eps * own.float()
+        p = torch.floor(mu)[:, :, None, :] + offsets + 0.5
         inside = (p >= 0).all(-1) & (p < H).all(-1)
-        w = w * inside.float()
-        vals = F.grid_sample(patches.reshape(B * K, C, n, n), torch.stack([u, v], -1).reshape(B * K, W, W, 2),
-                             mode='bilinear', padding_mode='border', align_corners=False).view(B, K, C, W, W)
-        idx = (p[..., 1].clamp(0, H - 1).long() * H + p[..., 0].clamp(0, H - 1).long()).view(B, 1, K * W * W)
-        num = torch.zeros(B, C, H * H, device=patches.device).scatter_add_(2, idx.expand(B, C, -1),
-                                                                            (vals * w[:, :, None]).permute(0, 2, 1, 3, 4).reshape(B, C, -1))
-        den = torch.zeros(B, 1, H * H, device=patches.device).scatter_add_(2, idx, w.reshape(B, 1, -1))
-        return (num / den.clamp_min(1e-12)).view(B, C, H, H)
+        q = p.floor().long()
+        if reflect:
+            q = torch.where(q < 0, -q - 1, q)
+            q = torch.where(q >= H, 2 * H - 1 - q, q).clamp(0, H - 1)
+        else:
+            q = q.clamp(0, H - 1)
+        idx = q[..., 1] * H + q[..., 0]
+        d = p - mu[:, :, None, :]
+        c, s = torch.cos(theta)[..., None], torch.sin(theta)[..., None]
+        u = (c * d[..., 0] + s * d[..., 1]) / h[..., 0, None]
+        v = (-s * d[..., 0] + c * d[..., 1]) / h[..., 1, None]
+        return idx, inside, u, v
+
+    def _encode_chunk(self, x_flat, mu, h, theta):
+        # coefficients [B, k, C, n, n] (rows: v, columns: u) of the pixels inside each token's frame
+        B, C = x_flat.shape[:2]
+        idx, _, u, v = self.window_coords(mu, h, theta, self.offsets_enc, reflect=True)
+        m = ((u.abs() < 1) & (v.abs() < 1)).float() # [B, k, P]: every pixel of the frame (reflected past the borders)
+        k, P = idx.shape[1], idx.shape[2]
+        vals = x_flat.gather(2, idx.view(B, 1, k * P).expand(B, C, -1)).view(B, C, k, P).transpose(1, 2) # [B, k, C, P]
+        pu, pv = self.basis(u) * m[..., None], self.basis(v) # [B, k, P, n]
+        coef = torch.einsum('bkcp,bkpq,bkpa->bkcqa', vals, pv, pu)
+        return coef / m.sum(-1).clamp_min(1).sqrt()[..., None, None, None]
+
+    def _decode_chunk(self, coef, mu, h, theta):
+        # each token's values and Gaussian blending weights at the pixels of its window: (numerator [B, C, H*H] contribution,
+        # weight [B, 1, H*H] contribution)
+        B, k, C, n, _ = coef.shape
+        H = self.input_size
+        idx, inside, u, v = self.window_coords(mu, h, theta, self.offsets_dec)
+        w = torch.exp(-(u ** 2 + v ** 2) / (2 * self.sigma ** 2)) * inside.float() # [B, k, P]
+        vals = torch.einsum('bkcqa,bkpq,bkpa->bkcp', coef, self.basis(v), self.basis(u)) / n # [B, k, C, P]
+        P = idx.shape[2]
+        num = torch.zeros(B, C, H * H, device=coef.device).scatter_add_(
+            2, idx.view(B, 1, k * P).expand(B, C, -1), (vals * w[:, :, None]).transpose(1, 2).reshape(B, C, k * P))
+        den = torch.zeros(B, 1, H * H, device=coef.device).scatter_add_(2, idx.view(B, 1, k * P), w.reshape(B, 1, k * P))
+        return num, den
+
+    def axis_coords(self, mu, h, offsets_1d, reflect=False):
+        # axis-aligned frames: per axis, the window's pixel indices [B, k, W] and frame coordinates [B, k, W], for x and y
+        H = self.input_size
+        p = torch.floor(mu)[..., None] + offsets_1d + 0.5 # [B, k, 2, W] pixel centres per axis
+        z = (p - mu[..., None]) / h[..., None]
+        q = p.floor().long()
+        inside = (q >= 0) & (q < H)
+        if reflect:
+            q = torch.where(q < 0, -q - 1, q)
+            q = torch.where(q >= H, 2 * H - 1 - q, q)
+        return q.clamp(0, H - 1), inside, z
+
+    def _block_index(self, q):
+        # flat pixel indices of each token's W x W window [B, k, W * W] (rows: y, columns: x) from per-axis indices [B, k, 2, W]
+        H = self.input_size
+        return (q[:, :, 1, :, None] * H + q[:, :, 0, None, :]).flatten(2)
+
+    def _encode_chunk_sep(self, x_flat, mu, h):
+        B, C = x_flat.shape[:2]
+        q, _, z = self.axis_coords(mu, h, self.offsets_enc_1d, reflect=True)
+        m = (z.abs() < 1).float() # [B, k, 2, W]: inside the frame, per axis
+        k, W = q.shape[1], q.shape[-1]
+        idx = self._block_index(q)
+        X = x_flat.gather(2, idx.view(B, 1, -1).expand(B, C, -1)).view(B, C, k, W, W).transpose(1, 2) # [B, k, C, Wy, Wx]
+        pu = self.basis(z[:, :, 0]) * m[:, :, 0, :, None] # [B, k, Wx, n]
+        pv = self.basis(z[:, :, 1]) * m[:, :, 1, :, None] # [B, k, Wy, n]
+        coef = pv.transpose(-1, -2)[:, :, None] @ X @ pu[:, :, None] # [B, k, C, n, n] (rows v, columns u)
+        return coef / (m[:, :, 0].sum(-1) * m[:, :, 1].sum(-1)).clamp_min(1).sqrt()[..., None, None, None]
+
+    def _decode_chunk_sep(self, coef, mu, h):
+        B, k, C, n, _ = coef.shape
+        H = self.input_size
+        q, inside, z = self.axis_coords(mu, h, self.offsets_dec_1d)
+        W = q.shape[-1]
+        g = torch.exp(-z ** 2 / (2 * self.sigma ** 2)) * inside.float() # [B, k, 2, W]: the Gaussian factors per axis
+        vals = self.basis(z[:, :, 1])[:, :, None] @ coef @ self.basis(z[:, :, 0]).transpose(-1, -2)[:, :, None] / n # [B, k, C, Wy, Wx]
+        w = g[:, :, 1, :, None] * g[:, :, 0, None, :] # [B, k, Wy, Wx]
+        idx = self._block_index(q).view(B, 1, -1)
+        num = torch.zeros(B, C, H * H, device=coef.device).scatter_add_(
+            2, idx.expand(B, C, -1), (vals * w[:, :, None]).transpose(1, 2).reshape(B, C, -1))
+        den = torch.zeros(B, 1, H * H, device=coef.device).scatter_add_(2, idx, w.reshape(B, 1, -1))
+        return num, den
+
+    def _chunked(self, fn, *args):
+        # fn over chunks of tokens (args: per-token tensors [B, K, ...] after the first, shared, argument), recomputed in the
+        # backward pass when training, so the pixel x basis intermediates are never stored
+        shared, per_token = args[0], args[1:]
+        K = per_token[0].shape[1]
+        size = math.ceil(K / max(1, self.chunks))
+        outs = []
+        for i in range(0, K, size):
+            part = [t[:, i:i + size] for t in per_token]
+            if torch.is_grad_enabled():
+                outs.append(torch.utils.checkpoint.checkpoint(fn, shared, *part, use_reentrant=False))
+            else:
+                outs.append(fn(shared, *part))
+        return outs
+
+    def encode(self, x, mu, h, theta):
+        # basis coefficients of every token [B, K, C * n^2]
+        B, C = x.shape[:2]
+        x_flat = x.float().reshape(B, C, -1)
+        if self.separable:
+            coef = torch.cat(self._chunked(lambda xf, m_, h_: self._encode_chunk_sep(xf, m_, h_), x_flat, mu, h), dim=1)
+        else:
+            coef = torch.cat(self._chunked(lambda xf, m_, h_, t_: self._encode_chunk(xf, m_, h_, t_), x_flat, mu, h, theta), dim=1)
+        return coef.reshape(B, mu.shape[1], -1)
+
+    def render(self, coef, mu, h, theta):
+        # pixels from every token's coefficients [B, K, C, n, n]: Gaussian-weighted, normalized over tokens
+        B, K, C = coef.shape[:3]
+        H = self.input_size
+        if self.separable:
+            parts = self._chunked(lambda _, c_, m_, h_: self._decode_chunk_sep(c_, m_, h_), None, coef, mu, h)
+        else:
+            parts = self._chunked(lambda _, c_, m_, h_, t_: self._decode_chunk(c_, m_, h_, t_), None, coef, mu, h, theta)
+        num = sum(p_[0] for p_ in parts)
+        den = sum(p_[1] for p_ in parts)
+        return (num / den.clamp_min(1e-30)).view(B, C, H, H)
 
     # --- forward
 
@@ -236,7 +342,7 @@ class GaussJiT(nn.Module):
         c_blocks = self.t_block(c) if self.adaln_single else c
         with torch.autocast(device_type=x.device.type, enabled=False): # geometry, sampling and rendering in fp32
             mu, h, theta, log_f = self.geometry(x, t_emb.float())
-            patches = self.sample_canvases(x, mu, h, theta)
+            patches = self.encode(x, mu, h, theta)
         self.last_geometry = (mu.detach(), h.detach(), theta.detach())
         tok = self.x_embedder(patches)
         # positions at the continuous centres (anchor units), detached: geometry learns through sampling and blending
@@ -256,14 +362,14 @@ class GaussJiT(nn.Module):
         hid = tok
         for i, block in enumerate(self.blocks):
             hid = block(hid, c_blocks, rope, res=res, index=i)
-        out = self.final_layer(hid, c) # [B, K, canvas^2 * C] (canvas rows, columns, channels: JiT's patch layout)
-        n = self.canvas
+        out = self.final_layer(hid, c) # [B, K, n^2 * C]: coefficients (rows v, columns u, channels), JiT's patch layout
+        n = self.basis_n
         with torch.autocast(device_type=x.device.type, enabled=False):
-            patches_out = out.float().view(B, K, n, n, self.out_channels).permute(0, 1, 4, 2, 3)
-            return self.render(patches_out, mu, h, theta)
+            coef = out.float().view(B, K, n, n, self.out_channels).permute(0, 1, 4, 2, 3)
+            return self.render(coef, mu, h, theta)
 
     def dense_weights(self, mu, h, theta):
-        # every token's blending weight (Hann window of its frame coordinates) at every pixel [B, K, H, W] (visualization)
+        # every token's blending weight (the Gaussian of its frame coordinates, untruncated) at every pixel [B, K, H, W]
         H = self.input_size
         r = torch.arange(H, device=mu.device, dtype=torch.float32) + 0.5
         py, px = torch.meshgrid(r, r, indexing='ij')
@@ -271,8 +377,7 @@ class GaussJiT(nn.Module):
         c, s = torch.cos(theta)[..., None, None], torch.sin(theta)[..., None, None]
         u = (c * dx + s * dy) / h[..., 0, None, None]
         v = (-s * dx + c * dy) / h[..., 1, None, None]
-        hann = lambda z: torch.where(z.abs() < 1, torch.cos(math.pi * z / 2) ** 2, torch.zeros_like(z))
-        return hann(u) * hann(v)
+        return torch.exp(-(u ** 2 + v ** 2) / (2 * self.sigma ** 2))
 
     def geometry_stats(self):
         # summary of the last forward's geometry: mean |offset| and scale spread in anchor units, mean |rotation| (degrees)
@@ -310,31 +415,61 @@ def draw_geometry(images, mu, h, theta, extent=0.75, color='#a8336b', points=96,
 
 
 # presets: JiT-B's backbone with Gaussian-placed tokens; the anchor spacing names the token count (/16: 64 tokens at 128px)
-# bottleneck_dim keeps JiT's compression ratio (768 -> 128 for a 16px patch): the default canvas (2 x 0.75 x patch_size per
-# side) holds (1.5)^2 = 2.25x a patch's pixels, so 128 x 2.25 = 288
+# bottleneck_dim keeps JiT's compression ratio (768 -> 128 for a 16px patch): the default basis (2 x 0.75 x patch_size per
+# side, the initial frame's width in pixels) has (1.5)^2 = 2.25x a patch's coefficients, so 128 x 2.25 = 288
 GAUSS_PRESETS = {
     'GaussJiT-B/16': dict(depth=12, hidden_size=768, num_heads=12, bottleneck_dim=288, patch_size=16),
     'GaussJiT-B/8': dict(depth=12, hidden_size=768, num_heads=12, bottleneck_dim=288, patch_size=8),
 }
 
 
+def owner_map(net, mu, h, theta):
+    # the token each pixel's blending weight is largest for [B, H, W], -1 where no frame covers the pixel
+    w = net.dense_weights(mu, h, theta) # [B, K, H, W]
+    owner = w.argmax(1)
+    return torch.where(w.amax(1) > 0, owner, torch.full_like(owner, -1))
+
+def draw_cells(images, net, mu, h, theta, color='#a8336b'):
+    """
+    images [N, 3, H, W] in [-1, 1] with every token's owned cell (the pixels where its blending weight is largest) outlined
+    and its centre marked: GaussJiT's effective tokenization, drawn like the quadtree's boxes and merge regions in
+    compare_tokenizations.py. Pixels no frame covers (only the fallback weight) are lightened.
+    """
+    N = images.shape[0]
+    mu, h, theta = mu[:N].to(images.device), h[:N].to(images.device), theta[:N].to(images.device)
+    owner = owner_map(net, mu, h, theta)
+    out = images.clone()
+    hole = owner < 0
+    out = torch.where(hole[:, None], 0.5 * out + 0.5, out)
+    edge = torch.zeros_like(hole)
+    edge[:, :, :-1] |= owner[:, :, :-1] != owner[:, :, 1:]
+    edge[:, :-1] |= owner[:, :-1] != owner[:, 1:]
+    rgb = torch.tensor([int(color[i:i + 2], 16) / 127.5 - 1 for i in (1, 3, 5)], device=out.device, dtype=out.dtype)
+    out = torch.where(edge[:, None], rgb.view(1, 3, 1, 1), out)
+    H, W = out.shape[-2:]
+    cx, cy = mu[..., 0].long().clamp(0, W - 1), mu[..., 1].long().clamp(0, H - 1)
+    for i in range(N):
+        out[i, :, cy[i], cx[i]] = rgb[:, None]
+    return out
+
 def coverage_panels(net, x, mu, h, theta, n=8, threshold=0.05):
     """
-    Per sample: the sample, core outlines, full frame outlines, the owner map (each pixel coloured by the token with the
-    largest blending weight, token boundaries darkened: the effective tokenization) and the overlap map (how many tokens
-    carry at least `threshold` of the pixel's normalized weight; dark = 1, bright = 4+). Returns images [5 n, 3, H, W] in
-    [-1, 1] and labels, for save_labeled_grid with nrow=5.
+    Per sample: the sample, its owned cells (draw_cells), full frame outlines, the owner map (each pixel coloured by the
+    token with the largest blending weight, token boundaries darkened, uncovered pixels white) and the overlap map (how many
+    tokens carry at least `threshold` of the pixel's normalized weight; light = 1, dark = 4+; white = uncovered). Returns
+    images [5 n, 3, H, W] in [-1, 1] and labels, for save_labeled_grid with nrow=5.
     """
     import matplotlib
     n = min(n, x.shape[0])
     x, mu, h, theta = x[:n], mu[:n].to(x.device), h[:n].to(x.device), theta[:n].to(x.device)
     w = net.dense_weights(mu, h, theta) # [n, K, H, W]
     wn = w / w.sum(1, keepdim=True).clamp_min(1e-12)
-    owner = wn.argmax(1) # [n, H, W]
+    owner = torch.where(w.amax(1) > 0, wn.argmax(1), torch.full_like(wn[:, 0], -1, dtype=torch.long)) # [n, H, W], -1 uncovered
     K = w.shape[1]
     g = torch.Generator().manual_seed(0)
     palette = (torch.rand(K, 3, generator=g) * 1.4 - 0.7).to(x.device) # distinct mid-range colours per token
-    own = palette[owner].permute(0, 3, 1, 2) # [n, 3, H, W]
+    own = palette[owner.clamp_min(0)].permute(0, 3, 1, 2) # [n, 3, H, W]
+    own = torch.where((owner < 0)[:, None], torch.ones_like(own), own)
     edge = torch.zeros_like(owner, dtype=torch.bool)
     edge[:, :, :-1] |= owner[:, :, :-1] != owner[:, :, 1:]
     edge[:, :-1] |= owner[:, :-1] != owner[:, 1:]
@@ -343,10 +478,11 @@ def coverage_panels(net, x, mu, h, theta, n=8, threshold=0.05):
     cmap = matplotlib.colormaps['Blues']
     lut = torch.tensor([cmap(0.25 + 0.75 * min(k, 4) / 4)[:3] for k in range(K + 1)], device=x.device) * 2 - 1
     cov = lut[count.long().clamp(0, K)].permute(0, 3, 1, 2)
-    cores = draw_geometry(x, mu, h, theta, extent=net.extent)
+    cov = torch.where((owner < 0)[:, None], torch.ones_like(cov), cov)
+    cells = draw_cells(x, net, mu, h, theta)
     frames = draw_geometry(x, mu, h, theta, extent=net.extent, core=False)
-    cells, labels = [], []
+    panels, labels = [], []
     for i in range(n):
-        cells += [x[i:i + 1], cores[i:i + 1], frames[i:i + 1], own[i:i + 1], cov[i:i + 1]]
-        labels += ['sample', 'cores', 'full frames', 'owner', f'overlap (mean {count[i].mean():.1f})']
-    return torch.cat(cells), labels
+        panels += [x[i:i + 1], cells[i:i + 1], frames[i:i + 1], own[i:i + 1], cov[i:i + 1]]
+        labels += ['sample', 'cells', 'full frames', 'owner', f'overlap {count[i].mean():.1f}, gaps {(owner[i] < 0).float().mean():.1%}']
+    return torch.cat(panels), labels

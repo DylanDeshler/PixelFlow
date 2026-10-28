@@ -502,13 +502,20 @@ oriented, scaled patches (64 at 128px for `GaussJiT-B/16`).
 - **Geometry:** each token is anchored on a grid of spacing `patch_size`. A small conv placer (about 0.1M parameters)
   predicts each token's centre offset, per-axis scale and rotation from the noisy input, in the same forward pass, trained
   only by the denoising loss.
-  - Offsets are bounded to ±0.25 of the spacing, scales to ×1.33^±1, rotation to ±45°.
+  - Offsets are bounded to ±0.25 of the spacing and scales to ×1.33^±1 per axis.
+  - Frames are axis-aligned by default. This keeps the basis separable, so encoding and decoding are two small matrix
+    multiplies per token. `--gauss_max_rotation=0.785` allows ±45° rotation, at about 2.5× the step cost.
   - The placer's last layer is zero-initialized, so training starts from a regular grid of overlapping square frames,
     1.5× the spacing.
-- **Encoder:** each token samples a canvas over its frame (bilinear, differentiable in the frame), followed by JiT's
-  bottleneck patch embedding.
-- **Decoder:** each token's final layer predicts a canvas in its frame. Every pixel blends the tokens covering it with a
-  Hann window of its frame coordinates, normalized over tokens.
+- **Tokens are continuous functions,** on a cosine basis over each frame, so no pixel is ever resampled. There's no
+  bilinear interpolation, and the noise level a token sees doesn't depend on its sub-pixel position.
+  - **Encoder:** projects the actual pixels inside each frame onto the basis (reflected past the image borders), followed
+    by JiT's bottleneck embedding. At the initial aligned frame this is the orthonormal DCT of the patch: lossless, and
+    white noise gives unit-variance coefficients.
+  - **Decoder:** each token's final layer predicts coefficients, evaluated exactly at each pixel's centre.
+  - **Blending:** pixels blend nearby tokens with Gaussian weights normalized over tokens, a local softmax as in Slot
+    Attention, so every pixel is covered whatever the geometry.
+  - **Memory:** both run in chunks of tokens and are recomputed in the backward pass.
 - **Positions:** sin-cos and RoPE at the continuous centres, a shape embedding, and the area attention bias.
 - **Logging:** the training log shows the batch's geometry (mean offset, scale range, mean rotation), also logged to wandb
   under `geometry/`. Sample grids get a `_geometry.png` with every token's core outline, which tiles the image like JiT's
@@ -518,11 +525,11 @@ oriented, scaled patches (64 at 128px for `GaussJiT-B/16`).
 python train_jit.py config/jit_in1k_128.py config/model_gaussjit_b16.py --optimizer_type=muon --attn_res=full --adaln_single=True
 ```
 
-Options: `--gauss_max_offset`, `--gauss_scale_range`, `--gauss_max_rotation`, `--gauss_extent`, `--gauss_canvas`,
+Options: `--gauss_max_offset`, `--gauss_scale_range`, `--gauss_max_rotation`, `--gauss_extent`, `--gauss_basis`, `--gauss_sigma`,
 `--gauss_placer_width/depth`, `--gauss_area_bias`, `--gauss_shape_embed`.
 
-The presets use `bottleneck_dim=288`, which keeps JiT's 6× compression of a token's input: the default canvas holds
-2.25× a 16px patch's pixels, and 128 × 2.25 = 288. If you change `--gauss_extent` or `--gauss_canvas`, rescale it the same
+The presets use `bottleneck_dim=288`, which keeps JiT's 6× compression of a token's input: the default basis (24×24 per
+channel) has 2.25× a 16px patch's values, and 128 × 2.25 = 288. If you change `--gauss_extent` or `--gauss_basis`, rescale it the same
 way.
 
 Saved activations are about 20% above JiT-B/16 in fp32, and more under bf16, because the geometry and rendering stay in

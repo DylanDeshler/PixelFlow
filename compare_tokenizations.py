@@ -8,6 +8,7 @@ coefficients). No diffusion model: this filters tokenization families before any
   quadtree4   the same down to 4 px
   merge       (B) irregular regions grown bottom-up from 2x2 px units: repeatedly merge the adjacent pair whose union
               raises the fit error least, until K regions remain (exact least squares from sufficient statistics)
+  gaussaxis   gauss with rotation frozen at 0 (axis-aligned, as GaussJiT's default): what rotation adds
   gaussfixed  soft decoding alone: Gaussians frozen at the quadtree8 layout (sigma = width / 3), only their polynomials fit
   gauss       (C) K soft 2D Gaussians: each pixel blends the tokens' polynomials (in each Gaussian's own frame) with weights
               normalized over tokens (a partition of unity, so every pixel is covered); centres, shapes and coefficients
@@ -17,7 +18,8 @@ coefficients). No diffusion model: this filters tokenization families before any
 Each family gets its best allocation for the image itself (fit on the clean image): an upper bound on what each could
 represent, not a router. Errors are PSNR on [0, 1] over held-out images.
 
-$ python compare_tokenizations.py --data_dir=/data/in1k_128          # -> {out}.json, {out}.png, {out}_viz_K{K}.png
+$ python compare_tokenizations.py --data_dir=/data/in1k_128          # -> {out}.json, {out}.png, {out}_viz_K{K}.png, {out}_viz.npz
+$ python compare_tokenizations.py --plot_only=True --out=...          # redraw every figure from {out}.json / {out}_viz.npz
 """
 
 import os
@@ -37,7 +39,7 @@ data_dir = ''
 n_images = 128
 seed = 0
 tokens = '64,100,160,256'
-families = 'uniform,quadtree8,quadtree4,merge,gaussfixed,gauss'
+families = 'uniform,quadtree8,quadtree4,merge,gaussfixed,gaussaxis,gauss'
 capacities = 'const,linear,quad'
 gauss_steps = 400
 gauss_lr = 0.02
@@ -65,8 +67,8 @@ def psnr_figure(results):
     caps = [c for c in results['psnr']]
     fams = list(dict.fromkeys(f for c in caps for f in results['psnr'][c]))
     Ks_ = sorted({int(k) for c in caps for f in results['psnr'][c] for k in results['psnr'][c][f]})
-    fixed = {'uniform': '#2a78d6', 'quadtree8': '#eb6834', 'quadtree4': '#eda100', 'merge': '#1baf7a', 'gaussfixed': '#e87ba4', 'gauss': '#a8336b'}
-    marks = {'uniform': 'o', 'quadtree8': 's', 'quadtree4': 'D', 'merge': '^', 'gaussfixed': 'X', 'gauss': 'P'}
+    fixed = {'uniform': '#2a78d6', 'quadtree8': '#eb6834', 'quadtree4': '#eda100', 'merge': '#1baf7a', 'gaussfixed': '#e87ba4', 'gaussaxis': '#008300', 'gauss': '#a8336b'}
+    marks = {'uniform': 'o', 'quadtree8': 's', 'quadtree4': 'D', 'merge': '^', 'gaussfixed': 'X', 'gaussaxis': 'v', 'gauss': 'P'}
     fig, axes = plt.subplots(1, len(caps), figsize=(5.2 * len(caps), 4.2), facecolor=SURFACE, squeeze=False)
     for ax, cap in zip(axes[0], caps):
         for j, fam in enumerate(fams):
@@ -87,6 +89,54 @@ def psnr_figure(results):
     plt.close(fig)
     print(f'wrote {out}.png')
 
+def viz_figures(d, psnr, cap):
+    # each family's patchification at every budget in d: reconstruction (top) and regions on the image (bottom)
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Ellipse
+    from plot_style import SURFACE, INK
+    to_np = lambda a: ((np.clip(a, -1, 1) + 1) / 2).transpose(1, 2, 0)
+    Xv = d['X']
+    nv, H = Xv.shape[0], Xv.shape[-1]
+    Ks_ = sorted({int(k.split('|')[0][1:]) for k in d if '|' in k})
+    order = ['uniform', 'quadtree8', 'quadtree4', 'merge', 'gaussfixed', 'gaussaxis', 'gauss']
+    written = []
+    for K in Ks_:
+        fams = [f for f in order if f'K{K}|{f}|rec' in d]
+        cols = ['image'] + fams
+        fig, axes = plt.subplots(2 * nv, len(cols), figsize=(1.9 * len(cols), 3.9 * nv + 0.6), facecolor=SURFACE, squeeze=False)
+        for ax in axes.flat:
+            ax.set_xticks([]); ax.set_yticks([])
+            for sp in ax.spines.values():
+                sp.set_visible(False)
+        for j, c in enumerate(cols):
+            for i in range(nv):
+                top, bot = axes[2 * i, j], axes[2 * i + 1, j]
+                if c == 'image':
+                    top.imshow(to_np(Xv[i])); bot.imshow(to_np(Xv[i]))
+                    if i == 0:
+                        top.set_title('image', color=INK, fontsize=8)
+                    continue
+                key = f'K{K}|{c}|'
+                top.imshow(to_np(d[key + 'rec'][i]))
+                bot.imshow(to_np(d[key + 'overlay'][i]))
+                if c.startswith('gauss'): # owned cells (in the overlay) and each Gaussian's centre
+                    mu = d[key + 'mu'][i]
+                    bot.scatter(mu[:, 0] - 0.5, mu[:, 1] - 0.5, s=2, color='#a8336b', linewidths=0)
+                    bot.set_xlim(-0.5, H - 0.5); bot.set_ylim(H - 0.5, -0.5)
+                if i == 0:
+                    db = psnr.get(cap, {}).get(c, {}).get(str(K))
+                    top.set_title(f"{c}" + (f"\n{db:.1f} dB" if db is not None else ''), color=INK, fontsize=8)
+        fig.suptitle(f'K={K}, {cap} polynomial per token: reconstruction (top), regions (bottom)\n'
+                     f'quadtree: boxes by size; merge: region boundaries; gauss: the cell each Gaussian dominates, and its centre',
+                     color=INK, fontsize=10, x=0.01, ha='left')
+        fig.tight_layout(rect=(0, 0, 1, 1 - 0.6 / (3.9 * nv + 0.6)))
+        fig.savefig(out + f'_viz_K{K}.png', dpi=140, facecolor=SURFACE)
+        plt.close(fig)
+        written.append(out + f'_viz_K{K}.png')
+    return written
+
 if plot_only:
     with open(out + '.json') as fh:
         res = json.load(fh)
@@ -97,6 +147,11 @@ if plot_only:
             json.dump(res, fh, indent=1)
         print(f'{out}.json: PSNR corrected (+{10 * np.log10(3):.2f} dB)')
     psnr_figure(res)
+    if os.path.exists(out + '_viz.npz'):
+        print('wrote ' + ', '.join(viz_figures(dict(np.load(out + '_viz.npz')), res['psnr'], res.get('config', {}).get('viz_capacity', 'linear'))))
+    else:
+        print(f'no {out}_viz.npz (results from before it was saved): rerun with a few images for the patch figures, e.g. '
+              f'--n_images=8 --capacities=linear')
     raise SystemExit
 
 data = MemmapImages(os.path.join(data_dir, 'val') if os.path.isdir(os.path.join(data_dir, 'val')) else data_dir)
@@ -105,7 +160,7 @@ idx = np.sort(np.random.default_rng(seed).choice(len(data), n_images, replace=Fa
 X = to_model_input(data.get(idx)[0], flip=False, device=device) # [N, 3, H, W] in [-1, 1]
 Ks = [int(k) for k in tokens.split(',')]
 fam_list = [f for f in families.split(',') if f]
-FAMILIES = ('uniform', 'quadtree8', 'quadtree4', 'merge', 'gaussfixed', 'gauss')
+FAMILIES = ('uniform', 'quadtree8', 'quadtree4', 'merge', 'gaussfixed', 'gaussaxis', 'gauss')
 assert all(f in FAMILIES for f in fam_list), f'unknown families {[f for f in fam_list if f not in FAMILIES]}: choose from {FAMILIES}'
 cap_list = [c for c in capacities.split(',') if c]
 DEG = {'const': 0, 'linear': 1, 'quad': 2}
@@ -259,7 +314,7 @@ def run_merge(x, cap, Ks_desc):
 # -----------------------------------------------------------------------------
 # C: K soft 2D Gaussians with per-token polynomials, fit by Adam from the quadtree8 layout
 
-def run_gauss(x, cap, K, steps=None, lr=None, fixed=False):
+def run_gauss(x, cap, K, steps=None, lr=None, fixed=False, rotate=True):
     """
     x [B, 3, H, W] -> reconstruction, (centres [B, K, 2], covariance factors) after fitting. Pixel value
     sum_k w_k(p) poly_k(p - mu_k) / sum_k w_k(p), w_k = exp(-|L_k^-1 (p - mu_k)|^2 / 2). fixed: the geometry stays at the
@@ -275,7 +330,7 @@ def run_gauss(x, cap, K, steps=None, lr=None, fixed=False):
     mu = torch.stack([cx, cy], -1).clone().requires_grad_(not fixed) # [B, K, 2] (x, y)
     # narrow enough that the normalized weights start close to the quadtree's hard partition
     log_s = torch.log(w0 / (3 if fixed else 4)).unsqueeze(-1).repeat(1, 1, 2).clone().requires_grad_(not fixed) # per-axis scales
-    rho = torch.zeros(B, K, device=x.device, requires_grad=not fixed) # rotation
+    rho = torch.zeros(B, K, device=x.device, requires_grad=not fixed and rotate) # rotation
     # each token's polynomial starts at its quadtree region's least-squares fit (node-local coordinates, u = rows, v = columns)
     lvl, pos = geo.level.to(x.device)[layout], geo.index_in_level.to(x.device)[layout] # [B, K]
     coef0 = None
@@ -292,7 +347,7 @@ def run_gauss(x, cap, K, steps=None, lr=None, fixed=False):
     yy, xx = torch.meshgrid(torch.arange(H, device=x.device) + 0.5, torch.arange(W, device=x.device) + 0.5, indexing='ij')
     P = torch.stack([xx.flatten(), yy.flatten()], -1) # [HW, 2]
     target = x.flatten(2).transpose(1, 2) # [B, HW, 3]
-    groups = [{'params': [coef], 'lr': lr * 5}] + ([] if fixed else [{'params': [mu], 'lr': lr * 8}, {'params': [log_s, rho], 'lr': lr}])
+    groups = [{'params': [coef], 'lr': lr * 5}] + ([] if fixed else [{'params': [mu], 'lr': lr * 8}, {'params': [log_s] + ([rho] if rotate else []), 'lr': lr}])
     opt = torch.optim.Adam(groups)
     def render():
         diff = P[None, None] - mu[:, :, None] # [B, K, HW, 2]
@@ -337,7 +392,7 @@ for cap in cap_list:
                     continue # done below for all K at once
                 else:
                     with torch.enable_grad():
-                        rec, extra = run_gauss(xb, cap, K, fixed=(fam == 'gaussfixed'))
+                        rec, extra = run_gauss(xb, cap, K, fixed=(fam == 'gaussfixed'), rotate=(fam != 'gaussaxis'))
                 err_sum += (rec - xb).pow(2).sum().item()
                 if i == 0 and cap == viz_capacity and K in VIZ_K:
                     recs.setdefault(K, {})[fam] = (rec[:viz_images].cpu(), extra)
@@ -366,60 +421,47 @@ print(f'wrote {out}.json')
 # -----------------------------------------------------------------------------
 # figures
 
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-from matplotlib.patches import Ellipse
-from plot_style import SURFACE, INK, INK_2, style_axis
-
 psnr_figure(results)
 
-to_np = lambda t: ((t.float().clamp(-1, 1) + 1) / 2).permute(1, 2, 0).cpu().numpy()
-def viz_figure(K):
-    # each family's patchification at budget K: reconstruction (top) and regions on the image (bottom)
-    rk = recs.get(K, {})
-    cols = ['image'] + [f for f in fam_list if f in rk]
+def portable_viz():
+    # the figure data as numpy arrays (saved to {out}_viz.npz, so --plot_only can redraw the patch figures): images, each
+    # family's reconstruction, region overlays drawn on the image (quadtree boxes, merge boundaries) or Gaussian parameters
     nv = min(viz_images, n_images)
-    fig, axes = plt.subplots(2 * nv, len(cols), figsize=(1.9 * len(cols), 3.9 * nv + 0.6), facecolor=SURFACE, squeeze=False)
-    for ax in axes.flat:
-        ax.set_xticks([]); ax.set_yticks([])
-        for sp in ax.spines.values():
-            sp.set_visible(False)
-    for j, c in enumerate(cols):
-        for i in range(nv):
-            top, bot = axes[2 * i, j], axes[2 * i + 1, j]
-            if c == 'image':
-                top.imshow(to_np(X[i])); bot.imshow(to_np(X[i]))
-                if i == 0:
-                    top.set_title('image', color=INK, fontsize=8)
-                continue
-            if c == 'merge':
-                rec = rk['merge'][0][i]; lab = rk['merge'][1][i]
-                top.imshow(to_np(rec))
-                edge = np.zeros(lab.shape, bool)
-                edge[:, :-1] |= (lab[:, :-1] != lab[:, 1:]).numpy(); edge[:-1] |= (lab[:-1] != lab[1:]).numpy()
-                im = to_np(X[i]).copy(); im[edge] = [0.11, 0.69, 0.48]
-                bot.imshow(im)
-            elif c.startswith('gauss'):
-                rec, (mu, s, rho) = rk[c]
-                top.imshow(to_np(rec[i])); bot.imshow(to_np(X[i]))
-                for k in range(mu.shape[1]):
-                    bot.add_patch(Ellipse(mu[i, k].cpu().numpy() - 0.5, 2 * s[i, k, 0].item(), 2 * s[i, k, 1].item(),
-                                          angle=float(np.degrees(rho[i, k].item())), fill=False, color='#a8336b', linewidth=0.5))
-                bot.set_xlim(-0.5, img - 0.5); bot.set_ylim(img - 0.5, -0.5)
+    d = {'X': X[:nv].float().cpu().numpy()}
+    for K, rk in recs.items():
+        for fam, val in rk.items():
+            key = f'K{K}|{fam}|'
+            if fam == 'merge':
+                rec = torch.stack(val[0][:nv]); labs = torch.stack(val[1][:nv])
+                edge = torch.zeros(labs.shape, dtype=torch.bool)
+                edge[:, :, :-1] |= labs[:, :, :-1] != labs[:, :, 1:]; edge[:, :-1] |= labs[:, :-1] != labs[:, 1:]
+                over = X[:nv].float().cpu().clone()
+                over = torch.where(edge[:, None], torch.tensor([-0.78, 0.38, -0.04]).view(1, 3, 1, 1), over)
+                d[key + 'rec'], d[key + 'overlay'] = rec.numpy(), over.numpy()
+            elif fam.startswith('gauss'):
+                rec, (mu, sc, rho) = val
+                mu, sc, rho = mu[:nv].float().cpu(), sc[:nv].float().cpu(), rho[:nv].float().cpu()
+                d[key + 'rec'], d[key + 'mu'], d[key + 's'], d[key + 'rho'] = rec[:nv].cpu().numpy(), mu.numpy(), sc.numpy(), rho.numpy()
+                # each token's owned cell: the pixels where its normalized weight is largest (the weights are normalized
+                # over all tokens, so these cells tile the image whatever the Gaussians' widths); boundaries drawn
+                Hh = X.shape[-1]
+                r = torch.arange(Hh, dtype=torch.float32) + 0.5
+                py, px = torch.meshgrid(r, r, indexing='ij')
+                dx, dy = px - mu[..., 0, None, None], py - mu[..., 1, None, None] # [nv, K, H, W]
+                c, sn = torch.cos(rho)[..., None, None], torch.sin(rho)[..., None, None]
+                q = ((c * dx + sn * dy) / sc[..., 0, None, None]) ** 2 + ((-sn * dx + c * dy) / sc[..., 1, None, None]) ** 2
+                owner = (-q).argmax(1) # [nv, H, W]
+                edge = torch.zeros(owner.shape, dtype=torch.bool)
+                edge[:, :, :-1] |= owner[:, :, :-1] != owner[:, :, 1:]; edge[:, :-1] |= owner[:, :-1] != owner[:, 1:]
+                over = torch.where(edge[:, None], torch.tensor([0.32, -0.6, -0.16]).view(1, 3, 1, 1), X[:nv].float().cpu().clone())
+                d[key + 'overlay'] = over.numpy()
             else:
-                rec, (layout, geo) = rk[c]
-                top.imshow(to_np(rec[i]))
-                bot.imshow(to_np(draw_layout(X[i:i + 1].cpu(), layout[i:i + 1].cpu(), geo)[0]))
-            if i == 0:
-                top.set_title(f"{c}\n{results['psnr'][viz_capacity][c][str(K)]:.1f} dB", color=INK, fontsize=8)
-    fig.suptitle(f'K={K}, {viz_capacity} polynomial per token: reconstruction (top) and regions (bottom; quadtree boxes by '
-                 f'size, merge boundaries, Gaussians: 1-sigma ellipses)', color=INK, fontsize=10, x=0.01, ha='left')
-    fig.tight_layout(rect=(0, 0, 1, 1 - 0.6 / (3.9 * nv + 0.6)))
-    fig.savefig(out + f'_viz_K{K}.png', dpi=140, facecolor=SURFACE)
-    plt.close(fig)
+                rec, (layout, geo) = val
+                d[key + 'rec'] = rec[:nv].cpu().numpy()
+                d[key + 'overlay'] = draw_layout(X[:nv].float().cpu(), layout[:nv].cpu(), geo).numpy()
+    return d
 
-for K in VIZ_K:
-    if K in recs:
-        viz_figure(K)
-print(f"wrote {out}.png, " + ', '.join(f'{out}_viz_K{K}.png' for K in VIZ_K if K in recs))
+viz_data = portable_viz()
+np.savez_compressed(out + '_viz.npz', **viz_data)
+written = viz_figures(viz_data, results['psnr'], viz_capacity)
+print(f'wrote {out}_viz.npz, ' + ', '.join(written))
