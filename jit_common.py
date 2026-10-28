@@ -424,11 +424,45 @@ def save_geometry_grid(net, x, names, path, n=8):
     geometry_figure(net, path, x[:n], [('end of sampling', mu, h, theta)], row_labels=names[:n],
                     title='geometry of the sampled images at the last sampling step (sampling weights)')
 
-def save_geometry_live(net, x, y, path, noise_scale, ts=(0.3, 0.6, 0.9), seed=0, t_grid=19):
+def plot_geometry_vs_t(stats, path, title, rotation=True):
+    """
+    Token geometry vs noise level from {t: stats} (keys offset_mean / _p95, scale_p5 / _p50 / _p95, rotation_p50 / _p95,
+    outside_frame): one panel each for displacement, per-axis scale, |rotation| (if rotation) and the share of pixels
+    outside their dominant token's frame.
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import PercentFormatter
+    from plot_style import SURFACE, INK_2, style_axis, line, CATEGORICAL
+    tv = sorted(stats)
+    panels = [('displacement (anchor spacings)', [('mean', 'offset_mean'), ('p95', 'offset_p95')]),
+              ('per-axis scale (x initial size)', [('p5', 'scale_p5'), ('p50', 'scale_p50'), ('p95', 'scale_p95')])]
+    panels.append(('token-to-token vs whole-image (std of log scale)', [('within images', 'scale_within'), ('between images', 'scale_between')]))
+    if rotation:
+        panels.append(('rotation (degrees)', [('|rot| p50', 'rotation_p50'), ('|rot| p95', 'rotation_p95'), ('signed mean', 'rotation_mean'),
+                                              ('within-image std', 'rotation_within')]))
+    panels.append(("pixels outside their dominant token's frame", [('share', 'outside_frame')]))
+    fig, axes = plt.subplots(1, len(panels), figsize=(4.4 * len(panels), 3.4), facecolor=SURFACE, squeeze=False)
+    for ax, (ptitle, series) in zip(axes[0], panels):
+        for k, (lab, key) in enumerate(series):
+            line(ax, tv, [stats[t][key] for t in tv], CATEGORICAL[k], 'o', lab)
+        style_axis(ax, 't (1 = clean)', '', ptitle)
+        ax.legend(frameon=False, fontsize=8, labelcolor=INK_2)
+        if series[0][1] == 'outside_frame': # a share: percent, from zero
+            ax.yaxis.set_major_formatter(PercentFormatter(1.0))
+            ax.set_ylim(0, max(0.05, 1.2 * max(stats[t]['outside_frame'] for t in tv)))
+    fig.suptitle(title, fontsize=9, x=0.01, ha='left')
+    fig.tight_layout(rect=(0, 0, 1, 0.9))
+    fig.savefig(path, dpi=130, facecolor=SURFACE)
+    plt.close(fig)
+
+def save_geometry_live(net, x, y, path, noise_scale, ts=(0.3, 0.6, 0.9), seed=0, t_grid=19, x_stats=None):
     """
     The geometry the network predicts now (call with the training weights) for held-out images x noised to t:
       {path}                      one column per t in ts (model_gauss.geometry_figure)
-      {path stem}_vs_t.png        displacement / per-axis scale / |rotation| percentiles vs t, over t_grid noise levels
+      {path stem}_vs_t.png        displacement / per-axis scale / |rotation| percentiles and the share of pixels outside
+                                  their dominant token's frame vs t, over t_grid noise levels, from x_stats (default x)
       {path stem}.gif             t sweeping from noisy to clean: the noisy input (top) and the Gaussians on the clean image
     Returns {t: geometry stats} for logging. Shows what the placer is learning even while sampling weights (EMA) lag.
     """
@@ -442,41 +476,41 @@ def save_geometry_live(net, x, y, path, noise_scale, ts=(0.3, 0.6, 0.9), seed=0,
         z = t_val * x + (1 - t_val) * e
         mu, h, theta, _ = net.geometry(z, net.t_embedder(t).float())
         return z, mu, h, theta
+    xs = x if x_stats is None else x_stats
+    es = torch.randn(xs.shape, generator=torch.Generator(device=xs.device).manual_seed(seed + 1), device=xs.device) * noise_scale
+    def geo_stats_at(t_val, chunk=64):
+        # geometry of every image in xs noised to t (placer forward only), in chunks
+        out = []
+        for i in range(0, xs.shape[0], chunk):
+            t = torch.full((len(xs[i:i + chunk]),), t_val, device=xs.device)
+            mu, h, theta, _ = net.geometry(t_val * xs[i:i + chunk] + (1 - t_val) * es[i:i + chunk], net.t_embedder(t).float())
+            out.append((mu, h, theta))
+        return [torch.cat(z) for z in zip(*out)]
     with torch.no_grad(), torch.autocast(device_type=x.device.type, enabled=False):
         cols = [(f't={t_val:g}', *geo_at(t_val)[1:]) for t_val in ts]
         grid = [float(v) for v in np.linspace(0.05, 0.95, t_grid)]
         sweep = [(t_val, *geo_at(t_val)) for t_val in grid]
+        stat_geo = {t_val: geo_stats_at(t_val) for t_val in grid}
     geometry_figure(net, path, x, cols, title='geometry predicted from held-out images noised to t (training weights)')
     stem = path.rsplit('.', 1)[0]
     # statistics vs t
     S, q = net.patch_size, torch.tensor([0.05, 0.5, 0.95], device=x.device)
     stats = {}
-    for t_val, _, mu, h, theta in sweep:
+    for t_val in grid:
+        mu, h, theta = stat_geo[t_val]
         off = ((mu - net.anchors) / S).norm(dim=-1).flatten()
         f = (h / (net.extent * S)).flatten()
         rot = theta.abs().flatten() * 180 / math.pi
         stats[t_val] = {'offset_mean': off.mean().item(), 'offset_p95': torch.quantile(off, 0.95).item(),
                         **{f'scale_{k}': v for k, v in zip(('p5', 'p50', 'p95'), torch.quantile(f, q).tolist())},
-                        'rotation_p50': torch.quantile(rot, 0.5).item(), 'rotation_p95': torch.quantile(rot, 0.95).item()}
+                        'rotation_p50': torch.quantile(rot, 0.5).item(), 'rotation_p95': torch.quantile(rot, 0.95).item(),
+                        'outside_frame': net.outside_frame_share(mu, h, theta), **net.spread_stats(h, theta)}
+    plot_geometry_vs_t(stats, stem + '_vs_t.png', f'token geometry vs noise level ({xs.shape[0]} held-out images x {net.tokens} tokens, '
+                       f'training weights)', net.max_rotation > 0)
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    from plot_style import SURFACE, INK_2, style_axis, line, CATEGORICAL
-    tv = list(stats)
-    panels = [('displacement (anchor spacings)', [('mean', 'offset_mean'), ('p95', 'offset_p95')]),
-              ('per-axis scale (x initial size)', [('p5', 'scale_p5'), ('p50', 'scale_p50'), ('p95', 'scale_p95')])]
-    if net.max_rotation > 0:
-        panels.append(('|rotation| (degrees)', [('p50', 'rotation_p50'), ('p95', 'rotation_p95')]))
-    fig, axes = plt.subplots(1, len(panels), figsize=(4.6 * len(panels), 3.4), facecolor=SURFACE, squeeze=False)
-    for ax, (title, series) in zip(axes[0], panels):
-        for k, (lab, key) in enumerate(series):
-            line(ax, tv, [stats[t][key] for t in tv], CATEGORICAL[k], 'o', lab)
-        style_axis(ax, 't (1 = clean)', '', title)
-        ax.legend(frameon=False, fontsize=8, labelcolor=INK_2)
-    fig.suptitle(f'token geometry vs noise level ({x.shape[0]} held-out images x {net.tokens} tokens, training weights)', fontsize=9, x=0.01, ha='left')
-    fig.tight_layout(rect=(0, 0, 1, 0.9))
-    fig.savefig(stem + '_vs_t.png', dpi=130, facecolor=SURFACE)
-    plt.close(fig)
+    from plot_style import SURFACE
     # animation over t
     from PIL import Image
     n = min(3, x.shape[0])

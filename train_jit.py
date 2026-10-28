@@ -31,7 +31,7 @@ import numpy as np
 import torch
 
 from data_jit import MemmapImages, EpochSampler, Prefetcher, to_model_input
-from jit_common import build_denoiser, resolve_arch, describe_arch, run_dir, legacy_run_dir, ema_state_dicts, ema_weights, generate_and_score, save_labeled_grid, save_layout_grids, save_geometry_grid, save_geometry_live, GAUSS_DEFAULTS
+from jit_common import build_denoiser, resolve_arch, describe_arch, run_dir, legacy_run_dir, ema_state_dicts, ema_weights, generate_and_score, save_labeled_grid, save_layout_grids, save_geometry_grid, save_geometry_live, plot_geometry_vs_t, GAUSS_DEFAULTS
 from fid import InceptionMetrics, load_ref_stats, precision_recall
 from repa import FrozenEncoder, Projector, MaskedTransformerAdapter, BlockCapture, repa_loss, mta_loss
 from masking import TokenMasker, flow_loss
@@ -664,7 +664,22 @@ def evaluate(step):
         log[f'eval/{split}_loss'] = estimate_loss(xs, ys)
     spectrum = SpectrumAccumulator(diag_spectrum_images) if diag else None
     with ema_weights(denoiser, 1):
+        if is_gauss: # the sampling (EMA) model's geometry along its own sampling trajectories, recorded during the FID generation
+            denoiser.net.record_geometry(True)
         out = generate(spectrum)
+        if is_gauss:
+            geo_ema = denoiser.net.geometry_record_summary()
+            denoiser.net.record_geometry(False)
+            if geo_ema:
+                plot_geometry_vs_t(geo_ema, os.path.join(samples_dir, f'geometry_ema_vs_t_{step}.png'),
+                                   f'token geometry vs noise level along the FID generation\'s sampling trajectories (EMA weights)',
+                                   denoiser.net.max_rotation > 0)
+                with open(os.path.join(out_dir, 'geometry_ema_vs_t.jsonl'), 'a') as fh:
+                    fh.write(json.dumps({'iter': step, 'stats': {f'{t:.3f}': v for t, v in geo_ema.items()}}) + '\n')
+                if wandb_log:
+                    wandb.log({f'geometry_ema_t/{k}_t{t:.2f}': v for t, st in geo_ema.items() for k, v in st.items()
+                               if k in ('offset_mean', 'scale_p5', 'scale_p95', 'rotation_p95', 'outside_frame', 'scale_within', 'scale_between',
+                                'rotation_mean', 'rotation_same_sign', 'rotation_within')}, step=step)
         if diag:
             # 5. probes on the EMA weights (the model that is sampled from)
             denoiser.eval()
@@ -830,19 +845,21 @@ def save_samples(step):
         settings.append((sample_cfg, (sample_interval_min, sample_interval_max), f'_cfg{sample_cfg:g}'))
     names = [class_names[i] for i in labels.tolist()]
     if is_gauss: # the live (training) weights' geometry on held-out images, before switching to the sampling weights
-        global geo_val
-        if 'geo_val' not in globals():
+        global geo_val, geo_stats_x
+        if 'geo_val' not in globals(): # 6 held-out images drawn, 256 for the geometry statistics
             gv = MemmapImages(os.path.join(data_dir, 'val'))
-            xg, _ = gv.get(spaced(len(gv), 6))
-            geo_val = to_model_input(xg, flip=False, device=device)
+            geo_val = to_model_input(gv.get(spaced(len(gv), 6))[0], flip=False, device=device)
+            geo_stats_x = to_model_input(gv.get(spaced(len(gv), 256))[0], flip=False, device=device)
         was = denoiser.training
         denoiser.eval()
-        geo_t = save_geometry_live(denoiser.net, geo_val, None, os.path.join(samples_dir, f'geometry_{step}.png'), noise_scale)
+        geo_t = save_geometry_live(denoiser.net, geo_val, None, os.path.join(samples_dir, f'geometry_{step}.png'), noise_scale, x_stats=geo_stats_x)
         denoiser.train(was)
         with open(os.path.join(out_dir, 'geometry_vs_t.jsonl'), 'a') as fh: # geometry vs t over training, for plotting
             fh.write(json.dumps({'iter': step, 'stats': {f'{t:.3f}': v for t, v in geo_t.items()}}) + '\n')
         if wandb_log:
-            wandb.log({f'geometry_t/{k}_t{t:.2f}': v for t, st in geo_t.items() for k, v in st.items() if k in ('offset_mean', 'scale_p5', 'scale_p95', 'rotation_p95')}, step=step)
+            wandb.log({f'geometry_t/{k}_t{t:.2f}': v for t, st in geo_t.items() for k, v in st.items()
+                       if k in ('offset_mean', 'scale_p5', 'scale_p95', 'rotation_p95', 'outside_frame', 'scale_within', 'scale_between',
+                                'rotation_mean', 'rotation_same_sign', 'rotation_within')}, step=step)
     with ema_weights(denoiser, 1):
         denoiser.eval()
         for cfg, interval, suffix in settings:
@@ -1024,7 +1041,9 @@ while True:
         g_ = geo_stats
         geo_str = (f", geometry: offset mean {g_['offset_mean']:.3f} / p95 {g_['offset_p95']:.3f}, scale p5/p50/p95 {g_['scale_p5']:.2f}/"
                    f"{g_['scale_p50']:.2f}/{g_['scale_p95']:.2f} [{g_['scale_min']:.2f}, {g_['scale_max']:.2f}]"
-                   + (f", |rotation| p50/p95/max {g_['rotation_p50']:.1f}/{g_['rotation_p95']:.1f}/{g_['rotation_max']:.1f}deg"
+                   + f", log-scale std within/between images {g_['scale_within']:.3f}/{g_['scale_between']:.3f}"
+                   + (f", |rotation| p50/p95/max {g_['rotation_p50']:.1f}/{g_['rotation_p95']:.1f}/{g_['rotation_max']:.1f}deg, signed mean "
+                      f"{g_['rotation_mean']:+.1f}deg, same sign {g_['rotation_same_sign']:.0%}, within-image std {g_['rotation_within']:.1f}deg"
                       if denoiser.net.max_rotation > 0 else '')) if g_ else ""
         print(f"iter {iter_num} (epoch {iter_num / iters_per_epoch:.2f}): loss {lossf:.4f}{trunk_str}{repa_str}{grad_str}{geo_str}, time {dt*1000:.2f}ms "
               f"(data {data_seconds*1000:.0f}ms), {imgs_per_sec:.0f} img/s")

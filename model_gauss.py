@@ -173,6 +173,7 @@ class GaussJiT(nn.Module):
             self.register_buffer(name + '_1d', w, persistent=False) # [W]
         self.separable = max_rotation == 0 # axis-aligned frames: the 2D basis is an outer product of 1D tables
         self.last_geometry = None # the last forward's (mu, h, theta), detached: for visualizations and logging
+        self.geo_record = None # while recording (record_geometry): {t: lists of per-call samples}, e.g. over an FID generation
         self.initialize_weights()
 
     def __setattr__(self, name, value):
@@ -398,6 +399,8 @@ class GaussJiT(nn.Module):
             mu, h, theta, log_f = self.geometry(x, t_emb.float())
             patches = self.encode(x, mu, h, theta)
         self.last_geometry = (mu.detach(), h.detach(), theta.detach())
+        if self.geo_record is not None:
+            self._record_geometry(t, mu, h, theta)
         tok = self.x_embedder(patches)
         # positions at the continuous centres (anchor units), detached: geometry learns through sampling and blending
         S = self.patch_size
@@ -433,6 +436,63 @@ class GaussJiT(nn.Module):
         v = (-s * dx + c * dy) / h[..., 1, None, None]
         return torch.exp(-(u ** 2 + v ** 2) / (2 * self.sigma ** 2))
 
+    def spread_stats(self, h, theta):
+        """
+        Token-to-token variation vs whole-image shifts, for geometry of N images [N, K, ...]:
+          scale_within    mean over images of the std of log-scale across the image's tokens (both axes): tokens differing
+                          inside an image (adaptive allocation)
+          scale_between   std over images of the image's mean log-scale: whole images tokenized coarser / finer
+          rotation_mean   signed mean rotation (degrees); rotation_same_sign: the share of rotated tokens (|theta| > 0.5 deg)
+                          turning the majority's way (1 = one global direction); rotation_within: mean within-image std (degrees)
+        """
+        lf = (h / (self.extent * self.patch_size)).float().log().flatten(1) # [N, 2K]
+        deg = theta.float() * 180 / math.pi # [N, K]
+        rot = deg[deg.abs() > 0.5]
+        same = max((rot > 0).float().mean().item(), (rot < 0).float().mean().item()) if rot.numel() else float('nan')
+        return {'scale_within': lf.std(1).mean().item(), 'scale_between': lf.mean(1).std().item() if lf.shape[0] > 1 else 0.0,
+                'rotation_mean': deg.mean().item(), 'rotation_same_sign': same, 'rotation_within': deg.std(1).mean().item()}
+
+    def record_geometry(self, on=True):
+        # start (clearing) or stop recording every forward's geometry by noise level, e.g. around an FID generation
+        self.geo_record = {} if on else None
+
+    @torch.compiler.disable
+    @torch.no_grad()
+    def _record_geometry(self, t, mu, h, theta, n_tokens=32, n_coverage=8):
+        # this call's geometry for the first n_tokens images (CFG batches carry the conditional half first) and its
+        # outside-frame share over the first n_coverage, under the call's noise level
+        key = round(float(t.flatten()[0]), 3)
+        S = self.patch_size
+        m_, h_, t_ = mu[:n_tokens].float(), h[:n_tokens].float(), theta[:n_tokens].float()
+        r = self.geo_record.setdefault(key, {'offset': [], 'scale': [], 'rotation': [], 'outside': [], 'lf_std': [], 'lf_mean': [],
+                                             'rot_signed': [], 'rot_std': []})
+        lf = (h_ / (self.extent * S)).log().flatten(1)
+        deg = t_ * 180 / math.pi
+        r['lf_std'].append(lf.std(1).cpu()); r['lf_mean'].append(lf.mean(1).cpu())
+        r['rot_signed'].append(deg.flatten().cpu()); r['rot_std'].append(deg.std(1).cpu())
+        r['offset'].append(((m_ - self.anchors) / S).norm(dim=-1).flatten().cpu())
+        r['scale'].append((h_ / (self.extent * S)).flatten().cpu())
+        r['rotation'].append((t_.abs() * 180 / math.pi).flatten().cpu())
+        r['outside'].append(self.outside_frame_share(m_[:n_coverage], h_[:n_coverage], t_[:n_coverage]))
+
+    def geometry_record_summary(self):
+        # {t: geometry statistics} from the recording, the same keys as jit_common.save_geometry_live's
+        out = {}
+        for key, r in sorted((self.geo_record or {}).items()):
+            off, f, rot = torch.cat(r['offset']), torch.cat(r['scale']), torch.cat(r['rotation'])
+            qs = lambda z, q: torch.quantile(z[:2 ** 24], torch.tensor(q)).tolist()
+            p5, p50, p95 = qs(f, [0.05, 0.5, 0.95])
+            r50, r95 = qs(rot, [0.5, 0.95])
+            rs = torch.cat(r['rot_signed'])
+            rr = rs[rs.abs() > 0.5]
+            out[key] = {'offset_mean': off.mean().item(), 'offset_p95': qs(off, [0.95])[0], 'scale_p5': p5, 'scale_p50': p50,
+                        'scale_p95': p95, 'rotation_p50': r50, 'rotation_p95': r95, 'outside_frame': sum(r['outside']) / len(r['outside']),
+                        'scale_within': torch.cat(r['lf_std']).mean().item(), 'scale_between': torch.cat(r['lf_mean']).std().item(),
+                        'rotation_mean': rs.mean().item(), 'rotation_within': torch.cat(r['rot_std']).mean().item(),
+                        'rotation_same_sign': max((rr > 0).float().mean().item(), (rr < 0).float().mean().item()) if rr.numel() else float('nan'),
+                        'samples': len(r['outside'])}
+        return out
+
     def geometry_stats(self):
         # distribution of the last forward's geometry over tokens: |offset| (anchor spacings), per-axis scale (relative to
         # the initial frame), |rotation| (degrees): mean, percentiles (p5, p50, p95), min, max
@@ -448,7 +508,26 @@ class GaussJiT(nn.Module):
             p5, p50, p95 = torch.quantile(z[:2 ** 20], q).tolist() # quantile's input limit; a batch has far fewer values
             out.update({f'{name}_mean': z.mean().item(), f'{name}_p5': p5, f'{name}_p50': p50, f'{name}_p95': p95,
                         f'{name}_min': z.min().item(), f'{name}_max': z.max().item()})
+        out.update(self.spread_stats(h, theta))
         return out
+
+    def outside_frame_share(self, mu, h, theta, chunk=16):
+        # share of pixels whose dominant token (largest blending weight) doesn't contain them in its frame (|u| or |v| >= 1):
+        # those pixels take that token's basis extended past its frame (a fallback), not values from pixels it read
+        # (evaluated over all pixels and tokens, `chunk` images at a time: [chunk, K, H, W] intermediates)
+        H = self.input_size
+        r = torch.arange(H, device=mu.device, dtype=torch.float32) + 0.5
+        py, px = torch.meshgrid(r, r, indexing='ij')
+        n_out = 0.0
+        for i in range(0, mu.shape[0], chunk):
+            m_, h_, t_ = mu[i:i + chunk], h[i:i + chunk], theta[i:i + chunk]
+            dx, dy = px - m_[..., 0, None, None], py - m_[..., 1, None, None]
+            c, s = torch.cos(t_)[..., None, None], torch.sin(t_)[..., None, None]
+            u = (c * dx + s * dy) / h_[..., 0, None, None]
+            v = (-s * dx + c * dy) / h_[..., 1, None, None]
+            own = (u ** 2 + v ** 2).argmin(1, keepdim=True) # the largest Gaussian weight = the smallest frame radius
+            n_out += ((u.gather(1, own).abs() >= 1) | (v.gather(1, own).abs() >= 1)).float().sum().item()
+        return n_out / (mu.shape[0] * H * H)
 
 
 def draw_geometry(images, mu, h, theta, extent=0.75, color='#a8336b', points=96, core=True):
