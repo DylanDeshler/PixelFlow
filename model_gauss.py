@@ -109,13 +109,65 @@ class Placer(nn.Module):
         return self.head(h).flatten(2).transpose(1, 2) # [B, K, 5]
 
 
+class ConvNeXtPlacer(nn.Module):
+    """
+    A ConvNeXt-style placer (Liu et al. 2022), t-conditioned: an overlapping 2s x 2s stride-s stem conv (s = patch_size / 4),
+    blocks of [7x7 depthwise conv, LayerNorm with FiLM from t (and class), pointwise MLP 4x, layer scale, residual] at stride
+    s, then a linear layer over each anchor cell's (patch_size / s)^2 features (a non-overlapping strided conv: keeps where
+    things are inside the cell, unlike average pooling) to twice the width, more blocks on the anchor grid (each 7x7
+    depthwise conv reaches 3 anchors away, so tokens see their neighbours' content), and a zero-initialized linear head to
+    5 numbers per anchor. Receptive field at 128px with the defaults (2 + 2 blocks): the whole image.
+    """
+    def __init__(self, in_chans, patch_size, width, depth, grid_depth, cond_dim):
+        super().__init__()
+        s = max(1, patch_size // 4)
+        self.stem = nn.Conv2d(in_chans, width, 2 * s, stride=s, padding=s // 2) # centred on each s x s cell
+        self.stem_norm = nn.LayerNorm(width, eps=1e-6)
+        self.blocks = nn.ModuleList([PlacerBlock(width) for _ in range(depth)])
+        self.down_norm = nn.LayerNorm(width, eps=1e-6)
+        self.down = nn.Conv2d(width, 2 * width, patch_size // s, stride=patch_size // s) # linear over each anchor cell
+        self.grid_blocks = nn.ModuleList([PlacerBlock(2 * width) for _ in range(grid_depth)])
+        self.films = nn.ModuleList([nn.Linear(cond_dim, 2 * b.width) for b in [*self.blocks, *self.grid_blocks]])
+        self.head_norm = nn.LayerNorm(2 * width, eps=1e-6)
+        self.head = nn.Linear(2 * width, 5)
+
+    def forward(self, x, c):
+        c = F.silu(c)
+        films = iter(self.films)
+        h = self.stem_norm(self.stem(x).permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        for block in self.blocks:
+            h = block(h, next(films)(c))
+        h = self.down(self.down_norm(h.permute(0, 2, 3, 1)).permute(0, 3, 1, 2))
+        for block in self.grid_blocks:
+            h = block(h, next(films)(c))
+        return self.head(self.head_norm(h.flatten(2).transpose(1, 2))) # [B, K, 5]
+
+
+class PlacerBlock(nn.Module):
+    # ConvNeXt block with FiLM (zero-initialized: a plain affine-free LayerNorm at init) on its LayerNorm
+    def __init__(self, width):
+        super().__init__()
+        self.width = width
+        self.dw = nn.Conv2d(width, width, 7, padding=3, groups=width)
+        self.norm = nn.LayerNorm(width, eps=1e-6, elementwise_affine=False)
+        self.pw1 = nn.Linear(width, 4 * width)
+        self.pw2 = nn.Linear(4 * width, width)
+        self.gamma = nn.Parameter(torch.full((width,), 1e-6)) # layer scale
+
+    def forward(self, x, film):
+        g, b = film[:, None, None, :].chunk(2, dim=-1)
+        h = self.norm(self.dw(x).permute(0, 2, 3, 1)) * (1 + g) + b
+        h = self.pw2(F.gelu(self.pw1(h)))
+        return x + (self.gamma * h).permute(0, 3, 1, 2)
+
+
 class GaussJiT(nn.Module):
     family = 'gauss'
 
     def __init__(self, input_size=128, patch_size=16, in_channels=3, hidden_size=768, depth=12, num_heads=12, mlp_ratio=4.0,
                  attn_drop=0.0, proj_drop=0.0, num_classes=1000, bottleneck_dim=128, attn_res='none', attn_res_block_size=0,
                  adaln_single=False, layernorm=False, extent=0.75, basis=0, max_offset=0.25, scale_range=1.33, scale_max=0.0,
-                 max_rotation=0.0, sigma=0.3, placer_width=64, placer_depth=2, area_bias=True, shape_embed=True,
+                 max_rotation=0.0, sigma=0.3, placer='conv', placer_width=64, placer_depth=2, placer_grid_depth=2, area_bias=True, shape_embed=True,
                  chunks=8, fused='auto', in_context_len=0, in_context_start=0, family='gauss'):
         super().__init__()
         assert in_context_len == 0, 'GaussJiT has no in-context class tokens'
@@ -152,7 +204,13 @@ class GaussJiT(nn.Module):
         self.y_embedder = LabelEmbedder(num_classes, hidden_size)
         if adaln_single:
             self.t_block = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size, bias=True))
-        self.placer = Placer(in_channels, patch_size, placer_width, placer_depth, hidden_size)
+        # placer: 'conv' (the original: stride-4 conv, 3x3 blocks, average pooled to the anchors; ~32px receptive field per
+        # token) or 'convnext' (ConvNeXtPlacer: whole-image receptive field, position-aware readout of each anchor cell)
+        assert placer in ('conv', 'convnext'), f"placer must be 'conv' or 'convnext', got {placer}"
+        if placer == 'convnext':
+            self.placer = ConvNeXtPlacer(in_channels, patch_size, placer_width, placer_depth, placer_grid_depth, hidden_size)
+        else:
+            self.placer = Placer(in_channels, patch_size, placer_width, placer_depth, hidden_size)
         self.x_embedder = CoefEmbed(self.basis_n, in_channels, bottleneck_dim, hidden_size)
         self.final_layer = FinalLayer(hidden_size, self.basis_n, in_channels, adaln_single=adaln_single, layernorm=layernorm)
         self.shape_mlp = nn.Sequential(nn.Linear(4, hidden_size), nn.SiLU(), nn.Linear(hidden_size, hidden_size)) if shape_embed else None

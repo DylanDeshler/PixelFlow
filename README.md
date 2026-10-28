@@ -499,9 +499,15 @@ python compare_tokenizations.py --data_dir=/data/in1k_128     # -> in1k_128_toke
 
 `model_gauss.py` is a separate model, so the baseline is untouched. It runs JiT-B's backbone on K tokens that are
 oriented, scaled patches (64 at 128px for `GaussJiT-B/16`).
-- **Geometry:** each token is anchored on a grid of spacing `patch_size`. A small conv placer (about 0.1M parameters)
-  predicts each token's centre offset, per-axis scale and rotation from the noisy input, in the same forward pass, trained
-  only by the denoising loss.
+- **Geometry:** each token is anchored on a grid of spacing `patch_size`. A small conv placer predicts each token's centre
+  offset, per-axis scale and rotation from the noisy input, in the same forward pass, trained only by the denoising loss.
+  - `--gauss_placer=conv` (the default, 0.27M parameters): a stride-4 conv and two 3×3 blocks, average pooled to the
+    anchors. Each token sees only about 32px around its cell, and the pooling discards where things are inside the cell.
+  - `--gauss_placer=convnext` (1.1M parameters): ConvNeXt blocks (7×7 depthwise conv, LayerNorm with FiLM from t,
+    pointwise MLP, layer scale) at stride 4. Then a linear layer over each anchor cell's features, in place of the pool,
+    and more blocks on the anchor grid, so each token sees the whole image, including its neighbours' content. It adds about
+    3 GB of activations at batch 1024 and about 2% of the trunk's compute. `--gauss_placer_grid_depth` sets the number of
+    anchor-grid blocks.
   - Offsets are bounded to ±0.25 of the spacing and scales to ×1.33^±1 per axis.
   - Frames are axis-aligned by default. This keeps the basis separable, so encoding and decoding are two small matrix
     multiplies per token. `--gauss_max_rotation=0.785` allows ±45° rotation.
@@ -551,7 +557,7 @@ python train_jit.py config/jit_in1k_128.py config/model_gaussjit_b16.py --optimi
 ```
 
 Options: `--gauss_max_offset`, `--gauss_scale_range`, `--gauss_max_rotation`, `--gauss_extent`, `--gauss_basis`, `--gauss_sigma`,
-`--gauss_placer_width/depth`, `--gauss_area_bias`, `--gauss_shape_embed`.
+`--gauss_placer`, `--gauss_placer_width/depth/grid_depth`, `--gauss_area_bias`, `--gauss_shape_embed`.
 
 The presets use `bottleneck_dim=288`, which keeps JiT's 6× compression of a token's input: the default basis (24×24 per
 channel) has 2.25× a 16px patch's values, and 128 × 2.25 = 288. If you change `--gauss_extent` or `--gauss_basis`, rescale it the same

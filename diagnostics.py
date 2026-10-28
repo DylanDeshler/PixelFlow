@@ -195,14 +195,18 @@ def _plain_forward(net, x, t, y, capture_blocks=(), tile=None):
     # non-JiT families (PixelDiT, QuadtreeJiT): the model's own forward, with the blocks' tokens captured by hooks for the
     # probes; the attention statistics and the windowed-attention ablation are JiT-specific and not computed
     assert tile is None, 'the windowed-attention ablation is only implemented for JiT'
+    # net.forward, not net(...): with Module.compile, net(...) runs the compiled graph, which (by default, dynamo doesn't
+    # guard on module hooks) can ignore hooks registered after compilation; the eager forward always runs them
     feats, hooks = {}, []
     for b in capture_blocks:
         hooks.append(net.blocks[b - 1].register_forward_hook(lambda m, i, o, b=b: feats.__setitem__(b, o)))
     try:
-        out = net(x, t, y)
+        out = net.forward(x, t, y) if capture_blocks else net(x, t, y)
     finally:
         for h in hooks:
             h.remove()
+    missing = [b for b in capture_blocks if b not in feats]
+    assert not missing, f'blocks {missing} were not captured (their forward hooks did not run)'
     return out, {}, feats
 
 def attn_res_matrix(weights, device):

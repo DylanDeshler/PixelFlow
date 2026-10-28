@@ -713,6 +713,66 @@ if HAVE_TRITON:
         _store_tile(DCOEF, t, 2, n, offs_n, acc2)
         _store_dg(DG, t, gmx, gmy, ghx, ghy, gth)
 
+    @triton.jit
+    def _encode_dx_kernel(GC, G, NCOUNT, DX, K, Hh, R, n, BLOCK_P: tl.constexpr, BLOCK_N: tl.constexpr, PREC: tl.constexpr):
+        # the encoder's input gradient (only for diagnostics: training never differentiates w.r.t. the noisy input):
+        # dx[c, p] += sum_{q,a} G_c psi_q(v) psi_a(u) / sqrt(N) at each frame pixel, at its (reflected) image position
+        t = tl.program_id(0)
+        b = t // K
+        offs_n = tl.arange(0, BLOCK_N)
+        valid_n = offs_n < n
+        freq = offs_n.to(tl.float32)
+        sn = tl.where(offs_n == 0, 1.0, 1.4142135623730951)
+        rx, ry = _encode_radii(G, t, R)
+        Wx = 2 * rx + 1
+        P = Wx * (2 * ry + 1)
+        sc = 1.0 / tl.sqrt(tl.load(NCOUNT + t))
+        g0 = _load_tile(GC, t, 0, n, offs_n) * sc
+        g1 = _load_tile(GC, t, 1, n, offs_n) * sc
+        g2 = _load_tile(GC, t, 2, n, offs_n) * sc
+        base = DX + b * 3 * Hh * Hh
+        for l0 in range(0, P, BLOCK_P):
+            l = l0 + tl.arange(0, BLOCK_P)
+            u, v, ix, iy, hx, hy, c, s = _frame(t, l, Wx, rx, ry, G)
+            m = (l < P) & (tl.abs(u) < 1.0) & (tl.abs(v) < 1.0)
+            off = _reflect(iy, Hh) * Hh + _reflect(ix, Hh)
+            pu = _basis_tile(u, freq, sn, valid_n); pv = _basis_tile(v, freq, sn, valid_n)
+            tl.atomic_add(base + off, tl.sum(_mm(pv, g0, PREC) * pu, axis=1), mask=m)
+            tl.atomic_add(base + Hh * Hh + off, tl.sum(_mm(pv, g1, PREC) * pu, axis=1), mask=m)
+            tl.atomic_add(base + 2 * Hh * Hh + off, tl.sum(_mm(pv, g2, PREC) * pu, axis=1), mask=m)
+
+    @triton.jit
+    def _encode_dx_axis_kernel(GC, G, NCOUNT, DX, K, Hh, R, n, BLOCK_Y: tl.constexpr, BLOCK_X: tl.constexpr,
+                               BLOCK_N: tl.constexpr, PREC: tl.constexpr):
+        # the same for axis-aligned frames: a tile's gradient is psi(v) G_c psi(u)^T / sqrt(N), masks in the 1D bases
+        t = tl.program_id(0)
+        b = t // K
+        offs_n = tl.arange(0, BLOCK_N)
+        valid_n = offs_n < n
+        freq = offs_n.to(tl.float32)
+        sn = tl.where(offs_n == 0, 1.0, 1.4142135623730951)
+        rx, ry = _encode_radii(G, t, R)
+        sc = 1.0 / tl.sqrt(tl.load(NCOUNT + t))
+        g0 = _load_tile(GC, t, 0, n, offs_n) * sc
+        g1 = _load_tile(GC, t, 1, n, offs_n) * sc
+        g2 = _load_tile(GC, t, 2, n, offs_n) * sc
+        base = DX + b * 3 * Hh * Hh
+        for y0 in range(0, 2 * ry + 1, BLOCK_Y):
+            iy, v, ok_y = _axis(t, y0 - ry + tl.arange(0, BLOCK_Y), ry, G, 1)
+            my = ok_y & (tl.abs(v) < 1.0)
+            pv = tl.where(my[:, None], _basis_tile(v, freq, sn, valid_n), 0.0)
+            a0 = _mm(pv, g0, PREC); a1 = _mm(pv, g1, PREC); a2 = _mm(pv, g2, PREC)
+            row = _reflect(iy, Hh) * Hh
+            for x0 in range(0, 2 * rx + 1, BLOCK_X):
+                ix, u, ok_x = _axis(t, x0 - rx + tl.arange(0, BLOCK_X), rx, G, 0)
+                mx = ok_x & (tl.abs(u) < 1.0)
+                put = tl.trans(tl.where(mx[:, None], _basis_tile(u, freq, sn, valid_n), 0.0))
+                off = row[:, None] + _reflect(ix, Hh)[None, :]
+                m2 = my[:, None] & mx[None, :]
+                tl.atomic_add(base + off, _mm(a0, put, PREC), mask=m2)
+                tl.atomic_add(base + Hh * Hh + off, _mm(a1, put, PREC), mask=m2)
+                tl.atomic_add(base + 2 * Hh * Hh + off, _mm(a2, put, PREC), mask=m2)
+
     # launch configurations per kernel (L40S sweeps at scale range 3; small blocks and few warps keep the basis tiles in
     # registers): rotated frames, pixels per block; axis-aligned frames, tile rows and columns
     CONFIGS = {
@@ -720,6 +780,7 @@ if HAVE_TRITON:
         ('rot', 'render'): dict(BLOCK_P=32, num_warps=2), ('rot', 'render_bwd'): dict(BLOCK_P=16, num_warps=2),
         ('axis', 'encode'): dict(BLOCK_Y=16, BLOCK_X=16, num_warps=2), ('axis', 'encode_bwd'): dict(BLOCK_Y=16, BLOCK_X=16, num_warps=2),
         ('axis', 'render'): dict(BLOCK_Y=16, BLOCK_X=32, num_warps=4), ('axis', 'render_bwd'): dict(BLOCK_Y=16, BLOCK_X=16, num_warps=2),
+        ('rot', 'encode_dx'): dict(BLOCK_P=32, num_warps=2), ('axis', 'encode_dx'): dict(BLOCK_Y=16, BLOCK_X=32, num_warps=4),
     }
 
     def _bn(n):
@@ -758,6 +819,20 @@ if HAVE_TRITON:
     def _(x, geom, gcoef, N, K, n, W, axis):
         return geom.new_empty((geom.shape[0], 5), dtype=torch.float32)
 
+    @torch.library.custom_op('gaussjit::encode_dx', mutates_args=())
+    def encode_dx_op(geom: torch.Tensor, gcoef: torch.Tensor, N: torch.Tensor, B: int, Hh: int, W: int, axis: bool) -> torch.Tensor:
+        geom = geom.float().contiguous()
+        T, n = geom.shape[0], gcoef.shape[-1]
+        dx = torch.zeros(B, 3, Hh, Hh, device=geom.device, dtype=torch.float32)
+        kernel = _encode_dx_axis_kernel if axis else _encode_dx_kernel
+        kernel[(T,)](gcoef.float().contiguous(), geom, N, dx, T // B, Hh, (W - 1) // 2, n, BLOCK_N=_bn(n), PREC=PRECISION,
+                     **_blocks(axis, 'encode_dx'))
+        return dx
+
+    @encode_dx_op.register_fake
+    def _(geom, gcoef, N, B, Hh, W, axis):
+        return geom.new_empty((B, 3, Hh, Hh), dtype=torch.float32)
+
     def _encode_setup(ctx, inputs, output):
         x, geom, K, n, W, axis = inputs
         ctx.save_for_backward(x, geom, output[1])
@@ -765,7 +840,10 @@ if HAVE_TRITON:
 
     def _encode_backward(ctx, gcoef, gN):
         x, geom, N = ctx.saved_tensors
-        return None, encode_bwd_op(x, geom, gcoef, N, ctx.K, ctx.n, ctx.W, ctx.axis), None, None, None, None
+        dg = encode_bwd_op(x, geom, gcoef, N, ctx.K, ctx.n, ctx.W, ctx.axis) if ctx.needs_input_grad[1] else None
+        # the input's gradient only when asked for (diagnostics such as the input sensitivity; training's input is constant)
+        dx = encode_dx_op(geom, gcoef, N, x.shape[0], x.shape[-1], ctx.W, ctx.axis).to(x.dtype) if ctx.needs_input_grad[0] else None
+        return dx, dg, None, None, None, None
 
     encode_op.register_autograd(_encode_backward, setup_context=_encode_setup)
 
@@ -913,6 +991,8 @@ if __name__ == '__main__':
         cr, Nr = ref_encode(x_img, geom, K_, n, Wd)
         print(f'encode {tag}: N match', torch.equal(Nk, Nr), end=' | ')
         check(f'encode {tag}', ck, cr, (geom,))
+        xg = x_img.clone().requires_grad_(True)
+        check(f'encode {tag} (input grad)', encode_op(xg, geom, K_, n, Wd, axis)[0], ref_encode(xg, geom, K_, n, Wd)[0], (xg,))
         cf = torch.randn(B_ * K_, 3, n, n, device=dev, requires_grad=True)
         nk, dk = render_op(cf, geom, B_, Hh, Wd, 0.3, r_own, axis)
         nr, dr = ref_render(cf, geom, B_, Hh, Wd, 0.3, r_own)
