@@ -504,7 +504,21 @@ oriented, scaled patches (64 at 128px for `GaussJiT-B/16`).
   only by the denoising loss.
   - Offsets are bounded to ±0.25 of the spacing and scales to ×1.33^±1 per axis.
   - Frames are axis-aligned by default. This keeps the basis separable, so encoding and decoding are two small matrix
-    multiplies per token. `--gauss_max_rotation=0.785` allows ±45° rotation, at about 2.5× the step cost.
+    multiplies per token. `--gauss_max_rotation=0.785` allows ±45° rotation. On CUDA, rotated frames use fused Triton
+    kernels (`gauss_kernels.py`), which evaluate the basis in registers. They're registered as custom ops, so
+    `torch.compile` fuses everything around them.
+
+  Measured on an L40S (batch 128, 128px, bf16, compiled, forward and backward):
+
+  | model | step | img/s | peak memory |
+  |---|---|---|---|
+  | JiT-B/16 | 62.5 ms | 2050 | 4.9 GB |
+  | GaussJiT-B/16, axis-aligned | 77.1 ms | 1659 | 5.7 GB |
+  | GaussJiT-B/16, rotated, fused kernels | 97.3 ms | 1315 | 6.4 GB |
+  | GaussJiT-B/16, rotated, PyTorch path | 288.1 ms | 444 | 10.9 GB |
+
+  `python gauss_kernels.py` checks the kernels against PyTorch references. Errors are about 1e-3 on GPU (TF32 matrix
+  multiplies, like the rest of the bf16 model) and about 1e-7 under `TRITON_INTERPRET=1` on CPU.
   - The placer's last layer is zero-initialized, so training starts from a regular grid of overlapping square frames,
     1.5× the spacing.
 - **Tokens are continuous functions,** on a cosine basis over each frame, so no pixel is ever resampled. There's no
@@ -532,8 +546,8 @@ The presets use `bottleneck_dim=288`, which keeps JiT's 6× compression of a tok
 channel) has 2.25× a 16px patch's values, and 128 × 2.25 = 288. If you change `--gauss_extent` or `--gauss_basis`, rescale it the same
 way.
 
-Saved activations are about 20% above JiT-B/16 in fp32, and more under bf16, because the geometry and rendering stay in
-fp32. Use `--gradient_accumulation_steps` if the batch doesn't fit.
+The input and output layers run in fp32 for precision, chunked and recomputed in the backward pass (PyTorch path) or inside
+the kernels (fused path). Peak memory is in the table above.
 
 ## PixelDiT baseline
 

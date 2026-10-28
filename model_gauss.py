@@ -29,7 +29,8 @@ Both are computed over a fixed window of pixels around each token, in chunks of 
 (activation checkpointing), so the pixel x basis intermediates are never stored. Axis-aligned frames (max_rotation = 0, the
 default: tokens still shift and scale each axis independently) make the basis separable, psi(v_y) psi(u_x), so encoding and
 decoding are two small matmuls per token (as a 2D DCT) instead of a basis evaluation at every pixel of the window: ~2.5x
-cheaper per training step than with rotation.
+cheaper per training step than with rotation (in PyTorch; on CUDA, rotated frames use the fused Triton kernels in
+gauss_kernels.py, which evaluate the basis in registers instead of storing it).
 Positions: the footprint-integrated sin-cos and RoPE at the continuous centres (in anchor units, detached: geometry is
 learned through the sampling and the blending), a learned shape embedding of (log scales, rotation), and the area
 attention bias (log of the frame's area relative to the anchor cell).
@@ -41,8 +42,31 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import gauss_kernels
 from model_jit import TimestepEmbedder, LabelEmbedder, FinalLayer, AttnResState, make_norm
-from model_quadtree import QuadBlock, TokenRope, integrated_sincos, rope_tables
+from model_quadtree import QuadBlock, TokenRope
+
+
+# positions at continuous centres, recomputed every forward (the tokens move), on the inputs' device: model_quadtree's
+# integrated_sincos / rope_tables, which build their tables once at construction on the CPU
+def integrated_sincos(dim, cy, cx, width):
+    omega = 1.0 / 10000 ** (torch.arange(dim // 4, device=cy.device, dtype=torch.float32) / (dim // 4))
+    out = []
+    for c in (cy, cx):
+        ang = c.float()[:, None] * omega[None]
+        damp = torch.sinc(width.float()[:, None] * omega[None] / 2 / math.pi)
+        out += [torch.sin(ang) * damp, torch.cos(ang) * damp]
+    return torch.cat(out, dim=1)
+
+def rope_tables(head_dim, cy, cx, width, theta=10000):
+    half = head_dim // 2
+    freqs = 1.0 / (theta ** (torch.arange(0, half, 2, device=cy.device)[:half // 2].float() / half))
+    cos, sin = [], []
+    for c in (cy, cx):
+        ang = c.float()[:, None] * freqs[None]
+        cos.append(torch.cos(ang).repeat_interleave(2, dim=1))
+        sin.append(torch.sin(ang).repeat_interleave(2, dim=1))
+    return torch.cat(cos, dim=1), torch.cat(sin, dim=1)
 
 
 class CoefEmbed(nn.Module):
@@ -88,7 +112,7 @@ class GaussJiT(nn.Module):
                  attn_drop=0.0, proj_drop=0.0, num_classes=1000, bottleneck_dim=128, attn_res='none', attn_res_block_size=0,
                  adaln_single=False, layernorm=False, extent=0.75, basis=0, max_offset=0.25, scale_range=1.33,
                  max_rotation=0.0, sigma=0.3, placer_width=64, placer_depth=2, area_bias=True, shape_embed=True,
-                 chunks=8, in_context_len=0, in_context_start=0, family='gauss'):
+                 chunks=8, fused=True, in_context_len=0, in_context_start=0, family='gauss'):
         super().__init__()
         assert in_context_len == 0, 'GaussJiT has no in-context class tokens'
         assert attn_res in ('none', 'full', 'block')
@@ -104,6 +128,7 @@ class GaussJiT(nn.Module):
         self.grid = input_size // patch_size
         self.tokens = self.grid ** 2
         self.area_bias, self.sigma, self.chunks = area_bias, sigma, chunks
+        self.fused = fused # rotated frames: Triton kernels (gauss_kernels.py) when on CUDA, else the chunked PyTorch path
         # pixel windows around each token (whole pixels around floor(mu)): the encoder's covers the largest rotated frame;
         # the decoder's reaches where the Gaussian weight falls to 1e-3 of its peak, and always contains the pixel's own
         # anchor cell (so every pixel has positive weight)
@@ -312,10 +337,41 @@ class GaussJiT(nn.Module):
                 outs.append(fn(shared, *part))
         return outs
 
+    def _encode_fused(self, x_flat, mu, h, theta):
+        # rotated frames on CUDA: the per-pixel basis evaluated inside Triton kernels (gauss_kernels.project), never stored
+        B, C = x_flat.shape[:2]
+        K, n = mu.shape[1], self.basis_n
+        idx, _, u, v = self.window_coords(mu, h, theta, self.offsets_enc, reflect=True)
+        m = ((u.abs() < 1) & (v.abs() < 1)).float()
+        P = idx.shape[2]
+        f = x_flat.gather(2, idx.view(B, 1, K * P).expand(B, C, -1)).view(B, C, K, P).transpose(1, 2) * m[:, :, None]
+        scale = m.sum(-1).clamp_min(1).rsqrt()
+        coef = gauss_kernels.project(f.reshape(B * K, C, P), u.reshape(B * K, P), v.reshape(B * K, P), scale.reshape(-1), n)
+        return coef.view(B, K, C, n, n)
+
+    def _render_fused(self, coef, mu, h, theta):
+        # rotated frames on CUDA: each token's values at its window's pixels from gauss_kernels.evaluate, Gaussian-blended
+        B, K, C, n, _ = coef.shape
+        H = self.input_size
+        idx, inside, u, v = self.window_coords(mu, h, theta, self.offsets_dec)
+        P = idx.shape[2]
+        w = torch.exp(-(u ** 2 + v ** 2) / (2 * self.sigma ** 2)) * inside.float()
+        vals = gauss_kernels.evaluate(coef.reshape(B * K, C, n, n), u.reshape(B * K, P), v.reshape(B * K, P),
+                                      torch.full((B * K,), 1.0 / n, device=coef.device)).view(B, K, C, P)
+        flat = idx.reshape(B, 1, K * P)
+        num = torch.zeros(B, C, H * H, device=coef.device).scatter_add_(2, flat.expand(B, C, -1), (vals * w[:, :, None]).transpose(1, 2).reshape(B, C, -1))
+        den = torch.zeros(B, 1, H * H, device=coef.device).scatter_add_(2, flat, w.reshape(B, 1, -1))
+        return (num / den.clamp_min(1e-30)).view(B, C, H, H)
+
+    def use_fused(self, device):
+        return not self.separable and self.fused and gauss_kernels.kernels_available(device)
+
     def encode(self, x, mu, h, theta):
         # basis coefficients of every token [B, K, C * n^2]
         B, C = x.shape[:2]
         x_flat = x.float().reshape(B, C, -1)
+        if self.use_fused(x.device):
+            return self._encode_fused(x_flat, mu, h, theta).reshape(B, mu.shape[1], -1)
         if self.separable:
             coef = torch.cat(self._chunked(lambda xf, m_, h_: self._encode_chunk_sep(xf, m_, h_), x_flat, mu, h), dim=1)
         else:
@@ -326,6 +382,8 @@ class GaussJiT(nn.Module):
         # pixels from every token's coefficients [B, K, C, n, n]: Gaussian-weighted, normalized over tokens
         B, K, C = coef.shape[:3]
         H = self.input_size
+        if self.use_fused(coef.device):
+            return self._render_fused(coef, mu, h, theta)
         if self.separable:
             parts = self._chunked(lambda _, c_, m_, h_: self._decode_chunk_sep(c_, m_, h_), None, coef, mu, h)
         else:
