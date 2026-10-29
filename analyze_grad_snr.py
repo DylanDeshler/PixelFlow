@@ -20,6 +20,13 @@ The Wiener weight of frequency f at noise level t: SNR / (1 + SNR), SNR = t^2 P_
 images' power spectrum (radially averaged) -- the share of that frequency the noisy input still carries. Also reported:
 the cosine between the plain and the weighted loss's expected gradients (how much the weighting turns the update).
 
+Critical batch (mixed_batches > 0): the same estimate for the actual training objective -- every example's t drawn from the
+run's training distribution (logit-normal P_mean, P_std) and labels dropped at its rate, so each mini-batch gradient is a
+training gradient. Its B_noise includes the variance between noise levels that per-level measurements miss, and is the
+critical batch size estimate of McCandlish et al. (B_simple: the noise scale of the raw gradient; the optimizer's
+per-parameter scaling can move the effective value, typically within a small factor). Above it, more samples per step buy
+little per step: the same quality takes more images seen.
+
 Use the raw weights (--ema=0, ckpt.pt): those are what the optimizer steps from. Writes
 {run}/diagnostics/grad_snr_{iter}_{weights}.json and prints tables.
 
@@ -41,12 +48,14 @@ import diagnostics as diag_lib
 
 # -----------------------------------------------------------------------------
 ckpts = '' # comma list of run directories (their ckpt.pt) or checkpoint files
+from_json = '' # comma list of saved grad_snr_*.json files (or run directories: their newest one): print their tables, compute nothing
 data_dir = '' # the prepared dataset the runs trained on (its val/ split is used)
 ema = 0 # 0 = raw weights (what the optimizer steps from; ckpt.pt only), 1 or 2 = that EMA
 ts = '0.1,0.2,0.3,0.45,0.6,0.75,0.9' # noise levels (t = 1 is clean)
 freq_bands = 8
 n_batches = 16 # K independent mini-batches per noise level
 batch_size = 64 # m images per mini-batch (K * m distinct held-out images, the same set at every t)
+mixed_batches = 32 # critical batch: mini-batches of training-distribution gradients (mixed noise levels); 0 skips it
 seed = 0
 device = 'cuda'
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float32'
@@ -56,7 +65,7 @@ exec(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'configurator
 config = {k: globals()[k] for k in config_keys}
 # -----------------------------------------------------------------------------
 
-assert ckpts and data_dir, 'pass --ckpts and --data_dir'
+assert from_json or (ckpts and data_dir), 'pass --ckpts and --data_dir (or --from_json)'
 device_type = 'cuda' if 'cuda' in device else 'cpu'
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16}[dtype]
 ctx = nullcontext() if (device_type == 'cpu' or dtype == 'float32') else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
@@ -67,13 +76,24 @@ torch.backends.cudnn.allow_tf32 = True
 import torch._functorch.config
 torch._functorch.config.donated_buffer = False
 
-val = MemmapImages(os.path.join(data_dir, 'val'))
-n_img = n_batches * batch_size
-assert n_img <= len(val), f'need {n_img} held-out images, the val split has {len(val)}'
-idx = np.linspace(0, len(val) - 1, n_img).round().astype(np.int64)
-xs_all, ys_all = val.get(idx)
-H = val.img_size
-masks = diag_lib.radial_band_masks(H, freq_bands, device) # [bands, H, H], a partition of the frequencies
+def newest_json(spec):
+    if spec.endswith('.json'):
+        return spec
+    d = os.path.join(spec, 'diagnostics')
+    found = [os.path.join(d, f) for f in os.listdir(d) if f.startswith('grad_snr_') and f.endswith('.json')] if os.path.isdir(d) else []
+    assert found, f'no grad_snr_*.json under {d}'
+    return max(found, key=os.path.getmtime)
+
+if from_json:
+    ckpts = '' # tables only
+else:
+    val = MemmapImages(os.path.join(data_dir, 'val'))
+    n_img = max(n_batches, mixed_batches) * batch_size
+    assert n_img <= len(val), f'need {n_img} held-out images, the val split has {len(val)}'
+    idx = np.linspace(0, len(val) - 1, n_img).round().astype(np.int64)
+    xs_all, ys_all = val.get(idx)
+    H = val.img_size
+    masks = diag_lib.radial_band_masks(H, freq_bands, device) # [bands, H, H], a partition of the frequencies
 t_list = [float(v) for v in ts.split(',') if v]
 weights = f'ema{ema}' if ema else 'raw'
 
@@ -97,8 +117,8 @@ def band_losses(x_pred, x, z, t, t_eps, wiener):
     return per_band, per_band.sum(), (wiener * pw).sum()
 
 
-results = []
-for spec in ckpts.split(','):
+results = [json.load(open(newest_json(s_))) for s_ in from_json.split(',') if s_] if from_json else []
+for spec in [c for c in ckpts.split(',') if c]:
     path = os.path.join(spec, 'ckpt.pt') if os.path.isdir(spec) else spec
     if not os.path.isfile(path):
         raise FileNotFoundError(f'checkpoint not found: {path}')
@@ -164,6 +184,42 @@ for spec in ckpts.split(','):
         r_out['wiener_band_mean'].append(((masks * wiener).sum(dim=(1, 2)) / masks.sum(dim=(1, 2))).tolist())
         del S
         print(f'  t={t_val:.2f} done', flush=True)
+    if mixed_batches > 1:
+        # the training objective's gradient noise: t ~ the run's logit-normal per example, labels dropped at its rate
+        S_h = [torch.zeros(n_par, device=device), torch.zeros(n_par, device=device)]; Q_h = [0.0, 0.0] # two halves of the batches
+        torch.manual_seed(seed + 1)
+        g = torch.Generator(device=device).manual_seed(seed + 1)
+        for k in range(mixed_batches):
+            x, y = xs[k * batch_size:(k + 1) * batch_size], ys[k * batch_size:(k + 1) * batch_size]
+            t = torch.sigmoid(torch.randn(len(x), generator=g, device=device) * denoiser.P_std + denoiser.P_mean).view(-1, 1, 1, 1)
+            drop = torch.rand(len(x), generator=g, device=device) < denoiser.label_drop_prob
+            y = torch.where(drop, torch.full_like(y, denoiser.num_classes), y)
+            e = torch.randn(x.shape, generator=g, device=device) * ns
+            z = t * x + (1 - t) * e
+            with ctx:
+                x_pred = net(z, t.flatten(), y)
+            loss = ((x_pred.float() - x) / (1 - t).clamp_min(t_eps)).pow(2).mean() # the training loss (v-loss), as flow_loss
+            grads = torch.autograd.grad(loss, params, allow_unused=True)
+            v = torch.cat([(gr if gr is not None else torch.zeros_like(p)).reshape(-1).float() for gr, p in zip(grads, params)])
+            S_h[k % 2] += v; Q_h[k % 2] += v.square().sum().item()
+            del grads, v
+        m = batch_size
+        def noise_scale(S, Q, K):
+            s2 = S.square().sum().item()
+            signal = (s2 - Q) / (K * (K - 1))
+            noise = (Q - s2 / K) / (K - 1)
+            return (m * noise / signal if signal > 0 else float('inf')), signal, noise
+        K = mixed_batches
+        B, signal, noise = noise_scale(S_h[0] + S_h[1], Q_h[0] + Q_h[1], K)
+        # uncertainty: the same estimate on each half of the batches (two independent estimates)
+        halves = [noise_scale(S_h[i], Q_h[i], len(range(i, K, 2)))[0] for i in (0, 1)]
+        r_out['critical_batch'] = {'B_noise': B, 'B_noise_halves': halves, 'signal': signal, 'noise_per_batch': noise,
+                                   'mini_batch': m, 'batches': K, 'P_mean': denoiser.P_mean, 'P_std': denoiser.P_std,
+                                   'frac_at_B': signal / (signal + noise * m / train_batch) if signal > 0 else 0.0}
+        del S_h
+        cb = r_out['critical_batch']
+        print(f"  critical batch (training objective, mixed noise levels): B_noise {cb['B_noise']:.0f} (halves {halves[0]:.0f} / {halves[1]:.0f}) "
+              f"vs training batch {train_batch} (signal fraction at the training batch {cb['frac_at_B']:.2f})", flush=True)
     out = os.path.join(os.path.dirname(os.path.abspath(path)), 'diagnostics')
     os.makedirs(out, exist_ok=True)
     with open(os.path.join(out, f'grad_snr_{it}_{weights}.json'), 'w') as f:
@@ -178,6 +234,7 @@ for spec in ckpts.split(','):
 
 fmt_B = lambda v: 'inf' if v == float('inf') else (f'{v:.0f}' if v >= 10 else f'{v:.1f}')
 for r in results:
+    freq_bands = len(r['names']) - 2
     print(f"\n=== {r['run']} (iter {r['iter']}, {r['weights']} weights; training batch {r['train_batch']})")
     head = ''.join(f'{nm:>9}' for nm in r['names'])
     for title, key, fmt in (('gradient noise scale B_noise (batch where noise = signal; >> training batch: noise-dominated)', 'B_noise', fmt_B),
@@ -185,6 +242,11 @@ for r in results:
         print(f'\n{title}\n{"t":>6}{head}')
         for t_val, row in zip(r['t'], r[key]):
             print(f'{t_val:>6.2f}' + ''.join(f'{fmt(v):>9}' for v in row))
+    if r.get('critical_batch'):
+        cb = r['critical_batch']
+        print(f"\ncritical batch (training objective: t ~ logit-normal({cb['P_mean']}, {cb['P_std']}), {cb['batches']} batches of {cb['mini_batch']}): "
+              f"B_noise {cb['B_noise']:.0f} (halves {cb['B_noise_halves'][0]:.0f} / {cb['B_noise_halves'][1]:.0f}) vs training batch {r['train_batch']}; "
+              f"signal fraction at the training batch {cb['frac_at_B']:.2f}")
     print(f'\nloss share by band, mean Wiener weight by band, and cos(plain, Wiener-weighted expected gradient)')
     print(f'{"t":>6}' + ''.join(f'{"b" + str(b):>7}' for b in range(freq_bands)) + ' |' + ''.join(f'{"w" + str(b):>6}' for b in range(freq_bands)) + '    cos')
     for i, t_val in enumerate(r['t']):

@@ -12,7 +12,9 @@ already done are skipped on a rerun (delete their entry, or pass --redo=step1,st
   warmup   a short training run at the starting point, with the loss weighting being calibrated (train_jit.py)
   snr      gradient signal vs noise per noise level on the warm-up checkpoint's raw weights (analyze_grad_snr.py): which
            noise levels give the optimizer usable gradients at the training batch. Reported, and used to flag sweep
-           candidates that put much of their training on noise-dominated levels
+           candidates that put much of their training on noise-dominated levels. Also the critical batch size (the
+           training objective's gradient noise scale), reported next to the training batch: a batch well above it spends
+           images for little per-step gain. Not applied automatically (a different batch needs its own lr and a test)
   sweep    short runs at sweep_points P_mean values across the bracket around the starting point (same budget each),
            judged on FID -- the final arbiter, since the spectrum only brackets and the gradient signal isn't FID
   sampler  inference only (eval_jit.py), on the best sweep run: time schedules and samplers, judged on FID
@@ -177,12 +179,17 @@ if should_run('snr'):
         col = g['names'].index('wiener' if loss_freq_weight == 'wiener' else 'plain')
         frac = [row[col] for row in g['frac_at_B']]
         state['snr'] = {'json': path, 't': g['t'], 'signal_fraction': frac, 'B_noise': [row[col] for row in g['B_noise']],
-                        'loss': g['names'][col], 'start_noisy_mass': noisy_mass(start_mean, start_std, g['t'], frac)}
+                        'loss': g['names'][col], 'start_noisy_mass': noisy_mass(start_mean, start_std, g['t'], frac),
+                        'critical_batch': g.get('critical_batch'), 'train_batch': g.get('train_batch')}
         save()
         print(f"\ngradient signal fraction at the training batch, {g['names'][col]} loss (noise-dominated below {noisy_fraction}):")
         for t, f_, b in zip(g['t'], frac, state['snr']['B_noise']):
             print(f"  t={t:.3f} (logit {logit(t):+.2f}): {f_:.2f}  (B_noise {b:.0f})")
         print(f"starting point puts {state['snr']['start_noisy_mass']:.0%} of training on noise-dominated levels")
+        cb = g.get('critical_batch')
+        if cb:
+            print(f"critical batch (training objective's gradient noise scale): {cb['B_noise']:.0f} (halves {cb['B_noise_halves'][0]:.0f} / "
+                  f"{cb['B_noise_halves'][1]:.0f}) vs training batch {g['train_batch']}")
 
 # -----------------------------------------------------------------------------
 # 4. P_mean sweep, judged on FID
@@ -250,3 +257,9 @@ if not dry_run:
     state['recommended_flags'] = flags
     save()
     print(f"\n{'calibrated' if best else 'starting-point'} settings for {dataset} (state: {state_path}):\n  {' '.join(flags)}")
+    cb = (state.get('snr') or {}).get('critical_batch')
+    if cb:
+        tb = state['snr'].get('train_batch')
+        note = ' -- the batch is well above it: a smaller batch (with more steps) may reach the same quality on fewer images' \
+            if tb and cb['B_noise'] < tb / 2 else ''
+        print(f"  critical batch estimate {cb['B_noise']:.0f} (training batch {tb}){note}")
