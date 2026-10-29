@@ -560,16 +560,27 @@ python train_jit.py config/jit_in1k_128.py config/model_gaussjit_b16.py --optimi
 Options: `--gauss_max_offset`, `--gauss_scale_range`, `--gauss_max_rotation`, `--gauss_extent`, `--gauss_basis`, `--gauss_sigma`,
 `--gauss_placer`, `--gauss_placer_width/depth/grid_depth`, `--gauss_area_bias`, `--gauss_shape_embed`.
 
-Two options decide whether the placer can learn token shapes (CPU tests in which only the placer trains, on images that
-vary along one axis):
-- `--gauss_sigma`: the blending width in frame units. At the default 0.3 the blend is nearly a hard partition, and the
-  shape gradient is dominated by terms from ownership boundaries that mostly cancel. In those tests, frames followed the
-  content's axis only from about 0.5 up. Larger values blur more across tokens and enlarge each token's render box (radius
-  ∝ σ). 0.5 is the suggested starting point.
+For ablations, `--gauss_placer=none` keeps every token on its anchor-grid frame, and `--gauss_decoder_extent` /
+`--gauss_decoder_basis` give the decoder its own frame size and basis. The encoder at `--gauss_extent=0.5` with a 16² basis is
+JiT's 16px patch embedding up to an orthonormal transform (the DCT), so `--gauss_placer=none --gauss_extent=0.5
+--gauss_decoder_extent=0.75 --bottleneck_dim=128` is JiT's input side with Gaussian-blended 24px outputs (24² basis, the same
+output size as `--head_overlap=4`).
+
+Options that affect whether the placer learns token shapes:
+- `--gauss_sigma`: the blending width in frame units. Larger values blur more across tokens and enlarge each token's
+  render box (radius ∝ σ). Small CPU tests are mixed. With an exact per-token decoder and capacity-limited tokens, shapes
+  were learned equally at 0.3 and 0.5. An earlier test that favoured 0.5 used an approximate decoder and was confounded.
 - `--gauss_scale_jitter`: training-only noise (std, in log-scale) on each token's scales, within the bounds. When content
   is finer than a token's basis can represent, the loss is flat in its scale and there's no gradient toward a better
-  shape; jitter smooths the loss over nearby scales. 0.1–0.15 worked in tests; 0.3 overshoots. Sampling and the logged
-  geometry are unaffected.
+  shape; jitter smooths the loss over nearby scales. 0.1–0.15 worked on a free-geometry test; 0.3 overshoots. Sampling
+  and the logged geometry are unaffected.
+- `--gauss_encoder_window=gauss` (experimental): the encoder weights each frame's pixels by exp(−(u² + v²)/2σ_e²), cut at the
+  frame edge (`--gauss_encoder_sigma`, default `--gauss_sigma`), instead of uniformly. It's smooth in the geometry, so the
+  encoder also sends shape gradients. In CPU tests it didn't clearly help (better or worse depending on σ).
+
+In those CPU tests, the decoder mattered most. Shapes were learned with an exact per-token decoder. With a learned linear
+map shared across tokens (trained jointly), they weren't. Neither jitter nor a faster placer fixed that. Whether the full
+model, whose decoder sees each token's shape, behaves like either case is what the toy dataset is for.
 
 The presets use `bottleneck_dim=288`, which keeps JiT's 6× compression of a token's input: the default basis (24×24 per
 channel) has 2.25× a 16px patch's values, and 128 × 2.25 = 288. If you change `--gauss_extent` or `--gauss_basis`, rescale it the same
@@ -784,3 +795,33 @@ python noise_calibration.py --data=clips.npy --quant_bits=16 --noise_scale=1.0  
   ImageNet at 256px they give P_mean -3.0 (coarse) and +4.3 (fine), and JiT's tuned -0.8 sits ~30% of the way between them.
   Sweep inside that bracket and judge on samples (training losses aren't comparable across noise settings). The per-noise-level
   held-out loss diagnostic shows whether training mass is landing where the loss is still reducible.
+
+### From scratch: `calibrate.py`
+
+For a new dataset with no known-good settings, `calibrate.py` runs the whole procedure and records it in
+`{calib_dir}/calibration.json`. It's resumable: finished steps are skipped on a rerun.
+
+1. **`stats`** (data only): the bracket above, plus a starting point at JiT's relative position in it. That position is a
+   prior from one known-good case; the next steps check it.
+2. **`warmup`**: a short training run at the starting point.
+3. **`snr`**: gradient signal vs noise per noise level on the warm-up checkpoint (`analyze_grad_snr.py`), to see which
+   levels give usable gradients at the training batch. Sweep candidates that put a lot of training on noise-dominated
+   levels are flagged.
+4. **`sweep`**: short runs at a few P_mean values across the bracket, judged on FID.
+5. **`sampler`**: an inference-only sweep of time schedules and samplers on the best run.
+
+```bash
+python calibrate.py --data_dir=/data/toy_gauss_128 --train_args="config/toy_gauss_128.py --optimizer_type=muon"
+python calibrate.py ... --loss_freq_weight=wiener --loss_t_weight=learned --calib_dir=runs/calibration/toy_wiener_learned
+python calibrate.py ... --dry_run=True     # the data statistics, and the commands the rest would run
+```
+
+It calibrates the loss weighting it's given (`--loss_freq_weight`, `--loss_t_weight`, implemented in `loss_weighting.py`).
+To compare weightings, run it once per combination with its own `--calib_dir`:
+- `--loss_freq_weight=wiener`: within each noise level, the residual's frequencies are weighted by their Wiener gain
+  (the share the noisy input still carries), with each level rescaled to the plain loss's running mean. The weighting only
+  redistributes effort among frequencies; the t distribution still sets how much each level counts. The same minimizer
+  (the posterior mean), so only learning efficiency changes. The per-level factors are capped at 100 and logged.
+- `--loss_t_weight=learned`: EDM2's learned per-noise-level uncertainty weight. It normalizes each level's loss scale;
+  the t distribution still sets the allocation. It trains at `--loss_weight_lr_mult` × the lr (default 50), since at the
+  model's lr it takes ~10k steps to reach its targets.

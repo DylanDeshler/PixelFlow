@@ -76,7 +76,7 @@ class TokenMasker(nn.Module):
         m = mask.view(-1, 1, g, g).float()
         return m.repeat_interleave(self.patch_size, dim=2).repeat_interleave(self.patch_size, dim=3)
 
-def flow_loss(denoiser, x, labels, masker=None, mask=None, weighting='effective_t', return_aux=False, parts=None):
+def flow_loss(denoiser, x, labels, masker=None, mask=None, weighting='effective_t', return_aux=False, parts=None, weighter=None):
     """
     JiT's training loss (Denoiser.forward: label dropout, logit-normal t, x-prediction, v-loss), with optional token
     masking. With mask=None this is numerically the same computation as denoiser(x, labels).
@@ -84,7 +84,9 @@ def flow_loss(denoiser, x, labels, masker=None, mask=None, weighting='effective_
     that need the same conditioning (PixelREPA's adapter).
     Skip pathway with skip_stop_grad, in training: the loss is L(with skip) + L(trunk only), the same objective on both
     predictions (see JiT.forward's return_trunk). parts: optional dict, filled with the two terms for logging.
+    weighter: optional loss_weighting.LossWeighting (frequency / learned per-noise-level weighting of the residual).
     """
+    assert weighter is None or mask is None, 'loss weighting is not combined with token masking'
     labels = denoiser.drop_labels(labels) if denoiser.training else labels
     t = denoiser.sample_t(x.size(0), device=x.device).view(-1, *([1] * (x.ndim - 1)))
     e = torch.randn_like(x) * denoiser.noise_scale
@@ -99,6 +101,8 @@ def flow_loss(denoiser, x, labels, masker=None, mask=None, weighting='effective_
 
     def v_loss(x_pred):
         # v - v_pred = (x - x_pred) / (1 - t), with JiT's clamp
+        if weighter is not None:
+            return weighter((x - x_pred) / (1 - t).clamp_min(denoiser.t_eps), t.flatten())
         err = ((x - x_pred) / (1 - t).clamp_min(denoiser.t_eps)) ** 2
         if mask is not None and weighting == 'effective_t':
             pm = masker.pixel_mask(mask)

@@ -176,7 +176,7 @@ class GaussJiT(nn.Module):
     def __init__(self, input_size=128, patch_size=16, in_channels=3, hidden_size=768, depth=12, num_heads=12, mlp_ratio=4.0,
                  attn_drop=0.0, proj_drop=0.0, num_classes=1000, bottleneck_dim=128, attn_res='none', attn_res_block_size=0,
                  adaln_single=False, layernorm=False, extent=0.75, basis=0, max_offset=0.25, scale_range=1.33, scale_max=0.0,
-                 max_rotation=0.0, sigma=0.3, placer='conv', placer_width=64, placer_depth=2, placer_grid_depth=2, placer_stride=4, scale_jitter=0.0, area_bias=True, shape_embed=True,
+                 max_rotation=0.0, sigma=0.3, placer='conv', placer_width=64, placer_depth=2, placer_grid_depth=2, placer_stride=4, scale_jitter=0.0, encoder_window='box', encoder_sigma=0.0, decoder_extent=0.0, decoder_basis=0, area_bias=True, shape_embed=True,
                  chunks=8, fused='auto', in_context_len=0, in_context_start=0, family='gauss'):
         super().__init__()
         assert in_context_len == 0, 'GaussJiT has no in-context class tokens'
@@ -191,6 +191,11 @@ class GaussJiT(nn.Module):
         self.extent, self.max_offset, self.scale_range, self.max_rotation = extent, max_offset, scale_range, max_rotation
         self.scale_max = scale_max or scale_range # upper scale bound (the lower one stays 1 / scale_range)
         self.basis_n = basis or int(round(2 * extent * patch_size)) # basis size n per axis: the initial frame's width in pixels
+        # the decoder's frames: the encoder's scaled by decoder_extent / extent (same centres, shapes and rotations), with
+        # their own basis size (default: the decoder frame's width in pixels). The defaults reuse the encoder's
+        self.dec_extent = decoder_extent or extent
+        self.dec_ratio = self.dec_extent / extent
+        self.dec_n = decoder_basis or (int(round(2 * self.dec_extent * patch_size)) if decoder_extent else self.basis_n)
         self.grid = input_size // patch_size
         self.tokens = self.grid ** 2
         self.area_bias, self.sigma, self.chunks = area_bias, sigma, chunks
@@ -206,12 +211,19 @@ class GaussJiT(nn.Module):
         self.window_enc = 2 * math.ceil(h_max * (math.cos(rot) + math.sin(rot))) + 3
         u_cut = gauss_kernels.render_cut(sigma)
         own = max_offset * patch_size * math.sqrt(2) + patch_size / math.sqrt(2) + 1
-        self.window = 2 * math.ceil(max(u_cut * h_max, own)) + 3
+        self.window = 2 * math.ceil(max(u_cut * h_max * self.dec_ratio, own)) + 3
         self.r_own = math.ceil(own) + 1
         # training only: Gaussian noise (std scale_jitter) on each token's per-axis log-scale, within the bounds. Smooths the
         # loss over nearby scales (randomized smoothing), so the placer gets a gradient across plateaus: a frame whose
         # content is finer than its basis can represent has a loss flat in its scale, and only nearby scales see the way out
-        self.scale_jitter = scale_jitter # each token renders within its Gaussian's box (u^2 + v^2 < u_cut^2), at least this far
+        self.scale_jitter = scale_jitter
+        # the encoder's window over a frame: 'box' (every pixel in the frame weighs the same) or 'gauss' (exp(-(u^2 + v^2) /
+        # 2 sigma_e^2), sigma_e = encoder_sigma or sigma, cut at the frame edge): smooth in the geometry, so the encoder too
+        # tells the placer which pixels to take in more or less. Coefficients are normalized by sqrt(sum of squared weights)
+        assert encoder_window in ('box', 'gauss'), f"encoder_window must be 'box' or 'gauss', got {encoder_window}"
+        self.encoder_window = encoder_window
+        sigma_e = encoder_sigma or sigma
+        self.enc_inv2s2 = 1.0 / (2 * sigma_e ** 2) if encoder_window == 'gauss' else 0.0 # each token renders within its Gaussian's box (u^2 + v^2 < u_cut^2), at least this far
 
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = LabelEmbedder(num_classes, hidden_size)
@@ -219,14 +231,17 @@ class GaussJiT(nn.Module):
             self.t_block = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size, bias=True))
         # placer: 'conv' (the original: stride-4 conv, 3x3 blocks, average pooled to the anchors; ~32px receptive field per
         # token) or 'convnext' (ConvNeXtPlacer: whole-image receptive field, position-aware readout of each anchor cell)
-        assert placer in ('conv', 'convnext'), f"placer must be 'conv' or 'convnext', got {placer}"
-        if placer == 'convnext':
+        # 'none': no placer, every token keeps its anchor-grid frame (for ablations: the tokenization without adaptation)
+        assert placer in ('conv', 'convnext', 'none'), f"placer must be 'conv', 'convnext' or 'none', got {placer}"
+        if placer == 'none':
+            self.placer = None
+        elif placer == 'convnext':
             self.placer = ConvNeXtPlacer(in_channels, patch_size, placer_width, placer_depth, placer_grid_depth, hidden_size, placer_stride)
         else:
             assert placer_stride == 4, "placer_stride is a 'convnext' option (the 'conv' placer works at patch_size / 4)"
             self.placer = Placer(in_channels, patch_size, placer_width, placer_depth, hidden_size)
         self.x_embedder = CoefEmbed(self.basis_n, in_channels, bottleneck_dim, hidden_size)
-        self.final_layer = FinalLayer(hidden_size, self.basis_n, in_channels, adaln_single=adaln_single, layernorm=layernorm)
+        self.final_layer = FinalLayer(hidden_size, self.dec_n, in_channels, adaln_single=adaln_single, layernorm=layernorm)
         self.shape_mlp = nn.Sequential(nn.Linear(4, hidden_size), nn.SiLU(), nn.Linear(hidden_size, hidden_size)) if shape_embed else None
         self.blocks = nn.ModuleList([
             QuadBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio,
@@ -244,6 +259,9 @@ class GaussJiT(nn.Module):
         n = self.basis_n
         self.register_buffer('freqs', torch.arange(n, dtype=torch.float32), persistent=False)
         self.register_buffer('basis_scale', torch.cat([torch.ones(1), torch.full((n - 1,), math.sqrt(2))]), persistent=False)
+        nd = self.dec_n
+        self.register_buffer('dec_freqs', torch.arange(nd, dtype=torch.float32), persistent=False)
+        self.register_buffer('dec_basis_scale', torch.cat([torch.ones(1), torch.full((nd - 1,), math.sqrt(2))]), persistent=False)
         for name, W in (('offsets_enc', self.window_enc), ('offsets_dec', self.window)):
             w = torch.arange(W, dtype=torch.float32) - (W - 1) // 2
             wy, wx = torch.meshgrid(w, w, indexing='ij')
@@ -273,11 +291,12 @@ class GaussJiT(nn.Module):
         nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
-        nn.init.constant_(self.placer.head.weight, 0)
-        nn.init.constant_(self.placer.head.bias, 0)
-        for film in self.placer.films:
-            nn.init.constant_(film.weight, 0)
-            nn.init.constant_(film.bias, 0)
+        if self.placer is not None:
+            nn.init.constant_(self.placer.head.weight, 0)
+            nn.init.constant_(self.placer.head.bias, 0)
+            for film in self.placer.films:
+                nn.init.constant_(film.weight, 0)
+                nn.init.constant_(film.bias, 0)
         if self.shape_mlp is not None:
             nn.init.constant_(self.shape_mlp[-1].weight, 0)
             nn.init.constant_(self.shape_mlp[-1].bias, 0)
@@ -304,7 +323,7 @@ class GaussJiT(nn.Module):
         Token frames from the noisy input: centres mu [B, K, 2] (x, y pixels), half-sizes h [B, K, 2], rotations theta [B, K],
         and the bounded log-scales [B, K, 2].
         """
-        raw = self.placer(x, c).float()
+        raw = self.placer(x, c).float() if self.placer is not None else x.new_zeros(x.shape[0], self.tokens, 5, dtype=torch.float32)
         S = self.patch_size
         mu = self.anchors + self.max_offset * S * torch.tanh(raw[..., 0:2])
         ts = torch.tanh(raw[..., 2:4]) # growing and shrinking bounded separately; scale 1 (the anchor grid's frames) at init
@@ -319,6 +338,10 @@ class GaussJiT(nn.Module):
     def basis(self, z):
         # the cosine basis at frame coordinates z [...] -> [..., n]
         return torch.cos(math.pi * self.freqs * (z[..., None] + 1) / 2) * self.basis_scale
+
+    def dec_basis(self, z):
+        # the decoder's cosine basis (dec_n functions) at decoder-frame coordinates z [...] -> [..., dec_n]
+        return torch.cos(math.pi * self.dec_freqs * (z[..., None] + 1) / 2) * self.dec_basis_scale
 
     def window_coords(self, mu, h, theta, offsets, reflect=False):
         # pixel centres in a window around each token [B, k, P, 2], their flat indices [B, k, P], whether they're in the
@@ -340,16 +363,20 @@ class GaussJiT(nn.Module):
         v = (-s * d[..., 0] + c * d[..., 1]) / h[..., 1, None]
         return idx, inside, u, v
 
+    def enc_weight(self, z):
+        # the encoder's window along one frame axis (1 inside the frame for the box); the 2D window is w(u) w(v)
+        return torch.where(z.abs() < 1, torch.exp(-z * z * self.enc_inv2s2), torch.zeros_like(z))
+
     def _encode_chunk(self, x_flat, mu, h, theta):
-        # coefficients [B, k, C, n, n] (rows: v, columns: u) of the pixels inside each token's frame
+        # coefficients [B, k, C, n, n] (rows: v, columns: u) of the pixels inside each token's frame, weighted by the window
         B, C = x_flat.shape[:2]
         idx, _, u, v = self.window_coords(mu, h, theta, self.offsets_enc, reflect=True)
-        m = ((u.abs() < 1) & (v.abs() < 1)).float() # [B, k, P]: every pixel of the frame (reflected past the borders)
+        wu, wv = self.enc_weight(u), self.enc_weight(v) # [B, k, P]: the frame's pixels (reflected past the borders)
         k, P = idx.shape[1], idx.shape[2]
         vals = x_flat.gather(2, idx.view(B, 1, k * P).expand(B, C, -1)).view(B, C, k, P).transpose(1, 2) # [B, k, C, P]
-        pu, pv = self.basis(u) * m[..., None], self.basis(v) # [B, k, P, n]
+        pu, pv = self.basis(u) * wu[..., None], self.basis(v) * wv[..., None] # [B, k, P, n]
         coef = torch.einsum('bkcp,bkpq,bkpa->bkcqa', vals, pv, pu)
-        return coef / m.sum(-1).clamp_min(1).sqrt()[..., None, None, None]
+        return coef / (wu * wv).square().sum(-1).clamp_min(1e-6).sqrt()[..., None, None, None]
 
     def render_radius(self, h, theta):
         # per token, the decoder's box radii around floor(mu) [B, k] (x, y): gauss_kernels.render_radius
@@ -366,7 +393,7 @@ class GaussJiT(nn.Module):
         rx, ry = self.render_radius(h, theta)
         inside = inside & (self.offsets_dec.abs() <= torch.stack([rx, ry], -1)[:, :, None]).all(-1)
         w = torch.exp(-(u ** 2 + v ** 2) / (2 * self.sigma ** 2)) * inside.float() # [B, k, P]
-        vals = torch.einsum('bkcqa,bkpq,bkpa->bkcp', coef, self.basis(v), self.basis(u)) / n # [B, k, C, P]
+        vals = torch.einsum('bkcqa,bkpq,bkpa->bkcp', coef, self.dec_basis(v), self.dec_basis(u)) / n # [B, k, C, P]
         P = idx.shape[2]
         num = torch.zeros(B, C, H * H, device=coef.device).scatter_add_(
             2, idx.view(B, 1, k * P).expand(B, C, -1), (vals * w[:, :, None]).transpose(1, 2).reshape(B, C, k * P))
@@ -393,14 +420,15 @@ class GaussJiT(nn.Module):
     def _encode_chunk_sep(self, x_flat, mu, h):
         B, C = x_flat.shape[:2]
         q, _, z = self.axis_coords(mu, h, self.offsets_enc_1d, reflect=True)
-        m = (z.abs() < 1).float() # [B, k, 2, W]: inside the frame, per axis
+        m = self.enc_weight(z) # [B, k, 2, W]: the window per axis (the frame mask for the box)
         k, W = q.shape[1], q.shape[-1]
         idx = self._block_index(q)
         X = x_flat.gather(2, idx.view(B, 1, -1).expand(B, C, -1)).view(B, C, k, W, W).transpose(1, 2) # [B, k, C, Wy, Wx]
         pu = self.basis(z[:, :, 0]) * m[:, :, 0, :, None] # [B, k, Wx, n]
         pv = self.basis(z[:, :, 1]) * m[:, :, 1, :, None] # [B, k, Wy, n]
         coef = pv.transpose(-1, -2)[:, :, None] @ X @ pu[:, :, None] # [B, k, C, n, n] (rows v, columns u)
-        return coef / (m[:, :, 0].sum(-1) * m[:, :, 1].sum(-1)).clamp_min(1).sqrt()[..., None, None, None]
+        S = m[:, :, 0].square().sum(-1) * m[:, :, 1].square().sum(-1)
+        return coef / S.clamp_min(1e-6).sqrt()[..., None, None, None]
 
     def _decode_chunk_sep(self, coef, mu, h):
         B, k, C, n, _ = coef.shape
@@ -410,7 +438,7 @@ class GaussJiT(nn.Module):
         inside = inside & (self.offsets_dec_1d.abs() <= torch.stack([rx, ry], -1)[..., None])
         W = q.shape[-1]
         g = torch.exp(-z ** 2 / (2 * self.sigma ** 2)) * inside.float() # [B, k, 2, W]: the Gaussian factors per axis
-        vals = self.basis(z[:, :, 1])[:, :, None] @ coef @ self.basis(z[:, :, 0]).transpose(-1, -2)[:, :, None] / n # [B, k, C, Wy, Wx]
+        vals = self.dec_basis(z[:, :, 1])[:, :, None] @ coef @ self.dec_basis(z[:, :, 0]).transpose(-1, -2)[:, :, None] / n # [B, k, C, Wy, Wx]
         w = g[:, :, 1, :, None] * g[:, :, 0, None, :] # [B, k, Wy, Wx]
         idx = self._block_index(q).view(B, 1, -1)
         num = torch.zeros(B, C, H * H, device=coef.device).scatter_add_(
@@ -440,7 +468,7 @@ class GaussJiT(nn.Module):
         B, C = x_flat.shape[:2]
         K, n, H = mu.shape[1], self.basis_n, self.input_size
         geom = torch.cat([mu, h, theta[..., None]], -1).reshape(B * K, 5)
-        coef, _ = gauss_kernels.encode_op(x_flat.view(B, C, H, H), geom, K, n, self.window_enc, self.separable)
+        coef, _ = gauss_kernels.encode_op(x_flat.view(B, C, H, H), geom, K, n, self.window_enc, self.separable, self.enc_inv2s2)
         return coef.view(B, K, C, n, n)
 
     def _render_fused(self, coef, mu, h, theta):
@@ -514,10 +542,10 @@ class GaussJiT(nn.Module):
         for i, block in enumerate(self.blocks):
             hid = block(hid, c_blocks, rope, res=res, index=i)
         out = self.final_layer(hid, c) # [B, K, n^2 * C]: coefficients (rows v, columns u, channels), JiT's patch layout
-        n = self.basis_n
+        n = self.dec_n
         with torch.autocast(device_type=x.device.type, enabled=False):
             coef = out.float().view(B, K, n, n, self.out_channels).permute(0, 1, 4, 2, 3)
-            return self.render(coef, mu, h, theta)
+            return self.render(coef, mu, h * self.dec_ratio, theta) # the decoder's frames
 
     def dense_weights(self, mu, h, theta):
         # every token's blending weight (the Gaussian of its frame coordinates, untruncated) at every pixel [B, K, H, W]
@@ -526,8 +554,8 @@ class GaussJiT(nn.Module):
         py, px = torch.meshgrid(r, r, indexing='ij')
         dx, dy = px - mu[..., 0, None, None], py - mu[..., 1, None, None]
         c, s = torch.cos(theta)[..., None, None], torch.sin(theta)[..., None, None]
-        u = (c * dx + s * dy) / h[..., 0, None, None]
-        v = (-s * dx + c * dy) / h[..., 1, None, None]
+        u = (c * dx + s * dy) / (h[..., 0, None, None] * self.dec_ratio) # h: the encoder's frames; blending uses the decoder's
+        v = (-s * dx + c * dy) / (h[..., 1, None, None] * self.dec_ratio)
         return torch.exp(-(u ** 2 + v ** 2) / (2 * self.sigma ** 2))
 
     def spread_stats(self, h, theta):
@@ -689,7 +717,7 @@ def draw_gaussians(ax, net, image, mu, h, theta, arrow_scale=4.0, contour=2.0):
     anchors = net.anchors.cpu().numpy()
     mu, h, theta = mu.float().cpu().numpy(), h.float().cpu().numpy(), theta.float().cpu().numpy()
     for k in range(mu.shape[0]):
-        e = Ellipse(mu[k] - 0.5, 2 * contour * net.sigma * h[k, 0], 2 * contour * net.sigma * h[k, 1], angle=float(np.degrees(theta[k])),
+        e = Ellipse(mu[k] - 0.5, 2 * contour * net.sigma * net.dec_ratio * h[k, 0], 2 * contour * net.sigma * net.dec_ratio * h[k, 1], angle=float(np.degrees(theta[k])),
                     facecolor=(*cols[k], 0.28), edgecolor=cols[k], linewidth=0.8)
         ax.add_patch(e)
         d = (mu[k] - anchors[k]) * arrow_scale

@@ -35,6 +35,7 @@ from jit_common import build_denoiser, resolve_arch, describe_arch, run_dir, leg
 from fid import InceptionMetrics, load_ref_stats, precision_recall
 from repa import FrozenEncoder, Projector, MaskedTransformerAdapter, BlockCapture, repa_loss, mta_loss
 from masking import TokenMasker, flow_loss
+from loss_weighting import LossWeighting, image_power_spectrum
 from muon import Muon, CombinedOptimizer
 import diagnostics as diag_lib
 import plot_trends
@@ -97,7 +98,11 @@ gauss_max_offset = 0.25 # centre offset bound / patch_size (tanh)
 gauss_scale_range = 1.33 # half-size bounds: extent * patch_size * [1 / scale_range, scale_range] per axis
 gauss_scale_max = 0.0 # > 0: a separate upper bound (frames grow to extent * patch_size * scale_max; the lower bound is unchanged)
 gauss_max_rotation = 0.0 # rotation bound (radians); 0: axis-aligned frames, separable basis (~2.5x cheaper per step than rotating)
-gauss_sigma = 0.3 # blending Gaussian width in frame units (normalized over tokens: every pixel covered); 0.5 lets the placer learn shapes (README)
+gauss_sigma = 0.3 # blending Gaussian width in frame units (normalized over tokens: every pixel covered)
+gauss_encoder_window = 'box' # 'gauss': the encoder weights each frame's pixels by a Gaussian (smooth in the geometry: shape gradients from the encoder too)
+gauss_encoder_sigma = 0.0 # its width in frame units (0: gauss_sigma)
+gauss_decoder_extent = 0.0 # the decoder's frames, half-size / patch_size (0: gauss_extent): e.g. 0.5 encoder (JiT's patches) + 0.75 decoder
+gauss_decoder_basis = 0 # the decoder's basis per axis (0: its frame width in pixels when gauss_decoder_extent is set, else gauss_basis)
 gauss_scale_jitter = 0.0 # training only: std of noise on each token's log-scales (~0.1-0.15: gradients across flat regions of the loss)
 gauss_placer = 'conv' # 'conv': stride-4 conv + 3x3 blocks, average pooled to the anchors (~32px receptive field per token);
                       # 'convnext': ConvNeXt blocks (7x7 depthwise) at stride 4 and on the anchor grid, a linear readout of each anchor cell (whole image)
@@ -147,6 +152,9 @@ P_mean = -0.8
 P_std = 0.8
 t_eps = 5e-2
 noise_scale = 0.0 # 0 -> img_size / 256, JiT's resolution rule (1.0 at 256, 2.0 at 512)
+loss_freq_weight = 'none' # 'wiener': weight the residual's frequencies by their Wiener gain at each noise level, normalized per level (loss_weighting.py)
+loss_t_weight = 'none' # 'learned': EDM2-style learned per-noise-level weight (loss L / e^u(t) + u(t)); the logged loss then includes u
+loss_weight_lr_mult = 50.0 # the learned weight's lr / lr: u(t) must travel to log E[L | t] (~-3..1), too slow at the model's lr
 label_drop_prob = 0.1
 # optimizer
 epochs = 200
@@ -274,7 +282,7 @@ else:
 is_quadtree = model.startswith('QuadJiT')
 is_gauss = model.startswith('GaussJiT')
 GAUSS_FLAGS = dict(extent=gauss_extent, basis=gauss_basis, max_offset=gauss_max_offset, scale_range=gauss_scale_range, scale_max=gauss_scale_max, max_rotation=gauss_max_rotation, sigma=gauss_sigma,
-                   placer=gauss_placer, placer_width=gauss_placer_width, placer_depth=gauss_placer_depth, placer_grid_depth=gauss_placer_grid_depth, placer_stride=gauss_placer_stride, scale_jitter=gauss_scale_jitter, area_bias=gauss_area_bias, shape_embed=gauss_shape_embed,
+                   placer=gauss_placer, placer_width=gauss_placer_width, placer_depth=gauss_placer_depth, placer_grid_depth=gauss_placer_grid_depth, placer_stride=gauss_placer_stride, scale_jitter=gauss_scale_jitter, encoder_window=gauss_encoder_window, encoder_sigma=gauss_encoder_sigma, decoder_extent=gauss_decoder_extent, decoder_basis=gauss_decoder_basis, area_bias=gauss_area_bias, shape_embed=gauss_shape_embed,
                    fused=gauss_fused)
 if is_gauss: # like QuadJiT: the JiT backbone options it needs, none of the input / output paths
     jit_only = dict(attn_res_adaln=not attn_res_adaln, gated_bottleneck=not gated_bottleneck, skip_pathway=not skip_pathway, dcae_stem=not dcae_stem,
@@ -410,7 +418,7 @@ if is_quadtree:
           f"{' / '.join(str(p) for p in denoiser.net.geo.patches)}px patches, router {arch.get('router', 'uniform')}")
 elif is_gauss:
     net_ = denoiser.net
-    print(f"model {model_name}: {sum(p.numel() for p in net_.parameters()) / 1e6:.1f}M params ({sum(p.numel() for p in net_.placer.parameters()) / 1e3:.0f}k "
+    print(f"model {model_name}: {sum(p.numel() for p in net_.parameters()) / 1e6:.1f}M params ({sum(p.numel() for p in net_.placer.parameters()) / 1e3 if net_.placer is not None else 0:.0f}k "
           f"in the placer), {net_.tokens} Gaussian-placed tokens on a {net_.grid}x{net_.grid} anchor grid, {net_.basis_n}^2 cosine basis "
           f"({3 * net_.basis_n ** 2} coefficients) over frames of 2 x {net_.extent:g} x {net_.patch_size}px at init")
 else:
@@ -450,8 +458,14 @@ if mask_ratio > 0:
     if mask_prob == 0:
         print(f"warning: mask_ratio={mask_ratio} but mask_prob=0, so no sample is ever masked; set --mask_prob (e.g. 0.5) to enable masking")
     print(f"token masking: {mask_ratio:.0%} of patches in {mask_prob:.0%} of samples, weighting {mask_weighting}")
+loss_weighter = None
+if loss_freq_weight != 'none' or loss_t_weight != 'none':
+    power = image_power_spectrum(data) if loss_freq_weight == 'wiener' else None
+    loss_weighter = LossWeighting(noise_scale, power, freq=loss_freq_weight, t_weight=loss_t_weight).to(device)
+    print(f"loss weighting: frequencies {loss_freq_weight}, noise levels {loss_t_weight}")
 trainable = list(denoiser.named_parameters()) + (list(projector.named_parameters()) if projector is not None else []) \
     + (list(masker.named_parameters()) if masker is not None else [])
+weighter_params = list(loss_weighter.parameters()) if loss_weighter is not None else [] # their own AdamW group (loss_weight_lr_mult)
 assert optimizer_type in ('adamw', 'muon'), f"optimizer_type must be 'adamw' or 'muon', got {optimizer_type}"
 # with Muon: hidden matrices of the transformer blocks (attention, MLP, adaLN projections) go to Muon; patch embedding,
 # time / class embeddings, output layer, gains, biases (and REPA projector / mask token) stay on AdamW
@@ -503,7 +517,8 @@ for name, p in trainable:
         (no_decay if p.ndim == 1 or name.endswith('.bias') or 'scale_shift_table' in name else decay).append(p)
 # every group stores its peak lr; the schedule scales all of them by the same factor
 adamw = torch.optim.AdamW(
-    [{'params': no_decay, 'weight_decay': 0.0, 'peak_lr': lr}, {'params': decay, 'weight_decay': weight_decay, 'peak_lr': lr}],
+    [{'params': no_decay, 'weight_decay': 0.0, 'peak_lr': lr}, {'params': decay, 'weight_decay': weight_decay, 'peak_lr': lr}]
+    + ([{'params': weighter_params, 'weight_decay': 0.0, 'peak_lr': lr * loss_weight_lr_mult, 'lr': lr * loss_weight_lr_mult}] if weighter_params else []),
     lr=lr, betas=(beta1, beta2), fused=device_type == 'cuda',
 )
 if optimizer_type == 'muon':
@@ -536,6 +551,8 @@ if init_from == 'resume':
         projector.load_state_dict(checkpoint['projector'])
     if masker is not None:
         masker.load_state_dict(checkpoint['masker'])
+    if loss_weighter is not None and checkpoint.get('loss_weighting') is not None:
+        loss_weighter.load_state_dict(checkpoint['loss_weighting'])
     optimizer.load_state_dict(checkpoint['optimizer'])
     iter_num = checkpoint['iter_num']
     best_fid = checkpoint['best_fid']
@@ -893,6 +910,7 @@ def save_checkpoint():
         'model_ema2': ema2,
         'projector': projector.state_dict() if projector is not None else None,
         'masker': masker.state_dict() if masker is not None else None,
+        'loss_weighting': loss_weighter.state_dict() if loss_weighter is not None else None,
         'optimizer': optimizer.state_dict(),
         'denoiser_args': denoiser_args,
         'iter_num': iter_num,
@@ -959,6 +977,10 @@ while True:
         extra = ''.join(f", {k.split('/')[-1]} {eval_log[k]:.3f}" for k in ('val/precision', 'val/recall', 'val/fid_raw', 'mem/nn_ratio') if k in eval_log)
         loss_str = ', '.join(f"{k.split('/')[-1].replace('_', ' ')} {eval_log[k]:.4f}" for k in ('eval/train_loss', 'eval/val_loss') if k in eval_log)
         print(f"iter {iter_num} (epoch {iter_num / iters_per_epoch:.2f}): {loss_str}, FID-{fid_num_images / 1000:g}k {fid:.2f}, IS {eval_log['val/is']:.1f} (cfg {fid_cfg}){extra}")
+        if loss_weighter is not None: # the learned per-level weights / per-level normalization factors
+            lw = loss_weighter.summary()
+            eval_log.update({f'loss_weighting/{k}': v for k, v in lw.items()})
+            print('loss weighting: ' + ', '.join(f'{k} {v:.3g}' for k, v in lw.items()))
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -987,14 +1009,15 @@ while True:
     for micro_step in range(gradient_accumulation_steps):
         with ctx:
             loss_parts = {}
-            if masker is None and not (encoder is not None and repa_adapter == 'mta') and not skip_stop_grad:
+            if masker is None and not (encoder is not None and repa_adapter == 'mta') and not skip_stop_grad and loss_weighter is None:
                 loss_fm = denoiser(X, Y) # JiT's own loss
                 loss_parts['skip'] = loss_fm
             else:
                 # same loss, but exposing this forward's t / dropped labels (the PixelREPA adapter is conditioned on them)
                 # and, with skip_stop_grad, adding the trunk-only prediction's loss
                 token_mask = masker.sample(len(X), mask_ratio, mask_prob, device) if masker is not None else None
-                loss_fm, t_used, y_used = flow_loss(denoiser, X, Y, masker, token_mask, mask_weighting, return_aux=True, parts=loss_parts)
+                loss_fm, t_used, y_used = flow_loss(denoiser, X, Y, masker, token_mask, mask_weighting, return_aux=True, parts=loss_parts,
+                                                    weighter=loss_weighter)
             loss = loss_fm
             if encoder is not None:
                 target = encoder(X, grid)
