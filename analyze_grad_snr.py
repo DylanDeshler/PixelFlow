@@ -185,41 +185,56 @@ for spec in [c for c in ckpts.split(',') if c]:
         del S
         print(f'  t={t_val:.2f} done', flush=True)
     if mixed_batches > 1:
-        # the training objective's gradient noise: t ~ the run's logit-normal per example, labels dropped at its rate
-        S_h = [torch.zeros(n_par, device=device), torch.zeros(n_par, device=device)]; Q_h = [0.0, 0.0] # two halves of the batches
-        torch.manual_seed(seed + 1)
-        g = torch.Generator(device=device).manual_seed(seed + 1)
-        for k in range(mixed_batches):
-            x, y = xs[k * batch_size:(k + 1) * batch_size], ys[k * batch_size:(k + 1) * batch_size]
-            t = torch.sigmoid(torch.randn(len(x), generator=g, device=device) * denoiser.P_std + denoiser.P_mean).view(-1, 1, 1, 1)
-            drop = torch.rand(len(x), generator=g, device=device) < denoiser.label_drop_prob
-            y = torch.where(drop, torch.full_like(y, denoiser.num_classes), y)
-            e = torch.randn(x.shape, generator=g, device=device) * ns
-            z = t * x + (1 - t) * e
+        # the training objective's gradient noise: t ~ the run's logit-normal per example, labels dropped at its rate. Both
+        # the plain loss and the Wiener-weighted one train_jit.py would use (loss_weighting.LossWeighting, its per-level
+        # normalization filled by a first pass over the same batches, as training would have)
+        from loss_weighting import LossWeighting
+        lw = LossWeighting(ns, P_x, freq='wiener').to(device)
+        def batches():
+            g = torch.Generator(device=device).manual_seed(seed + 1)
+            for k in range(mixed_batches):
+                x, y = xs[k * batch_size:(k + 1) * batch_size], ys[k * batch_size:(k + 1) * batch_size]
+                t = torch.sigmoid(torch.randn(len(x), generator=g, device=device) * denoiser.P_std + denoiser.P_mean).view(-1, 1, 1, 1)
+                drop = torch.rand(len(x), generator=g, device=device) < denoiser.label_drop_prob
+                y = torch.where(drop, torch.full_like(y, denoiser.num_classes), y)
+                e = torch.randn(x.shape, generator=g, device=device) * ns
+                yield k, x, y, t, t * x + (1 - t) * e
+        with torch.no_grad(): # pass 1: the weighting's per-level normalization
+            lw.train()
+            for k, x, y, t, z in batches():
+                with ctx:
+                    x_pred = net(z, t.flatten(), y)
+                lw((x - x_pred.float()) / (1 - t).clamp_min(t_eps), t.flatten())
+        lw.eval()
+        objs = ('plain', 'wiener')
+        S_h = {o: [torch.zeros(n_par, device=device), torch.zeros(n_par, device=device)] for o in objs} # two halves of the batches
+        Q_h = {o: [0.0, 0.0] for o in objs}
+        for k, x, y, t, z in batches(): # pass 2: gradients
             with ctx:
                 x_pred = net(z, t.flatten(), y)
-            loss = ((x_pred.float() - x) / (1 - t).clamp_min(t_eps)).pow(2).mean() # the training loss (v-loss), as flow_loss
-            grads = torch.autograd.grad(loss, params, allow_unused=True)
-            v = torch.cat([(gr if gr is not None else torch.zeros_like(p)).reshape(-1).float() for gr, p in zip(grads, params)])
-            S_h[k % 2] += v; Q_h[k % 2] += v.square().sum().item()
-            del grads, v
-        m = batch_size
+            r = (x - x_pred.float()) / (1 - t).clamp_min(t_eps)
+            losses = {'plain': r.pow(2).mean(), 'wiener': lw(r, t.flatten())} # plain = the training loss (v-loss), as flow_loss
+            for i, o in enumerate(objs):
+                grads = torch.autograd.grad(losses[o], params, retain_graph=i == 0, allow_unused=True)
+                v = torch.cat([(gr if gr is not None else torch.zeros_like(p)).reshape(-1).float() for gr, p in zip(grads, params)])
+                S_h[o][k % 2] += v; Q_h[o][k % 2] += v.square().sum().item()
+                del grads, v
+        m, K = batch_size, mixed_batches
         def noise_scale(S, Q, K):
             s2 = S.square().sum().item()
             signal = (s2 - Q) / (K * (K - 1))
             noise = (Q - s2 / K) / (K - 1)
             return (m * noise / signal if signal > 0 else float('inf')), signal, noise
-        K = mixed_batches
-        B, signal, noise = noise_scale(S_h[0] + S_h[1], Q_h[0] + Q_h[1], K)
-        # uncertainty: the same estimate on each half of the batches (two independent estimates)
-        halves = [noise_scale(S_h[i], Q_h[i], len(range(i, K, 2)))[0] for i in (0, 1)]
-        r_out['critical_batch'] = {'B_noise': B, 'B_noise_halves': halves, 'signal': signal, 'noise_per_batch': noise,
-                                   'mini_batch': m, 'batches': K, 'P_mean': denoiser.P_mean, 'P_std': denoiser.P_std,
-                                   'frac_at_B': signal / (signal + noise * m / train_batch) if signal > 0 else 0.0}
-        del S_h
-        cb = r_out['critical_batch']
-        print(f"  critical batch (training objective, mixed noise levels): B_noise {cb['B_noise']:.0f} (halves {halves[0]:.0f} / {halves[1]:.0f}) "
-              f"vs training batch {train_batch} (signal fraction at the training batch {cb['frac_at_B']:.2f})", flush=True)
+        for o in objs:
+            B, signal, noise = noise_scale(S_h[o][0] + S_h[o][1], Q_h[o][0] + Q_h[o][1], K)
+            # uncertainty: the same estimate on each half of the batches (two independent estimates)
+            halves = [noise_scale(S_h[o][i], Q_h[o][i], len(range(i, K, 2)))[0] for i in (0, 1)]
+            r_out['critical_batch' if o == 'plain' else 'critical_batch_wiener'] = {
+                'B_noise': B, 'B_noise_halves': halves, 'signal': signal, 'noise_per_batch': noise, 'mini_batch': m, 'batches': K,
+                'P_mean': denoiser.P_mean, 'P_std': denoiser.P_std, 'frac_at_B': signal / (signal + noise * m / train_batch) if signal > 0 else 0.0}
+            print(f"  critical batch, {o} loss (training objective, mixed noise levels): B_noise {B:.0f} (halves {halves[0]:.0f} / {halves[1]:.0f}) "
+                  f"vs training batch {train_batch}", flush=True)
+        del S_h, lw
     out = os.path.join(os.path.dirname(os.path.abspath(path)), 'diagnostics')
     os.makedirs(out, exist_ok=True)
     with open(os.path.join(out, f'grad_snr_{it}_{weights}.json'), 'w') as f:
@@ -242,11 +257,11 @@ for r in results:
         print(f'\n{title}\n{"t":>6}{head}')
         for t_val, row in zip(r['t'], r[key]):
             print(f'{t_val:>6.2f}' + ''.join(f'{fmt(v):>9}' for v in row))
-    if r.get('critical_batch'):
-        cb = r['critical_batch']
-        print(f"\ncritical batch (training objective: t ~ logit-normal({cb['P_mean']}, {cb['P_std']}), {cb['batches']} batches of {cb['mini_batch']}): "
-              f"B_noise {cb['B_noise']:.0f} (halves {cb['B_noise_halves'][0]:.0f} / {cb['B_noise_halves'][1]:.0f}) vs training batch {r['train_batch']}; "
-              f"signal fraction at the training batch {cb['frac_at_B']:.2f}")
+    for key, lbl in (('critical_batch', 'plain'), ('critical_batch_wiener', 'Wiener-weighted')):
+        if r.get(key):
+            cb = r[key]
+            print(f"\ncritical batch, {lbl} loss (training objective: t ~ logit-normal({cb['P_mean']}, {cb['P_std']}), {cb['batches']} batches of {cb['mini_batch']}): "
+                  f"B_noise {cb['B_noise']:.0f} (halves {cb['B_noise_halves'][0]:.0f} / {cb['B_noise_halves'][1]:.0f}) vs training batch {r['train_batch']}")
     print(f'\nloss share by band, mean Wiener weight by band, and cos(plain, Wiener-weighted expected gradient)')
     print(f'{"t":>6}' + ''.join(f'{"b" + str(b):>7}' for b in range(freq_bands)) + ' |' + ''.join(f'{"w" + str(b):>6}' for b in range(freq_bands)) + '    cos')
     for i, t_val in enumerate(r['t']):
