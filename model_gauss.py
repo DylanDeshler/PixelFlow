@@ -111,16 +111,18 @@ class Placer(nn.Module):
 
 class ConvNeXtPlacer(nn.Module):
     """
-    A ConvNeXt-style placer (Liu et al. 2022), t-conditioned: an overlapping 2s x 2s stride-s stem conv (s = patch_size / 4),
+    A ConvNeXt-style placer (Liu et al. 2022), t-conditioned: an overlapping 2s x 2s stride-s stem conv (s = stride, 4 or 8),
     blocks of [7x7 depthwise conv, LayerNorm with FiLM from t (and class), pointwise MLP 4x, layer scale, residual] at stride
     s, then a linear layer over each anchor cell's (patch_size / s)^2 features (a non-overlapping strided conv: keeps where
     things are inside the cell, unlike average pooling) to twice the width, more blocks on the anchor grid (each 7x7
     depthwise conv reaches 3 anchors away, so tokens see their neighbours' content), and a zero-initialized linear head to
-    5 numbers per anchor. Receptive field at 128px with the defaults (2 + 2 blocks): the whole image.
+    5 numbers per anchor. Receptive field at 128px with the defaults (2 + 2 blocks): the whole image. The stride-s blocks are
+    most of the cost (memory-bound at large batch): stride 8 runs them on 4x fewer positions, with twice the reach per block.
     """
-    def __init__(self, in_chans, patch_size, width, depth, grid_depth, cond_dim):
+    def __init__(self, in_chans, patch_size, width, depth, grid_depth, cond_dim, stride=4):
         super().__init__()
-        s = max(1, patch_size // 4)
+        s = stride
+        assert patch_size % s == 0 and s % 2 == 0, f'placer stride {s} must be even and divide the patch size {patch_size}'
         self.stem = nn.Conv2d(in_chans, width, 2 * s, stride=s, padding=s // 2) # centred on each s x s cell
         self.stem_norm = nn.LayerNorm(width, eps=1e-6)
         self.blocks = nn.ModuleList([PlacerBlock(width) for _ in range(depth)])
@@ -167,7 +169,7 @@ class GaussJiT(nn.Module):
     def __init__(self, input_size=128, patch_size=16, in_channels=3, hidden_size=768, depth=12, num_heads=12, mlp_ratio=4.0,
                  attn_drop=0.0, proj_drop=0.0, num_classes=1000, bottleneck_dim=128, attn_res='none', attn_res_block_size=0,
                  adaln_single=False, layernorm=False, extent=0.75, basis=0, max_offset=0.25, scale_range=1.33, scale_max=0.0,
-                 max_rotation=0.0, sigma=0.3, placer='conv', placer_width=64, placer_depth=2, placer_grid_depth=2, area_bias=True, shape_embed=True,
+                 max_rotation=0.0, sigma=0.3, placer='conv', placer_width=64, placer_depth=2, placer_grid_depth=2, placer_stride=4, area_bias=True, shape_embed=True,
                  chunks=8, fused='auto', in_context_len=0, in_context_start=0, family='gauss'):
         super().__init__()
         assert in_context_len == 0, 'GaussJiT has no in-context class tokens'
@@ -208,8 +210,9 @@ class GaussJiT(nn.Module):
         # token) or 'convnext' (ConvNeXtPlacer: whole-image receptive field, position-aware readout of each anchor cell)
         assert placer in ('conv', 'convnext'), f"placer must be 'conv' or 'convnext', got {placer}"
         if placer == 'convnext':
-            self.placer = ConvNeXtPlacer(in_channels, patch_size, placer_width, placer_depth, placer_grid_depth, hidden_size)
+            self.placer = ConvNeXtPlacer(in_channels, patch_size, placer_width, placer_depth, placer_grid_depth, hidden_size, placer_stride)
         else:
+            assert placer_stride == 4, "placer_stride is a 'convnext' option (the 'conv' placer works at patch_size / 4)"
             self.placer = Placer(in_channels, patch_size, placer_width, placer_depth, hidden_size)
         self.x_embedder = CoefEmbed(self.basis_n, in_channels, bottleneck_dim, hidden_size)
         self.final_layer = FinalLayer(hidden_size, self.basis_n, in_channels, adaln_single=adaln_single, layernorm=layernorm)

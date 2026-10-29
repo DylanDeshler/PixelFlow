@@ -46,7 +46,7 @@ QUADTREE_DEFAULTS = dict(attn_res='none', adaln_single=False, router='uniform', 
                          route_t_min=0.0, route_gate_tau=1.0, pos_embed='integrated', rope='plain', area_bias=True, level_embed=True)
 
 GAUSS_DEFAULTS = dict(attn_res='none', adaln_single=False, extent=0.75, basis=0, max_offset=0.25, scale_range=1.33, scale_max=0.0,
-                      max_rotation=0.0, sigma=0.3, placer='conv', placer_width=64, placer_depth=2, placer_grid_depth=2, area_bias=True, shape_embed=True, fused='auto')
+                      max_rotation=0.0, sigma=0.3, placer='conv', placer_width=64, placer_depth=2, placer_grid_depth=2, placer_stride=4, area_bias=True, shape_embed=True, fused='auto')
 
 def resolve_arch(model, **overrides):
     """
@@ -83,7 +83,7 @@ def describe_arch(model, arch):
         preset = dict(GAUSS_DEFAULTS, **JIT_PRESETS[model], mlp_ratio=4.0)
         full = dict(preset, **arch)
         keys = ('depth', 'hidden_size', 'num_heads', 'patch_size', 'bottleneck_dim', 'mlp_ratio', 'attn_res', 'adaln_single', 'extent',
-                'basis', 'max_offset', 'scale_range', 'scale_max', 'max_rotation', 'sigma', 'placer', 'placer_width', 'placer_depth', 'placer_grid_depth', 'area_bias', 'shape_embed', 'fused')
+                'basis', 'max_offset', 'scale_range', 'scale_max', 'max_rotation', 'sigma', 'placer', 'placer_width', 'placer_depth', 'placer_grid_depth', 'placer_stride', 'area_bias', 'shape_embed', 'fused')
         parts = [(f"{k} {full[k]:g}" if isinstance(full[k], float) else f"{k} {full[k]}") + (f"* (preset {preset[k]})" if full[k] != preset[k] else '')
                  for k in keys]
         return f"arch: {', '.join(parts)} (preset {model}, * = overridden)"
@@ -569,7 +569,7 @@ _NAME_TOKENS = {
     'quad_tokens': 'K', 'quad_levels': 'levels', 'quad_router': 'route-', 'quad_route_dino': 'dino-', 'quad_route_t_min': 'routetmin',
     'quad_gate_tau': 'gatetau', 'quad_pos': 'pos-', 'quad_rope': 'rope-', 'quad_area_bias': 'areabias', 'quad_level_embed': 'levelemb',
     'gauss_extent': 'gext', 'gauss_basis': 'gbasis', 'gauss_sigma': 'gsigma', 'gauss_max_offset': 'goff', 'gauss_scale_range': 'gscale', 'gauss_scale_max': 'gscalemax', 'gauss_max_rotation': 'grot',
-    'gauss_placer': 'gplacer-', 'gauss_placer_width': 'gplacerw', 'gauss_placer_depth': 'gplacerd', 'gauss_placer_grid_depth': 'gplacergd', 'gauss_area_bias': 'gareabias', 'gauss_shape_embed': 'gshape', 'gauss_fused': 'gfused-',
+    'gauss_placer': 'gplacer-', 'gauss_placer_width': 'gplacerw', 'gauss_placer_depth': 'gplacerd', 'gauss_placer_grid_depth': 'gplacergd', 'gauss_placer_stride': 'gplacers', 'gauss_area_bias': 'gareabias', 'gauss_shape_embed': 'gshape', 'gauss_fused': 'gfused-',
 }
 
 def _fmt_value(v):

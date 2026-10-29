@@ -505,9 +505,10 @@ oriented, scaled patches (64 at 128px for `GaussJiT-B/16`).
     anchors. Each token sees only about 32px around its cell, and the pooling discards where things are inside the cell.
   - `--gauss_placer=convnext` (1.1M parameters): ConvNeXt blocks (7×7 depthwise conv, LayerNorm with FiLM from t,
     pointwise MLP, layer scale) at stride 4. Then a linear layer over each anchor cell's features, in place of the pool,
-    and more blocks on the anchor grid, so each token sees the whole image, including its neighbours' content. It adds about
-    3 GB of activations at batch 1024 and about 2% of the trunk's compute. `--gauss_placer_grid_depth` sets the number of
-    anchor-grid blocks.
+    and more blocks on the anchor grid, so each token sees the whole image, including its neighbours' content. At stride 4 (the default) it adds
+    about 3 GB of activations at batch 1024 and costs about 22% throughput (1400 vs 1800 img/s): its stride-4 blocks are
+    memory-bound. `--gauss_placer_stride=8` runs them on 4× fewer positions. `--gauss_placer_grid_depth` sets the number
+    of anchor-grid blocks.
   - Offsets are bounded to ±0.25 of the spacing and scales to ×1.33^±1 per axis.
   - Frames are axis-aligned by default. This keeps the basis separable, so encoding and decoding are two small matrix
     multiplies per token. `--gauss_max_rotation=0.785` allows ±45° rotation.

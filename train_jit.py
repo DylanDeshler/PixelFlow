@@ -103,6 +103,7 @@ gauss_placer = 'conv' # 'conv': stride-4 conv + 3x3 blocks, average pooled to th
 gauss_placer_width = 64 # channels (convnext: at stride 4; twice this on the anchor grid)
 gauss_placer_depth = 2 # blocks at stride 4
 gauss_placer_grid_depth = 2 # convnext: blocks on the anchor grid
+gauss_placer_stride = 4 # convnext: stride of its first blocks (8: 4x fewer positions, the cheaper option)
 gauss_area_bias = True # + log(frame area / initial area) on every key's logits
 gauss_shape_embed = True # learned embedding of (log scales, rotation), added to the tokens
 gauss_fused = 'auto' # CUDA Triton kernels for the input / output layers (faster and less memory than PyTorch, rotated or not): 'auto' / 'always' (on CUDA), 'never'
@@ -272,7 +273,7 @@ else:
 is_quadtree = model.startswith('QuadJiT')
 is_gauss = model.startswith('GaussJiT')
 GAUSS_FLAGS = dict(extent=gauss_extent, basis=gauss_basis, max_offset=gauss_max_offset, scale_range=gauss_scale_range, scale_max=gauss_scale_max, max_rotation=gauss_max_rotation, sigma=gauss_sigma,
-                   placer=gauss_placer, placer_width=gauss_placer_width, placer_depth=gauss_placer_depth, placer_grid_depth=gauss_placer_grid_depth, area_bias=gauss_area_bias, shape_embed=gauss_shape_embed,
+                   placer=gauss_placer, placer_width=gauss_placer_width, placer_depth=gauss_placer_depth, placer_grid_depth=gauss_placer_grid_depth, placer_stride=gauss_placer_stride, area_bias=gauss_area_bias, shape_embed=gauss_shape_embed,
                    fused=gauss_fused)
 if is_gauss: # like QuadJiT: the JiT backbone options it needs, none of the input / output paths
     jit_only = dict(attn_res_adaln=not attn_res_adaln, gated_bottleneck=not gated_bottleneck, skip_pathway=not skip_pathway, dcae_stem=not dcae_stem,
