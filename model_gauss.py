@@ -53,14 +53,19 @@ from model_quadtree import QuadBlock, TokenRope
 
 # positions at continuous centres, recomputed every forward (the tokens move), on the inputs' device: model_quadtree's
 # integrated_sincos / rope_tables, which build their tables once at construction on the CPU
-def integrated_sincos(dim, cy, cx, wy, wx):
-    # each axis's frequencies averaged over the token's footprint along that axis (widths wy, wx in anchor units), so an
-    # elongated token's position is smoothed along its long axis only
+def integrated_sincos(dim, cy, cx, hx, hy, theta):
+    # each axis's sin-cos averaged over the token's frame (half-sizes hx, hy in anchor units, rotated by theta): the frame's
+    # Fourier transform at that axis's frequency, sinc(w hx |cos|) sinc(w hy |sin|) along x and sinc(w hx |sin|) sinc(w hy |cos|)
+    # along y (sinc(z) = sin z / z), so an elongated or rotated token is smoothed along its actual extent on each axis
     omega = 1.0 / 10000 ** (torch.arange(dim // 4, device=cy.device, dtype=torch.float32) / (dim // 4))
+    c, s = torch.cos(theta.float())[:, None], torch.sin(theta.float())[:, None]
+    hx, hy = hx.float()[:, None], hy.float()[:, None]
+    sinc = lambda z: torch.sinc(z / math.pi) # torch.sinc(z) = sin(pi z) / (pi z)
+    damp_x = sinc(omega * hx * c) * sinc(omega * hy * s)
+    damp_y = sinc(omega * hx * s) * sinc(omega * hy * c)
     out = []
-    for c, width in ((cy, wy), (cx, wx)):
-        ang = c.float()[:, None] * omega[None]
-        damp = torch.sinc(width.float()[:, None] * omega[None] / 2 / math.pi)
+    for ctr, damp in ((cy, damp_y), (cx, damp_x)):
+        ang = ctr.float()[:, None] * omega[None]
         out += [torch.sin(ang) * damp, torch.cos(ang) * damp]
     return torch.cat(out, dim=1)
 
@@ -171,7 +176,7 @@ class GaussJiT(nn.Module):
     def __init__(self, input_size=128, patch_size=16, in_channels=3, hidden_size=768, depth=12, num_heads=12, mlp_ratio=4.0,
                  attn_drop=0.0, proj_drop=0.0, num_classes=1000, bottleneck_dim=128, attn_res='none', attn_res_block_size=0,
                  adaln_single=False, layernorm=False, extent=0.75, basis=0, max_offset=0.25, scale_range=1.33, scale_max=0.0,
-                 max_rotation=0.0, sigma=0.3, placer='conv', placer_width=64, placer_depth=2, placer_grid_depth=2, placer_stride=4, area_bias=True, shape_embed=True,
+                 max_rotation=0.0, sigma=0.3, placer='conv', placer_width=64, placer_depth=2, placer_grid_depth=2, placer_stride=4, scale_jitter=0.0, area_bias=True, shape_embed=True,
                  chunks=8, fused='auto', in_context_len=0, in_context_start=0, family='gauss'):
         super().__init__()
         assert in_context_len == 0, 'GaussJiT has no in-context class tokens'
@@ -202,7 +207,11 @@ class GaussJiT(nn.Module):
         u_cut = gauss_kernels.render_cut(sigma)
         own = max_offset * patch_size * math.sqrt(2) + patch_size / math.sqrt(2) + 1
         self.window = 2 * math.ceil(max(u_cut * h_max, own)) + 3
-        self.r_own = math.ceil(own) + 1 # each token renders within its Gaussian's box (u^2 + v^2 < u_cut^2), at least this far
+        self.r_own = math.ceil(own) + 1
+        # training only: Gaussian noise (std scale_jitter) on each token's per-axis log-scale, within the bounds. Smooths the
+        # loss over nearby scales (randomized smoothing), so the placer gets a gradient across plateaus: a frame whose
+        # content is finer than its basis can represent has a loss flat in its scale, and only nearby scales see the way out
+        self.scale_jitter = scale_jitter # each token renders within its Gaussian's box (u^2 + v^2 < u_cut^2), at least this far
 
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = LabelEmbedder(num_classes, hidden_size)
@@ -246,7 +255,7 @@ class GaussJiT(nn.Module):
         self.initialize_weights()
 
     def __setattr__(self, name, value):
-        if name == 'last_geometry': # a plain attribute, never part of the module state
+        if name in ('last_geometry', '_h_placed'): # plain attributes, never part of the module state
             object.__setattr__(self, name, value)
         else:
             super().__setattr__(name, value)
@@ -300,6 +309,9 @@ class GaussJiT(nn.Module):
         mu = self.anchors + self.max_offset * S * torch.tanh(raw[..., 0:2])
         ts = torch.tanh(raw[..., 2:4]) # growing and shrinking bounded separately; scale 1 (the anchor grid's frames) at init
         log_f = ts * torch.where(ts > 0, math.log(self.scale_max), math.log(self.scale_range))
+        self._h_placed = (self.extent * S * log_f.exp()).detach() # the placer's own scales, before any jitter (for logging)
+        if self.training and self.scale_jitter > 0:
+            log_f = (log_f + self.scale_jitter * torch.randn_like(log_f)).clamp(-math.log(self.scale_range), math.log(self.scale_max))
         h = self.extent * S * log_f.exp()
         theta = self.max_rotation * torch.tanh(raw[..., 4])
         return mu, h, theta, log_f
@@ -480,16 +492,16 @@ class GaussJiT(nn.Module):
         with torch.autocast(device_type=x.device.type, enabled=False): # geometry, sampling and rendering in fp32
             mu, h, theta, log_f = self.geometry(x, t_emb.float())
             patches = self.encode(x, mu, h, theta)
-        self.last_geometry = (mu.detach(), h.detach(), theta.detach())
+        self.last_geometry = (mu.detach(), self._h_placed, theta.detach()) # logged geometry: the placer's, without training jitter
         if self.geo_record is not None:
             self._record_geometry(t, mu, h, theta)
         tok = self.x_embedder(patches)
         # positions at the continuous centres (anchor units), detached: geometry learns through sampling and blending
         S = self.patch_size
         cy, cx = (mu[..., 1] / S).detach().flatten(), (mu[..., 0] / S).detach().flatten()
-        wx, wy = (2 * h[..., 0].detach() / S).flatten(), (2 * h[..., 1].detach() / S).flatten() # frame widths per axis
+        hx, hy = (h[..., 0].detach() / S).flatten(), (h[..., 1].detach() / S).flatten() # frame half-sizes (anchor units)
         B, K = mu.shape[:2]
-        add = integrated_sincos(self.hidden_size, cy, cx, wy, wx).view(B, K, -1)
+        add = integrated_sincos(self.hidden_size, cy, cx, hx, hy, theta.detach().flatten()).view(B, K, -1)
         if self.shape_mlp is not None:
             shape = torch.cat([log_f, torch.sin(2 * theta)[..., None], torch.cos(2 * theta)[..., None] - 1], -1).detach()
             add = add + self.shape_mlp(shape)

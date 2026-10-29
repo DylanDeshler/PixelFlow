@@ -97,7 +97,8 @@ gauss_max_offset = 0.25 # centre offset bound / patch_size (tanh)
 gauss_scale_range = 1.33 # half-size bounds: extent * patch_size * [1 / scale_range, scale_range] per axis
 gauss_scale_max = 0.0 # > 0: a separate upper bound (frames grow to extent * patch_size * scale_max; the lower bound is unchanged)
 gauss_max_rotation = 0.0 # rotation bound (radians); 0: axis-aligned frames, separable basis (~2.5x cheaper per step than rotating)
-gauss_sigma = 0.3 # blending Gaussian width in frame units (normalized over tokens: every pixel covered)
+gauss_sigma = 0.3 # blending Gaussian width in frame units (normalized over tokens: every pixel covered); 0.5 lets the placer learn shapes (README)
+gauss_scale_jitter = 0.0 # training only: std of noise on each token's log-scales (~0.1-0.15: gradients across flat regions of the loss)
 gauss_placer = 'conv' # 'conv': stride-4 conv + 3x3 blocks, average pooled to the anchors (~32px receptive field per token);
                       # 'convnext': ConvNeXt blocks (7x7 depthwise) at stride 4 and on the anchor grid, a linear readout of each anchor cell (whole image)
 gauss_placer_width = 64 # channels (convnext: at stride 4; twice this on the anchor grid)
@@ -273,7 +274,7 @@ else:
 is_quadtree = model.startswith('QuadJiT')
 is_gauss = model.startswith('GaussJiT')
 GAUSS_FLAGS = dict(extent=gauss_extent, basis=gauss_basis, max_offset=gauss_max_offset, scale_range=gauss_scale_range, scale_max=gauss_scale_max, max_rotation=gauss_max_rotation, sigma=gauss_sigma,
-                   placer=gauss_placer, placer_width=gauss_placer_width, placer_depth=gauss_placer_depth, placer_grid_depth=gauss_placer_grid_depth, placer_stride=gauss_placer_stride, area_bias=gauss_area_bias, shape_embed=gauss_shape_embed,
+                   placer=gauss_placer, placer_width=gauss_placer_width, placer_depth=gauss_placer_depth, placer_grid_depth=gauss_placer_grid_depth, placer_stride=gauss_placer_stride, scale_jitter=gauss_scale_jitter, area_bias=gauss_area_bias, shape_embed=gauss_shape_embed,
                    fused=gauss_fused)
 if is_gauss: # like QuadJiT: the JiT backbone options it needs, none of the input / output paths
     jit_only = dict(attn_res_adaln=not attn_res_adaln, gated_bottleneck=not gated_bottleneck, skip_pathway=not skip_pathway, dcae_stem=not dcae_stem,

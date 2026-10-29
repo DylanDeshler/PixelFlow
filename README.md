@@ -560,6 +560,17 @@ python train_jit.py config/jit_in1k_128.py config/model_gaussjit_b16.py --optimi
 Options: `--gauss_max_offset`, `--gauss_scale_range`, `--gauss_max_rotation`, `--gauss_extent`, `--gauss_basis`, `--gauss_sigma`,
 `--gauss_placer`, `--gauss_placer_width/depth/grid_depth`, `--gauss_area_bias`, `--gauss_shape_embed`.
 
+Two options decide whether the placer can learn token shapes (CPU tests in which only the placer trains, on images that
+vary along one axis):
+- `--gauss_sigma`: the blending width in frame units. At the default 0.3 the blend is nearly a hard partition, and the
+  shape gradient is dominated by terms from ownership boundaries that mostly cancel. In those tests, frames followed the
+  content's axis only from about 0.5 up. Larger values blur more across tokens and enlarge each token's render box (radius
+  ∝ σ). 0.5 is the suggested starting point.
+- `--gauss_scale_jitter`: training-only noise (std, in log-scale) on each token's scales, within the bounds. When content
+  is finer than a token's basis can represent, the loss is flat in its scale and there's no gradient toward a better
+  shape; jitter smooths the loss over nearby scales. 0.1–0.15 worked in tests; 0.3 overshoots. Sampling and the logged
+  geometry are unaffected.
+
 The presets use `bottleneck_dim=288`, which keeps JiT's 6× compression of a token's input: the default basis (24×24 per
 channel) has 2.25× a 16px patch's values, and 128 × 2.25 = 288. If you change `--gauss_extent` or `--gauss_basis`, rescale it the same
 way.
