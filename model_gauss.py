@@ -53,16 +53,18 @@ from model_quadtree import QuadBlock, TokenRope
 
 # positions at continuous centres, recomputed every forward (the tokens move), on the inputs' device: model_quadtree's
 # integrated_sincos / rope_tables, which build their tables once at construction on the CPU
-def integrated_sincos(dim, cy, cx, width):
+def integrated_sincos(dim, cy, cx, wy, wx):
+    # each axis's frequencies averaged over the token's footprint along that axis (widths wy, wx in anchor units), so an
+    # elongated token's position is smoothed along its long axis only
     omega = 1.0 / 10000 ** (torch.arange(dim // 4, device=cy.device, dtype=torch.float32) / (dim // 4))
     out = []
-    for c in (cy, cx):
+    for c, width in ((cy, wy), (cx, wx)):
         ang = c.float()[:, None] * omega[None]
         damp = torch.sinc(width.float()[:, None] * omega[None] / 2 / math.pi)
         out += [torch.sin(ang) * damp, torch.cos(ang) * damp]
     return torch.cat(out, dim=1)
 
-def rope_tables(head_dim, cy, cx, width, theta=10000):
+def rope_tables(head_dim, cy, cx, theta=10000):
     half = head_dim // 2
     freqs = 1.0 / (theta ** (torch.arange(0, half, 2, device=cy.device)[:half // 2].float() / half))
     cos, sin = [], []
@@ -485,14 +487,14 @@ class GaussJiT(nn.Module):
         # positions at the continuous centres (anchor units), detached: geometry learns through sampling and blending
         S = self.patch_size
         cy, cx = (mu[..., 1] / S).detach().flatten(), (mu[..., 0] / S).detach().flatten()
-        width = (2 * h.detach().mean(-1) / S).flatten()
+        wx, wy = (2 * h[..., 0].detach() / S).flatten(), (2 * h[..., 1].detach() / S).flatten() # frame widths per axis
         B, K = mu.shape[:2]
-        add = integrated_sincos(self.hidden_size, cy, cx, width).view(B, K, -1)
+        add = integrated_sincos(self.hidden_size, cy, cx, wy, wx).view(B, K, -1)
         if self.shape_mlp is not None:
             shape = torch.cat([log_f, torch.sin(2 * theta)[..., None], torch.cos(2 * theta)[..., None] - 1], -1).detach()
             add = add + self.shape_mlp(shape)
         tok = tok + add.to(tok.dtype)
-        cos, sin = rope_tables(self.hidden_size // self.num_heads, cy, cx, width)
+        cos, sin = rope_tables(self.hidden_size // self.num_heads, cy, cx)
         bias = (log_f.sum(-1).detach()[:, None, None, :]) if self.area_bias else None # log(frame area / initial area)
         rope = TokenRope(cos.view(B, 1, K, -1), sin.view(B, 1, K, -1), bias)
         res = AttnResState(self, tok, c) if self.attn_res != 'none' else None
@@ -522,6 +524,7 @@ class GaussJiT(nn.Module):
           scale_within    mean over images of the std of log-scale across the image's tokens (both axes): tokens differing
                           inside an image (adaptive allocation)
           scale_between   std over images of the image's mean log-scale: whole images tokenized coarser / finer
+          aspect_p50/p95  each token's elongation, long axis / short axis (1 = circle), median and 95th percentile
           rotation_mean   signed mean rotation (degrees); rotation_same_sign: the share of rotated tokens (|theta| > 0.5 deg)
                           turning the majority's way (1 = one global direction); rotation_within: mean within-image std (degrees)
         """
@@ -529,8 +532,15 @@ class GaussJiT(nn.Module):
         deg = theta.float() * 180 / math.pi # [N, K]
         rot = deg[deg.abs() > 0.5]
         same = max((rot > 0).float().mean().item(), (rot < 0).float().mean().item()) if rot.numel() else float('nan')
+        a50, a95 = torch.quantile(self._aspect(h).flatten()[:2 ** 20], torch.tensor([0.5, 0.95], device=h.device)).tolist()
         return {'scale_within': lf.std(1).mean().item(), 'scale_between': lf.mean(1).std().item() if lf.shape[0] > 1 else 0.0,
+                'aspect_p50': a50, 'aspect_p95': a95,
                 'rotation_mean': deg.mean().item(), 'rotation_same_sign': same, 'rotation_within': deg.std(1).mean().item()}
+
+    @staticmethod
+    def _aspect(h):
+        # long axis / short axis per token
+        return (h[..., 0].float().log() - h[..., 1].float().log()).abs().exp()
 
     def record_geometry(self, on=True):
         # start (clearing) or stop recording every forward's geometry by noise level, e.g. around an FID generation
@@ -545,13 +555,14 @@ class GaussJiT(nn.Module):
         S = self.patch_size
         m_, h_, t_ = mu[:n_tokens].float(), h[:n_tokens].float(), theta[:n_tokens].float()
         r = self.geo_record.setdefault(key, {'offset': [], 'scale': [], 'rotation': [], 'outside': [], 'lf_std': [], 'lf_mean': [],
-                                             'rot_signed': [], 'rot_std': []})
+                                             'rot_signed': [], 'rot_std': [], 'aspect': []})
         lf = (h_ / (self.extent * S)).log().flatten(1)
         deg = t_ * 180 / math.pi
         r['lf_std'].append(lf.std(1).cpu()); r['lf_mean'].append(lf.mean(1).cpu())
         r['rot_signed'].append(deg.flatten().cpu()); r['rot_std'].append(deg.std(1).cpu())
         r['offset'].append(((m_ - self.anchors) / S).norm(dim=-1).flatten().cpu())
         r['scale'].append((h_ / (self.extent * S)).flatten().cpu())
+        r['aspect'].append(self._aspect(h_).flatten().cpu())
         r['rotation'].append((t_.abs() * 180 / math.pi).flatten().cpu())
         r['outside'].append(self.outside_frame_share(m_[:n_coverage], h_[:n_coverage], t_[:n_coverage]))
 
@@ -563,10 +574,11 @@ class GaussJiT(nn.Module):
             qs = lambda z, q: torch.quantile(z[:2 ** 24], torch.tensor(q)).tolist()
             p5, p50, p95 = qs(f, [0.05, 0.5, 0.95])
             r50, r95 = qs(rot, [0.5, 0.95])
+            a50, a95 = qs(torch.cat(r['aspect']), [0.5, 0.95]) if r.get('aspect') else (float('nan'), float('nan'))
             rs = torch.cat(r['rot_signed'])
             rr = rs[rs.abs() > 0.5]
             out[key] = {'offset_mean': off.mean().item(), 'offset_p95': qs(off, [0.95])[0], 'scale_p5': p5, 'scale_p50': p50,
-                        'scale_p95': p95, 'rotation_p50': r50, 'rotation_p95': r95, 'outside_frame': sum(r['outside']) / len(r['outside']),
+                        'scale_p95': p95, 'aspect_p50': a50, 'aspect_p95': a95, 'rotation_p50': r50, 'rotation_p95': r95, 'outside_frame': sum(r['outside']) / len(r['outside']),
                         'scale_within': torch.cat(r['lf_std']).mean().item(), 'scale_between': torch.cat(r['lf_mean']).std().item(),
                         'rotation_mean': rs.mean().item(), 'rotation_within': torch.cat(r['rot_std']).mean().item(),
                         'rotation_same_sign': max((rr > 0).float().mean().item(), (rr < 0).float().mean().item()) if rr.numel() else float('nan'),

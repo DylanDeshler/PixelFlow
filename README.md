@@ -567,6 +567,20 @@ way.
 The input and output layers run in fp32 for precision (TF32 matrix multiplies in the kernels), inside the kernels on CUDA or
 chunked and recomputed in the backward pass on the PyTorch path. Peak memory is in the table above.
 
+### Toy dataset: Gaussian blobs
+
+`prepare_toy_gaussians.py` writes a synthetic dataset in the same memmap layout: 50k train / 5k val images at 128px,
+each a graded background plus 4–24 anisotropic, rotated Gaussian blobs. Most blobs cluster in one region per image, so
+detail is uneven. The 10 classes are set by blob shape: 8 orientation bins of elongated blobs, round blobs, and random
+orientations. The right token shapes are known (every blob's parameters are saved in `blobs.npz`), so it's a fast test
+of whether adaptive tokenization learns them.
+
+```bash
+python prepare_toy_gaussians.py --out_dir=$JIT_DATA_ROOT/toy_gauss_128
+python fid.py --data_dir=$JIT_DATA_ROOT/toy_gauss_128
+python train_jit.py config/toy_gauss_128.py config/model_gaussjit_b16.py --optimizer_type=muon
+```
+
 ## PixelDiT baseline
 
 `--model=PixelDiT-B/16` (also `-L/16`, `-XL/16`) trains PixelDiT (Yu et al. 2025, arXiv 2511.20645), implemented in

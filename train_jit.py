@@ -683,7 +683,7 @@ def evaluate(step):
                     fh.write(json.dumps({'iter': step, 'stats': {f'{t:.3f}': v for t, v in geo_ema.items()}}) + '\n')
                 if wandb_log:
                     wandb.log({f'geometry_ema_t/{k}_t{t:.2f}': v for t, st in geo_ema.items() for k, v in st.items()
-                               if k in ('offset_mean', 'scale_p5', 'scale_p95', 'rotation_p95', 'outside_frame', 'scale_within', 'scale_between',
+                               if k in ('offset_mean', 'scale_p5', 'scale_p95', 'aspect_p50', 'aspect_p95', 'rotation_p95', 'outside_frame', 'scale_within', 'scale_between',
                                 'rotation_mean', 'rotation_same_sign', 'rotation_within')}, step=step)
         if diag:
             # 5. probes on the EMA weights (the model that is sampled from)
@@ -863,7 +863,7 @@ def save_samples(step):
             fh.write(json.dumps({'iter': step, 'stats': {f'{t:.3f}': v for t, v in geo_t.items()}}) + '\n')
         if wandb_log:
             wandb.log({f'geometry_t/{k}_t{t:.2f}': v for t, st in geo_t.items() for k, v in st.items()
-                       if k in ('offset_mean', 'scale_p5', 'scale_p95', 'rotation_p95', 'outside_frame', 'scale_within', 'scale_between',
+                       if k in ('offset_mean', 'scale_p5', 'scale_p95', 'aspect_p50', 'aspect_p95', 'rotation_p95', 'outside_frame', 'scale_within', 'scale_between',
                                 'rotation_mean', 'rotation_same_sign', 'rotation_within')}, step=step)
     with ema_weights(denoiser, 1):
         denoiser.eval()
@@ -1047,6 +1047,7 @@ while True:
         geo_str = (f", geometry: offset mean {g_['offset_mean']:.3f} / p95 {g_['offset_p95']:.3f}, scale p5/p50/p95 {g_['scale_p5']:.2f}/"
                    f"{g_['scale_p50']:.2f}/{g_['scale_p95']:.2f} [{g_['scale_min']:.2f}, {g_['scale_max']:.2f}]"
                    + f", log-scale std within/between images {g_['scale_within']:.3f}/{g_['scale_between']:.3f}"
+                   + f", elongation p50/p95 {g_['aspect_p50']:.2f}/{g_['aspect_p95']:.2f}"
                    + (f", |rotation| p50/p95/max {g_['rotation_p50']:.1f}/{g_['rotation_p95']:.1f}/{g_['rotation_max']:.1f}deg, signed mean "
                       f"{g_['rotation_mean']:+.1f}deg, same sign {g_['rotation_same_sign']:.0%}, within-image std {g_['rotation_within']:.1f}deg"
                       if denoiser.net.max_rotation > 0 else '')) if g_ else ""

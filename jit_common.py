@@ -439,6 +439,8 @@ def plot_geometry_vs_t(stats, path, title, rotation=True):
     panels = [('displacement (anchor spacings)', [('mean', 'offset_mean'), ('p95', 'offset_p95')]),
               ('per-axis scale (x initial size)', [('p5', 'scale_p5'), ('p50', 'scale_p50'), ('p95', 'scale_p95')])]
     panels.append(('token-to-token vs whole-image (std of log scale)', [('within images', 'scale_within'), ('between images', 'scale_between')]))
+    if any('aspect_p50' in st for st in stats.values()):
+        panels.append(('elongation (long / short axis)', [('p50', 'aspect_p50'), ('p95', 'aspect_p95')]))
     if rotation:
         panels.append(('rotation (degrees)', [('|rot| p50', 'rotation_p50'), ('|rot| p95', 'rotation_p95'), ('signed mean', 'rotation_mean'),
                                               ('within-image std', 'rotation_within')]))

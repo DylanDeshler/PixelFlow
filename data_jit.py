@@ -41,6 +41,8 @@ class MemmapImages:
         Readable name per label, from torchvision's ImageNet-1k category list (standard class order, which both the
         HF label indices and sorted wnid folders follow). Older meta.json files without 'imagenet_index' assume in1k / every-10th in100.
         """
+        if self.meta.get('class_names'): # datasets that name their own classes (prepare_toy_gaussians.py)
+            return self.meta['class_names']
         from torchvision.models import ResNet50_Weights
         categories = ResNet50_Weights.IMAGENET1K_V1.meta['categories']
         index = self.meta.get('imagenet_index') or list(range(0, 1000, 1000 // self.num_classes))
