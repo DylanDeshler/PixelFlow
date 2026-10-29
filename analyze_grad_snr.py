@@ -62,6 +62,10 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16}[dtype]
 ctx = nullcontext() if (device_type == 'cpu' or dtype == 'float32') else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+# JiT's blocks and final layer are @torch.compile'd; their compiled backwards donate buffers, which can't be combined with
+# retain_graph (one forward, a backward per band). Donation only saves memory, so turn it off
+import torch._functorch.config
+torch._functorch.config.donated_buffer = False
 
 val = MemmapImages(os.path.join(data_dir, 'val'))
 n_img = n_batches * batch_size
