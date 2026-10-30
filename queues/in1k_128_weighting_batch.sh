@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # in1k_128 queue (2026-10-29): critical batch, loss weighting, batch size, bottleneck, then the from-scratch calibration.
-# Sequential; each step logs to runs/queue_logs/{name}.log and a failed step doesn't stop the queue. Every training run is
+# Sequential; each step logs to runs/queue_logs/{name}.log and a failed step doesn't stop the queue. Rerunning the same
+# command resumes: finished steps (runs/queue_logs/{name}.done) are skipped, and an interrupted training step continues
+# from its last checkpoint (train_jit.py saves one every epoch; its log names the run directory). calibrate.py resumes its
+# own finished steps; a training run it was in the middle of restarts. Every training run is
 # JiT-B/16 + Muon, 20 epochs, matched to the existing baseline runs/in1k_128/jit-b16_icl0/muon (batch 1024, constant lr, so
 # --epochs=20 has the same schedule as that run's first 20 epochs) and compared to it at its 5 / 10 / 15 / 20-epoch evals.
 #
 #   nohup bash queues/in1k_128_weighting_batch.sh > runs/queue_logs/queue.log 2>&1 &
-#   QUEUE_FROM=4 nohup bash queues/in1k_128_weighting_batch.sh ...     # resume from step 4 (steps are numbered below)
+#   QUEUE_FROM=4 nohup bash queues/in1k_128_weighting_batch.sh ...     # skip steps before 4 (steps are numbered below)
+#   rm runs/queue_logs/wiener.done                                      # make a finished step run again (from scratch)
 # Rough times on one L40S: step 1 ~15 min, each 20-epoch run ~3.5-4 h at batch 1024 and ~4-5 h at batch 256, step 9 ~7 h.
 set -u
 DATA=${JIT_DATA_ROOT:-/data}/in1k_128
@@ -14,10 +18,20 @@ BASE="config/jit_in1k_128.py --optimizer_type=muon --data_dir=$DATA --epochs=20"
 mkdir -p runs/queue_logs
 step() { # step N name command...
     local n=$1 name=$2; shift 2
-    if [ "$n" -lt "$FROM" ]; then echo "skip $n $name"; return; fi
-    echo "=== $(date '+%F %T') start $n $name: $*"
-    "$@" > "runs/queue_logs/$name.log" 2>&1
-    echo "=== $(date '+%F %T') end $n $name (exit $?)"
+    local log="runs/queue_logs/$name.log" done="runs/queue_logs/$name.done"
+    if [ "$n" -lt "$FROM" ]; then echo "skip $n $name (before QUEUE_FROM)"; return; fi
+    if [ -e "$done" ]; then echo "skip $n $name (done)"; return; fi
+    local extra=() mode=">"
+    if [ -e "$log" ] && [ "$2" = "train_jit.py" ]; then
+        # an interrupted training run: resume it if it saved a checkpoint (its log's "run:  <dir>" line names the directory)
+        local dir; dir=$(grep -m1 '^run:  ' "$log" | sed 's/^run:  //')
+        if [ -n "$dir" ] && [ -e "$dir/ckpt.pt" ]; then extra=(--init_from=resume); mode=">>"; fi
+    fi
+    echo "=== $(date '+%F %T') start $n $name ${extra[*]:-}: $*"
+    if [ "$mode" = ">>" ]; then "$@" "${extra[@]}" >> "$log" 2>&1; else "$@" > "$log" 2>&1; fi
+    local rc=$?
+    [ $rc -eq 0 ] && touch "$done"
+    echo "=== $(date '+%F %T') end $n $name (exit $rc)"
 }
 
 # 1. critical batch of the plain vs Wiener-weighted training objective (mixed noise levels), on the p16 / p8 baselines
