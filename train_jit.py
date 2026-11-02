@@ -746,20 +746,38 @@ def generate(spectrum=None):
         method=sampling_method, batch_size=gen_batch_size, on_batch=spectrum, eta=sampling_eta,
     )
 
+class EvalTimer:
+    # wall-clock minutes per eval section (the GPU synchronized at each lap), printed after every eval
+    def __init__(self):
+        self.times, self.t = {}, time.time()
+
+    def lap(self, name):
+        if device_type == 'cuda':
+            torch.cuda.synchronize()
+        now = time.time()
+        self.times[name] = self.times.get(name, 0.0) + (now - self.t) / 60
+        self.t = now
+
+eval_timer = EvalTimer()
+
 @torch.no_grad()
 def evaluate(step):
     """
     FID / IS of the EMA weights, plus the diagnostics if enabled. Returns (fid, dict of scalars for logging, dict of images).
     """
     t_start = time.time()
+    global eval_timer
+    eval_timer = timer = EvalTimer()
     log, images, record = {}, {}, {}
     for split, (xs, ys) in loss_sets.items():
         log[f'eval/{split}_loss'] = estimate_loss(xs, ys)
+    timer.lap('val loss')
     spectrum = SpectrumAccumulator(diag_spectrum_images) if diag else None
     with ema_weights(denoiser, 1):
         if is_gauss: # the sampling (EMA) model's geometry along its own sampling trajectories, recorded during the FID generation
             denoiser.net.record_geometry(True)
         out = generate(spectrum)
+        timer.lap('FID sampling')
         if is_gauss:
             geo_ema = denoiser.net.geometry_record_summary()
             denoiser.net.record_geometry(False)
@@ -778,14 +796,17 @@ def evaluate(step):
             denoiser.eval()
             tr = diag_lib.probe_features(denoiser.net, probe_train_x, probe_ts, probe_blocks, num_classes, ctx, device, noise_scale)
             va = diag_lib.probe_features(denoiser.net, probe_val_x, probe_ts, probe_blocks, num_classes, ctx, device, noise_scale)
+            timer.lap('probe features')
             # 9. error along the sampler's own trajectory from held-out images noised to t0 (same sampler as the FID)
             trajectory = diag_lib.trajectory_pass(denoiser, *diag_val, trajectory_t0s, noise_scale, ctx, band_masks,
                                                   diag_trajectory_images, chunk=gen_batch_size) if trajectory_t0s else None
+            timer.lap('trajectory')
             # quadtree: layouts along the model's own sampling trajectories (stability), seams and detail per level in samples
             quad_sampling = diag_lib.sampling_layout_stats(denoiser, torch.linspace(0, num_classes - 1, 64).long().to(device),
                                                            diag_val[0], noise_scale, ctx) if is_quadtree else None
             denoiser.train()
             probes = diag_lib.run_probes(tr, probe_train_y, va, probe_val_y, num_classes)
+            timer.lap('probe fits')
     log['val/fid'], log['val/is'] = out['fid'], out['is']
     if token_sizes and alloc_eval:
         # the allocation: matched per-size held-out loss, FID-N under fixed allocations (same noise and labels), sample rows
@@ -799,6 +820,7 @@ def evaluate(step):
             loss_ts=alloc_ts, ema_context=lambda: ema_weights(denoiser, 1))
         log.update(a_log)
         images.update(a_images)
+        timer.lap('allocation eval')
     if not diag:
         return out['fid'], log, images
 
@@ -813,6 +835,7 @@ def evaluate(step):
         raw = generate()
         log['val/fid_raw'], log['val/is_raw'] = raw['fid'], raw['is']
         log['val/precision_raw'], log['val/recall_raw'] = precision_recall(pr_real, raw['features'].to(device))
+    timer.lap('precision / recall / memorization')
     # 5. probes
     for (b, t), r in probes.items():
         log[f'probe/knn_block{b:02d}_t{t:.2f}'] = r['knn']
@@ -824,9 +847,11 @@ def evaluate(step):
     denoiser.eval()
     passes = {split: diag_lib.noise_level_pass(denoiser.net, xb, yb, diag_ts, noise_scale, t_eps, ctx, band_masks)
               for split, (xb, yb) in (('train', diag_train), ('val', diag_val))}
+    timer.lap('noise-level passes')
     # 4. locality ablation on the held-out batch: same images / noise / t, attention confined to tiles
     window_passes = {k: diag_lib.noise_level_pass(denoiser.net, *diag_val, diag_ts, noise_scale, t_eps, ctx, band_masks, tile=k)
                      for k in window_tiles}
+    timer.lap('window ablation')
     # skip pathway: the trunk-only prediction on the same held-out images and noise (what the trunk is trained on; never sampled)
     has_skip = getattr(denoiser.net, 'skip_pathway', False)
     trunk_pass = diag_lib.noise_level_pass(denoiser.net, *diag_val, diag_ts, noise_scale, t_eps, ctx, band_masks, skip_on=False) if has_skip else None
@@ -839,6 +864,7 @@ def evaluate(step):
         if has_skip:
             sensitivity['trunk'] = diag_lib.input_sensitivity(denoiser.net, *diag_val, diag_ts, noise_scale, ctx, diag_sensitivity_images,
                                                               skip_on=False, masks=band_masks)
+    timer.lap('sensitivity')
     denoiser.train()
     t_labels = [f'{t:.3f}' for t in diag_ts.tolist()]
     for i, tl in enumerate(t_labels):
@@ -937,6 +963,7 @@ def evaluate(step):
                              if layout is not None else None})
     with open(os.path.join(d, f'diag_{step}.json'), 'w') as f:
         json.dump(record, f)
+    timer.lap('diagnostic plots / json')
     log['diag_minutes'] = (time.time() - t_start) / 60
     return out['fid'], log, images
 
@@ -1043,12 +1070,14 @@ while True:
     if (eval_only or (iter_num > 0 and local_iter_num > 0 and (iter_num % eval_iters == 0 or iter_num == max_iters))):
         fid, eval_log, eval_images = evaluate(iter_num)
         save_samples(iter_num)
+        eval_timer.lap('sample grids')
         progress_gifs = {}
         if progress_gif:
             try: # animation must never stop training
                 progress_gifs = make_progress_gifs(out_dir)
             except Exception as e:
                 print(f"warning: progress gif failed ({type(e).__name__}: {e}); training continues")
+            eval_timer.lap('progress gifs')
         trend_images = {}
         if trend_plots and diag:
             try: # plotting must never stop training
@@ -1056,6 +1085,9 @@ while True:
                 trend_images = plot_trends.make_run_figures(out_dir)
             except Exception as e:
                 print(f"warning: trend plots failed ({type(e).__name__}: {e}); training continues")
+            eval_timer.lap('trend plots')
+        eval_log.update({f"eval_minutes/{k.replace(' / ', '_').replace(' ', '_')}": v for k, v in eval_timer.times.items()})
+        print(f"eval took {sum(eval_timer.times.values()):.1f} min: " + ', '.join(f"{k} {v:.1f}" for k, v in eval_timer.times.items()))
         best_fid = min(best_fid, fid)
         extra = ''.join(f", {k.split('/')[-1]} {eval_log[k]:.3f}" for k in ('val/precision', 'val/recall', 'val/fid_raw', 'mem/nn_ratio') if k in eval_log)
         loss_str = ', '.join(f"{k.split('/')[-1].replace('_', ' ')} {eval_log[k]:.4f}" for k in ('eval/train_loss', 'eval/val_loss') if k in eval_log)
