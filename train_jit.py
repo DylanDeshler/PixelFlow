@@ -33,11 +33,13 @@ import torch
 from data_jit import MemmapImages, EpochSampler, Prefetcher, to_model_input
 from jit_common import build_denoiser, resolve_arch, describe_arch, run_dir, legacy_run_dir, ema_state_dicts, ema_weights, generate_and_score, save_labeled_grid, save_layout_grids, save_geometry_grid, save_geometry_live, plot_geometry_vs_t, GAUSS_DEFAULTS
 from fid import InceptionMetrics, load_ref_stats, precision_recall
-from repa import FrozenEncoder, Projector, MaskedTransformerAdapter, BlockCapture, repa_loss, mta_loss
+from repa import FrozenEncoder, Projector, MaskedTransformerAdapter, BlockCapture, DispCapture, repa_loss, mta_loss, dispersive_loss
+from balancer import GradientBalancer
 from masking import TokenMasker, flow_loss
 from loss_weighting import LossWeighting, image_power_spectrum
 from muon import Muon, CombinedOptimizer
 import diagnostics as diag_lib
+import alloc_eval as alloc_lib
 import plot_trends
 from progress_gif import make_progress_gifs
 
@@ -152,6 +154,11 @@ P_mean = -0.8
 P_std = 0.8
 t_eps = 5e-2
 noise_scale = 0.0 # 0 -> img_size / 256, JiT's resolution rule (1.0 at 256, 2.0 at 512)
+token_sizes = '' # 'coarse,fine' (e.g. '16,8', coarse = the model's patch size): two token sizes on one trunk, each training
+                 # sample's size drawn in proportion to the fine tokens' measured loss gain at its noise level (model_jit.TokenAllocation)
+fine_frac = 0.25 # the token budget: the share of each batch on fine tokens (and the default share of sampling calls)
+alloc_floor = 0.1 # exploration: every noise level keeps this x the mean gain as weight, so both sizes stay trained everywhere
+alloc_gain = 'rel' # 'rel' ((L_coarse - L_fine) / L_coarse, unit-free) or 'abs'
 loss_freq_weight = 'none' # 'wiener': weight the residual's frequencies by their Wiener gain at each noise level, normalized per level (loss_weighting.py);
                           # 'table': by the share a trained model recovers instead (--loss_freq_table, from build_freq_table.py)
 loss_freq_table = '' # JSON from build_freq_table.py, for loss_freq_weight='table'
@@ -185,6 +192,12 @@ ema_warmup = True # decay = min(decay, (1+step)/(10+step)); False is JiT's updat
 repa_encoder = '' # e.g. timm:vit_base_patch14_dinov2.lvd142m (PixelREPA's DINOv2 setup), dinov2_vitb14, dino_vitb16
 repa_adapter = 'mlp' # 'mlp' (REPA's MLP projector; hurts JiT per Shin et al. 2026) or 'mta' (PixelREPA's Masked Transformer Adapter)
 repa_depth = 4 # align the output of this block (1-indexed); JiT-B's in_context_start, the block PixelREPA uses
+disp_weight = 0.0 # Dispersive Loss (Wang & He 2025, repa.dispersive_loss): weight lambda, 0 = off (the paper: 0.5; their PyTorch code: 0.25)
+disp_temp = 0.5 # its temperature tau (the paper: 0.5; their PyTorch code: 1.0)
+disp_blocks = '' # blocks whose outputs it disperses (1-indexed): '' -> depth // 4 (the paper's default, block 3 of JiT-B's 12), a comma list, or 'all' (averaged)
+disp_kind = 'infonce_l2' # 'infonce_l2' (best in the paper), 'infonce_cos', 'hinge', 'covariance' (repa.dispersive_loss)
+disp_balance = 0.0 # > 0: instead of the fixed weight, EnCodec's gradient balancer at the block: the dispersive loss gets this share
+                   # of the gradient into the blocks below (the diffusion loss gets 1 - share); disp_weight is then ignored (one block only)
 repa_coeff = -1.0 # alignment loss weight; -1 -> the method's published value: 0.5 for mlp (REPA), 0.1 for mta (PixelREPA)
 repa_proj_dim = 2048 # mlp only: projector width (REPA)
 repa_mask_ratio = 0.2 # mta only: fraction of adapter-input tokens masked (PixelREPA)
@@ -229,6 +242,17 @@ diag_opt_stats = True # 4: grad norms and update/weight ratios per block, every 
 device = 'cuda'
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float32'
 compile = True # torch.compile the whole network; False disables dynamo entirely
+alloc_eval = True # two token sizes: the allocation's eval (alloc_eval.py) at every eval: matched per-size held-out loss per t,
+                  # FID under fixed allocations (same noise and labels), fixed sample rows, plots
+alloc_eval_conditions = 'coarse,budget,budget:0.5,fine,window:0-0.25,window:0.25-0.5,window:0.5-0.75,window:0.75-1'
+alloc_eval_images = 1000 # FID-N per allocation (must be divisible by the number of classes); differences between allocations
+                         # share the noise and labels, so they're much less noisy than N suggests
+alloc_eval_loss_images = 1024 # held-out images for the matched per-size loss
+alloc_eval_ts = 16 # noise levels for it (bin centres of a uniform t grid)
+alloc_eval_show = 8 # sample columns (labels spread over the classes), same noise under every allocation and at every eval
+act_memory_budget = 1.0 # < 1: torch.compile recomputes cheap activations in the backward instead of saving them, keeping about this
+                        # fraction of the saved-activation memory (Inductor's activation_memory_budget): fits larger batches /
+                        # fine shares without gradient accumulation, for some recompute. 1.0 = off. Needs compile
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 _defaults = {k: globals()[k] for k in config_keys} # to name the run by what changed
@@ -313,6 +337,7 @@ model_name, arch = resolve_arch(model, **{k: (None if v < 0 else v) for k, v in 
             route_gate_tau=quad_gate_tau if quad_router == 'dino' else None, pos_embed=quad_pos, rope=quad_rope,
             area_bias=quad_area_bias, level_embed=quad_level_embed) if is_quadtree else {}),
     **({k: v for k, v in GAUSS_FLAGS.items() if v != GAUSS_DEFAULTS[k]} if is_gauss else {}),
+    **(dict(token_sizes=token_sizes, fine_frac=fine_frac, alloc_floor=alloc_floor, alloc_gain=alloc_gain) if token_sizes else {}),
     attn_res=None if attn_res == 'none' else attn_res,
     attn_res_block_size=attn_res_block_size if (attn_res == 'block' and attn_res_block_size > 0) else None,
     adaln_single=adaln_single or None, attn_res_adaln=attn_res_adaln or None, gated_bottleneck=gated_bottleneck or None,
@@ -434,6 +459,32 @@ with open(os.path.join(out_dir, 'config.json'), 'w') as f:
 grid = img_size // denoiser.net.patch_size
 
 encoder, projector, capture = None, None, None
+if token_sizes:
+    assert not (repa_encoder or disp_weight > 0 or disp_balance > 0), 'token_sizes: no REPA / dispersive loss yet (two forwards per step)'
+    if diag_window_tiles:
+        print('token_sizes: the windowed-attention diagnostic is off (it reimplements the single-size forward)')
+        diag_window_tiles = ''
+    _pc, _pf = (int(v) for v in token_sizes.split(','))
+    tokens_per_img = (1 - fine_frac) * (img_size // _pc) ** 2 + fine_frac * (img_size // _pf) ** 2
+    print(f"two token sizes: {_pc}px ({(img_size // _pc) ** 2} tokens) and {_pf}px ({(img_size // _pf) ** 2}); fine share {fine_frac} "
+          f"-> {tokens_per_img:.0f} tokens per training image on average")
+else:
+    tokens_per_img = grid ** 2 if getattr(denoiser.net, 'family', 'jit') == 'jit' and not is_gauss else None # (model-specific token counts elsewhere)
+disp_captures = [] # Dispersive Loss: hooks on the chosen blocks, registered here, before compiling, so they're traced in
+disp_balancer = None
+if disp_weight > 0 or disp_balance > 0:
+    n_blocks = len(denoiser.net.blocks)
+    disp_idx = list(range(1, n_blocks + 1)) if disp_blocks == 'all' else \
+        ([int(b) for b in disp_blocks.split(',')] if disp_blocks else [max(1, n_blocks // 4)])
+    assert all(1 <= b <= n_blocks for b in disp_idx), f'disp_blocks {disp_idx} outside 1..{n_blocks}'
+    if disp_balance > 0:
+        assert len(disp_idx) == 1 and 0 < disp_balance < 1, 'disp_balance: one block, a share in (0, 1)'
+        # total norm = the diffusion branch's own running norm: the trunk's gradient keeps its natural scale
+        disp_balancer = GradientBalancer({'diff': 1.0 - disp_balance, 'disp': disp_balance}, reference='diff').to(device)
+        disp_weight = 1.0 # the balancer sets the gradient shares; the loss term enters unweighted
+    disp_captures = [DispCapture(denoiser.net, b, disp_balancer) for b in disp_idx]
+    print(f"dispersive loss ({disp_kind}): " + (f"balanced, share {disp_balance} of the gradient below block {disp_idx[0]}" if disp_balancer
+          else f"weight {disp_weight}") + f", temperature {disp_temp}, block(s) {disp_idx} of {n_blocks}")
 if repa_encoder:
     assert repa_adapter in ('mlp', 'mta'), f"repa_adapter must be 'mlp' or 'mta', got {repa_adapter}"
     repa_coeff = repa_coeff if repa_coeff >= 0 else (0.5 if repa_adapter == 'mlp' else 0.1)
@@ -559,6 +610,8 @@ if init_from == 'resume':
         masker.load_state_dict(checkpoint['masker'])
     if loss_weighter is not None and checkpoint.get('loss_weighting') is not None:
         loss_weighter.load_state_dict(checkpoint['loss_weighting'])
+    if disp_balancer is not None and checkpoint.get('disp_balancer') is not None:
+        disp_balancer.load_state_dict(checkpoint['disp_balancer'])
     optimizer.load_state_dict(checkpoint['optimizer'])
     iter_num = checkpoint['iter_num']
     best_fid = checkpoint['best_fid']
@@ -575,6 +628,11 @@ if compile:
     # whole network, after every hook (REPA capture, token masking) is registered so they're traced in;
     # Module.compile keeps the parameter names, so checkpoints and EMA are unaffected
     print("compiling the model... (the first iteration and the first eval take a few minutes)")
+    if token_sizes: # the two paths are two fixed shapes: keep them two static graphs rather than one dynamic-shape graph
+        torch._dynamo.config.automatic_dynamic_shapes = False
+    if act_memory_budget < 1.0:
+        import torch._functorch.config
+        torch._functorch.config.activation_memory_budget = act_memory_budget
     denoiser.net.compile()
 ref_stats_path = os.path.join(data_dir, 'fid_stats_jit.npz')
 if not os.path.exists(ref_stats_path):
@@ -590,6 +648,12 @@ loss_sets = {'train': data.get(_spaced(len(data), eval_loss_images))}
 if os.path.exists(os.path.join(data_dir, 'val', 'meta.json')):
     _val = MemmapImages(os.path.join(data_dir, 'val'))
     loss_sets['val'] = _val.get(_spaced(len(_val), eval_loss_images))
+if token_sizes and alloc_eval:
+    assert alloc_eval_images % num_classes == 0, f'alloc_eval_images must be divisible by the number of classes ({num_classes})'
+    _xs, _ys = loss_sets.get('val', loss_sets['train'])
+    alloc_val = (_xs[:alloc_eval_loss_images], _ys[:alloc_eval_loss_images])
+    alloc_ts = ((np.arange(alloc_eval_ts) + 0.5) / alloc_eval_ts).tolist()
+    alloc_show_labels = torch.linspace(0, num_classes - 1, alloc_eval_show).long().to(device)
 
 @torch.no_grad()
 def estimate_loss(images, labels, chunk=256, seed=0):
@@ -723,6 +787,18 @@ def evaluate(step):
             denoiser.train()
             probes = diag_lib.run_probes(tr, probe_train_y, va, probe_val_y, num_classes)
     log['val/fid'], log['val/is'] = out['fid'], out['is']
+    if token_sizes and alloc_eval:
+        # the allocation: matched per-size held-out loss, FID-N under fixed allocations (same noise and labels), sample rows
+        a_log, a_images, _ = alloc_lib.evaluate_allocation(
+            step, denoiser, denoiser.net, alloc_val[0], alloc_val[1], out_dir, generate_and_score=generate_and_score, metrics=metrics,
+            ref_stats=ref_stats, num_classes=num_classes, device=device, ctx=ctx, gen_batch_size=gen_batch_size,
+            sampler=dict(cfg=fid_cfg, interval=(fid_interval_min, fid_interval_max), steps=num_sampling_steps, method=sampling_method, eta=sampling_eta),
+            show_sampler=dict(cfg=sample_cfg or fid_cfg, interval=(sample_interval_min, sample_interval_max), steps=num_sampling_steps,
+                              method=sampling_method, eta=sampling_eta),
+            conditions=alloc_eval_conditions, fid_images=alloc_eval_images, show_labels=alloc_show_labels, class_names=class_names,
+            loss_ts=alloc_ts, ema_context=lambda: ema_weights(denoiser, 1))
+        log.update(a_log)
+        images.update(a_images)
     if not diag:
         return out['fid'], log, images
 
@@ -917,6 +993,7 @@ def save_checkpoint():
         'projector': projector.state_dict() if projector is not None else None,
         'masker': masker.state_dict() if masker is not None else None,
         'loss_weighting': loss_weighter.state_dict() if loss_weighter is not None else None,
+        'disp_balancer': disp_balancer.state_dict() if disp_balancer is not None else None,
         'optimizer': optimizer.state_dict(),
         'denoiser_args': denoiser_args,
         'iter_num': iter_num,
@@ -983,6 +1060,20 @@ while True:
         extra = ''.join(f", {k.split('/')[-1]} {eval_log[k]:.3f}" for k in ('val/precision', 'val/recall', 'val/fid_raw', 'mem/nn_ratio') if k in eval_log)
         loss_str = ', '.join(f"{k.split('/')[-1].replace('_', ' ')} {eval_log[k]:.4f}" for k in ('eval/train_loss', 'eval/val_loss') if k in eval_log)
         print(f"iter {iter_num} (epoch {iter_num / iters_per_epoch:.2f}): {loss_str}, FID-{fid_num_images / 1000:g}k {fid:.2f}, IS {eval_log['val/is']:.1f} (cfg {fid_cfg}){extra}")
+        alloc = getattr(denoiser.net, 'alloc', None)
+        if alloc is not None: # the token allocation: fine tokens' relative gain and how often each noise range trains them
+            gain = alloc.gain().tolist(); tot = alloc.count.sum(0).clamp_min(1)
+            share = (alloc.count[1] / tot).tolist()
+            edges = [(lo, hi) for lo, hi in ((0.0, 0.2), (0.2, 0.4), (0.4, 0.6), (0.6, 0.8), (0.8, 1.0))]
+            centres = torch.sigmoid(torch.linspace(-alloc.logit_range, alloc.logit_range, alloc.bins + 1)[:-1] + alloc.logit_range / alloc.bins).tolist()
+            summ = []
+            for lo, hi in edges:
+                ix = [i for i, c in enumerate(centres) if lo <= c < hi]
+                if ix:
+                    summ.append(f"t {lo:.1f}-{hi:.1f}: gain {sum(gain[i] for i in ix) / len(ix):+.3f}, fine share so far {sum(share[i] for i in ix) / len(ix):.2f}")
+                    eval_log[f'alloc/gain_t{lo:.1f}'] = sum(gain[i] for i in ix) / len(ix)
+                    eval_log[f'alloc/fine_share_t{lo:.1f}'] = sum(share[i] for i in ix) / len(ix)
+            print('token allocation: ' + '; '.join(summ))
         if loss_weighter is not None: # the learned per-level weights / per-level normalization factors
             lw = loss_weighter.summary()
             eval_log.update({f'loss_weighting/{k}': v for k, v in lw.items()})
@@ -1015,15 +1106,17 @@ while True:
     for micro_step in range(gradient_accumulation_steps):
         with ctx:
             loss_parts = {}
-            if masker is None and not (encoder is not None and repa_adapter == 'mta') and not skip_stop_grad and loss_weighter is None:
+            if masker is None and not (encoder is not None and repa_adapter == 'mta') and not skip_stop_grad and loss_weighter is None and not token_sizes:
                 loss_fm = denoiser(X, Y) # JiT's own loss
                 loss_parts['skip'] = loss_fm
             else:
                 # same loss, but exposing this forward's t / dropped labels (the PixelREPA adapter is conditioned on them)
                 # and, with skip_stop_grad, adding the trunk-only prediction's loss
                 token_mask = masker.sample(len(X), mask_ratio, mask_prob, device) if masker is not None else None
+                # two token sizes: each path backpropagates right after its forward (peak memory = the larger path)
+                path_backward = (lambda l: (l / gradient_accumulation_steps).backward()) if token_sizes else None
                 loss_fm, t_used, y_used = flow_loss(denoiser, X, Y, masker, token_mask, mask_weighting, return_aux=True, parts=loss_parts,
-                                                    weighter=loss_weighter)
+                                                    weighter=loss_weighter, backward=path_backward)
             loss = loss_fm
             if encoder is not None:
                 target = encoder(X, grid)
@@ -1032,12 +1125,16 @@ while True:
                 else:
                     loss_repa = mta_loss(capture.out, target, projector, t_used, y_used)
                 loss = loss + repa_coeff * loss_repa
+            if disp_captures:
+                loss_disp = sum(dispersive_loss(c.out, disp_temp, disp_kind) for c in disp_captures) / len(disp_captures)
+                loss = loss + disp_weight * loss_disp
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately fetch the next batch while the GPU works on the forward pass
         t_data = time.time()
         X, Y = get_batch()
         data_seconds += time.time() - t_data # host time reading the next batch (the GPU only overlaps it with the forward)
-        loss.backward()
+        if not token_sizes: # (already backpropagated per path)
+            loss.backward()
     # 4. optimization health: grad norms and update/weight ratios per block (only on logging iterations)
     log_opt = diag_opt_stats and iter_num % log_interval == 0
     if log_opt:
@@ -1069,7 +1166,7 @@ while True:
         if not math.isfinite(lossf):
             raise RuntimeError(f"loss is {lossf} at iter {iter_num}, stopping")
         imgs_per_sec = effective_batch_size / dt
-        repa_str = f", repa {loss_repa.item():.4f}" if encoder is not None else ""
+        repa_str = (f", repa {loss_repa.item():.4f}" if encoder is not None else "") + (f", disp {loss_disp.item():.4f}" if disp_captures else "")
         grad_str = f", grad norm {math.sqrt(sum(v ** 2 for v in grad_norms.values())):.4f}" if log_opt else ""
         trunk_str = f", trunk-only loss {loss_trunkf:.4f}" if loss_trunkf is not None else ""
         geo_stats = denoiser.net.geometry_stats() if is_gauss else {} # the training batch's token geometry
@@ -1082,7 +1179,7 @@ while True:
                       f"{g_['rotation_mean']:+.1f}deg, same sign {g_['rotation_same_sign']:.0%}, within-image std {g_['rotation_within']:.1f}deg"
                       if denoiser.net.max_rotation > 0 else '')) if g_ else ""
         print(f"iter {iter_num} (epoch {iter_num / iters_per_epoch:.2f}): loss {lossf:.4f}{trunk_str}{repa_str}{grad_str}{geo_str}, time {dt*1000:.2f}ms "
-              f"(data {data_seconds*1000:.0f}ms), {imgs_per_sec:.0f} img/s")
+              f"(data {data_seconds*1000:.0f}ms), {imgs_per_sec:.0f} img/s" + (f", {imgs_per_sec * tokens_per_img / 1e3:.0f}k tok/s" if tokens_per_img else ""))
         if wandb_log:
             log = {
                 "iter": iter_num,
@@ -1092,12 +1189,17 @@ while True:
                 **({"train/loss_trunk": loss_trunkf} if loss_trunkf is not None else {}),
                 "lr": lr_now,
                 "imgs_per_sec": imgs_per_sec,
+                **({"tokens_per_sec": imgs_per_sec * tokens_per_img} if tokens_per_img else {}),
                 "data_ms": data_seconds * 1000,
             }
             if optimizer_type == 'muon':
                 log["lr_muon"] = peak_muon_lr * lr_now / lr
             if encoder is not None:
                 log["train/repa_loss"] = loss_repa.item()
+            if disp_captures:
+                log["train/disp_loss"] = loss_disp.item()
+            if disp_balancer is not None: # each branch's running gradient norm at the block, before scaling
+                log.update({f"train/balance_norm_{k}": v for k, v in disp_balancer.avg_norms().items()})
             log.update({f"geometry/{k}": v for k, v in geo_stats.items()})
             if log_opt:
                 log["grad_norm/total"] = math.sqrt(sum(v ** 2 for v in grad_norms.values()))
@@ -1113,6 +1215,10 @@ while True:
         record.update({f'geometry_{k}': v for k, v in geo_stats.items()})
         if encoder is not None:
             record['repa_loss'] = loss_repa.item()
+        if disp_captures:
+            record['disp_loss'] = loss_disp.item()
+        if disp_balancer is not None:
+            record.update({f'balance_norm_{k}': v for k, v in disp_balancer.avg_norms().items()})
         if optimizer_type == 'muon':
             record['lr_muon'] = peak_muon_lr * lr_now / lr
         if log_opt:

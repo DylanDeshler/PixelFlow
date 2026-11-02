@@ -111,7 +111,7 @@ def instrumented_forward(net, x, t, y, capture_blocks=(), tile=None, skip_on=Tru
     tile: if set, runs the windowed-attention ablation (see tile_mask) instead of full attention.
     skip_on: False runs a skip-pathway model without its skip (the trunk-only prediction, used for skip_residual).
     """
-    if getattr(net, 'family', 'jit') != 'jit': # PixelDiT, QuadtreeJiT: the model's own forward
+    if getattr(net, 'family', 'jit') != 'jit' or getattr(net, 'token_sizes', ()): # PixelDiT, QuadtreeJiT, two-size JiT: the model's own forward
         return _plain_forward(net, x, t, y, capture_blocks, tile)
     g = int(round(net.x_embedder.num_patches ** 0.5))
     x_input = x

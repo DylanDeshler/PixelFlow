@@ -13,8 +13,10 @@ import copy
 import torch
 import torch.nn as nn
 import math
+
+import numpy as np
 import torch.nn.functional as F
-from util.model_util import VisionRotaryEmbeddingFast, get_2d_sincos_pos_embed, RMSNorm
+from util.model_util import VisionRotaryEmbeddingFast, get_2d_sincos_pos_embed, get_2d_sincos_pos_embed_from_grid, RMSNorm, rotate_half
 
 
 class LayerNorm(nn.Module):
@@ -650,6 +652,129 @@ class AttnResState:
             self.partial = torch.cat([zeros, self.partial], dim=1)
 
 
+def token_coords(n, p, p_coarse):
+    # positions of an n x n grid of p-pixel tokens in coarse-token units, as JiT's tables index the coarse grid (token i at i):
+    # centre (j + 0.5) p pixels -> (j + 0.5) p / p_coarse - 0.5, so a fine token sits where its pixels are on the coarse grid
+    return (np.arange(n, dtype=np.float64) + 0.5) * p / p_coarse - 0.5
+
+def sincos_at(dim, coords):
+    # JiT's fixed 2D sin-cos table (get_2d_sincos_pos_embed) at arbitrary 1D coordinates per axis -> [n * n, dim]
+    grid = np.stack(np.meshgrid(coords, coords), axis=0).reshape([2, 1, len(coords), len(coords)])
+    return get_2d_sincos_pos_embed_from_grid(dim, grid)
+
+class RopeAt(nn.Module):
+    """
+    VisionRotaryEmbeddingFast (JiT's 2D RoPE, 'lang' frequencies, no class tokens) at arbitrary 1D coordinates per axis
+    instead of 0..n-1: the same tables at integer coordinates.
+    """
+    def __init__(self, dim, coords, theta=10000):
+        super().__init__()
+        freqs = 1. / (theta ** (torch.arange(0, dim, 2)[:(dim // 2)].float() / dim))
+        f = torch.as_tensor(coords, dtype=torch.float32)[:, None] * freqs[None] # [n, dim / 2]
+        f = f.repeat_interleave(2, dim=-1) # as repeat('... n -> ... (n r)', r=2)
+        n = len(coords)
+        f = torch.cat([f[:, None, :].expand(n, n, -1), f[None, :, :].expand(n, n, -1)], dim=-1) # as broadcat, rows then columns
+        self.register_buffer('freqs_cos', f.cos().reshape(n * n, -1), persistent=False)
+        self.register_buffer('freqs_sin', f.sin().reshape(n * n, -1), persistent=False)
+
+    def forward(self, t):
+        return t * self.freqs_cos + rotate_half(t) * self.freqs_sin
+
+class TokenAllocation(nn.Module):
+    """
+    Which token size each training sample gets, learned from the losses (token_sizes). Per noise-level bin (logit t), running
+    means of each path's per-sample training loss -- from different images: the expected gain E[L_coarse - L_fine | t] needs
+    no matched pairs -- give the gain of fine tokens there, relative ((L_c - L_f) / L_c, unit-free, as the learned
+    per-level weight sees the loss) or absolute. Each training step gives a fixed quota (fine_frac of the batch, so shapes
+    stay static and the token budget is exact) to samples drawn without replacement in proportion to their bin's gain plus a
+    floor (alloc_floor x the mean gain): proportional, not greedy, so every bin keeps training both paths and its estimates
+    stay valid, and the model stays in distribution for any allocation at inference. Until the statistics cover the visited t,
+    the draw is uniform (see ready). The statistics are buffers: saved with the model, and they decide inference.
+    Inference (fine_mask): fine tokens where t ranks in the top infer_frac of a uniform t grid by gain (an exact share of a
+    uniform sampler's calls; default fine_frac): a compute knob. fine_windows (a list of (lo, hi) t ranges) overrides the
+    ranking, for evaluating fixed allocations; calls counts [coarse, fine] samples routed outside training.
+    """
+    def __init__(self, fine_frac, floor, gain='rel', bins=32, logit_range=6.0, decay=0.995, min_count=8):
+        super().__init__()
+        assert gain in ('rel', 'abs'), f"alloc_gain must be 'rel' or 'abs', got {gain}"
+        assert 0 < fine_frac < 1, f'fine_frac must be in (0, 1), got {fine_frac}'
+        self.fine_frac, self.floor, self.gain_kind = fine_frac, floor, gain
+        self.bins, self.logit_range, self.decay, self.min_count = bins, logit_range, decay, min_count
+        self.infer_frac = fine_frac
+        self.fine_windows = None
+        self.calls = [0, 0]
+        self.register_buffer('ema', torch.zeros(2, bins)) # running mean per-sample loss: [coarse, fine] x bins
+        self.register_buffer('count', torch.zeros(2, bins)) # samples seen per path and bin
+
+    def bin(self, t):
+        lt = torch.logit(t.float().flatten().clamp(1e-6, 1 - 1e-6)).clamp(-self.logit_range, self.logit_range - 1e-6)
+        return ((lt + self.logit_range) / (2 * self.logit_range) * self.bins).long()
+
+    def valid(self):
+        return (self.count >= self.min_count).all(0) # [bins] both paths seen enough
+
+    def ready(self):
+        # statistics cover the noise levels training visits: >= 99% of the samples fell in bins where both paths have
+        # enough (the sampler's far tails may never fill, and borrow a neighbour's gain)
+        v, tot = self.valid(), self.count.sum(0)
+        return bool(v.any() and tot[v].sum() >= 0.99 * tot.sum())
+
+    def gain(self):
+        # [bins] gain of fine tokens per bin (0 where fine isn't better); bins without statistics take the nearest valid bin's
+        d = self.ema[0] - self.ema[1]
+        if self.gain_kind == 'rel':
+            d = d / self.ema[0].clamp_min(1e-12)
+        d = d.clamp_min(0)
+        v = self.valid()
+        if v.any() and not v.all():
+            idx = torch.arange(self.bins, device=d.device)
+            vi = idx[v]
+            d = d[vi[(idx[:, None] - vi[None, :]).abs().argmin(1)]]
+        return d
+
+    @torch.no_grad()
+    def weights(self, t):
+        # per-sample sampling weights for the fine quota
+        if not self.ready():
+            return torch.ones(t.numel(), device=t.device)
+        g = self.gain()
+        return g[self.bin(t)] + self.floor * g.mean().clamp_min(1e-12)
+
+    @torch.no_grad()
+    def update(self, t, loss, path):
+        # running means of the per-sample loss for one path (0 coarse, 1 fine) at noise levels t
+        b = self.bin(t)
+        n = torch.zeros(self.bins, device=t.device).scatter_add_(0, b, torch.ones_like(loss, dtype=torch.float32))
+        m = torch.zeros(self.bins, device=t.device).scatter_add_(0, b, loss.float()) / n.clamp_min(1)
+        new = self.count[path] == 0
+        self.ema[path] = torch.where(n > 0, torch.where(new, m, self.decay * self.ema[path] + (1 - self.decay) * m), self.ema[path])
+        self.count[path] += n
+
+    @torch.compiler.disable
+    def fine_mask(self, t):
+        # inference: which samples get fine tokens, from their t ([B] bool)
+        t = t.flatten().float()
+        if self.fine_windows is not None:
+            m = torch.zeros_like(t, dtype=torch.bool)
+            for lo, hi in self.fine_windows:
+                m |= (t >= lo) & ((t < hi) | (hi >= 1))
+        elif not self.ready():
+            m = torch.zeros_like(t, dtype=torch.bool)
+        else:
+            # rank a uniform t grid by gain, ties (equal gains, points in one bin) broken toward higher t, nearer the data: the
+            # top infer_frac of the grid gets fine tokens, an exact share whatever the bins' resolution
+            n = 199
+            grid = torch.linspace(0.5 / n, 1 - 0.5 / n, n)
+            g = self.gain().cpu()[self.bin(grid)]
+            order = sorted(range(n), key=lambda i: (g[i].item(), i), reverse=True)
+            on = torch.zeros(n, dtype=torch.bool)
+            on[order[:round(self.infer_frac * n)]] = True
+            m = on.to(t.device)[(t * n).long().clamp(0, n - 1)]
+        k = int(m.sum())
+        self.calls[0] += len(m) - k; self.calls[1] += k
+        return m
+
+
 class JiT(nn.Module):
     """
     Just image Transformer.
@@ -695,7 +820,11 @@ class JiT(nn.Module):
         skip_decoder_rank=0,
         skip_decoder_conv=False,
         skip_decoder_attnres=False,
-        skip_decoder_modulation=True
+        skip_decoder_modulation=True,
+        token_sizes='',
+        fine_frac=0.25,
+        alloc_floor=0.1,
+        alloc_gain='rel',
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -825,6 +954,22 @@ class JiT(nn.Module):
         # linear predict
         # with patch_overlap / head_overlap the final layer predicts overlapping (patch + 2 * overlap)^2 patches, blended by overlap-add
         self.final_layer = FinalLayer(hidden_size, patch_size + 2 * self.out_overlap, self.out_channels, adaln_single=adaln_single, layernorm=layernorm)
+        # two token sizes (token_sizes='16,8'): one shared trunk, coarse tokens (patch_size) or fine tokens per forward, each
+        # with its own patch embedding, sin-cos table, RoPE table and final layer (see TokenAllocation)
+        self.token_sizes = tuple(int(v) for v in token_sizes.split(',')) if token_sizes else ()
+        if self.token_sizes:
+            assert len(self.token_sizes) == 2 and self.token_sizes[0] == patch_size and patch_size % self.token_sizes[1] == 0, \
+                f"token_sizes: 'coarse,fine' with coarse = patch_size ({patch_size}) a multiple of fine, got {token_sizes}"
+            assert in_context_len == 0 and not (gated_bottleneck or skip_pathway or dcae_stem or dcae_head or patch_overlap or head_overlap), \
+                'token_sizes: plain JiT only (no in-context tokens, skip pathway, DC-AE, overlap or gated bottleneck)'
+            pf = self.fine_patch = self.token_sizes[1]
+            self.x_embedder_fine = BottleneckPatchEmbed(input_size, pf, in_channels, bottleneck_dim, hidden_size, bias=True)
+            self.final_layer_fine = FinalLayer(hidden_size, pf, self.out_channels, adaln_single=adaln_single, layernorm=layernorm)
+            n_f = input_size // pf
+            coords = token_coords(n_f, pf, patch_size) # in coarse-token units, centres aligned with the coarse grid's
+            self.register_buffer('pos_embed_fine', torch.from_numpy(sincos_at(hidden_size, coords)).float().unsqueeze(0), persistent=False)
+            self.feat_rope_fine = RopeAt(hidden_size // num_heads // 2, coords)
+            self.alloc = TokenAllocation(fine_frac, alloc_floor, alloc_gain)
         if skip_final_layer:
             # the with-skip prediction (what evaluation and sampling use) gets its own final layer; final_layer then only
             # serves the trunk-only branch of skip_stop_grad, so nothing the skip branch trains is shared with the trunk
@@ -1006,9 +1151,12 @@ class JiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def run_blocks(self, x, res, start, end, c_blocks, y_emb):
+    def run_blocks(self, x, res, start, end, c_blocks, y_emb, fine=False):
         # trunk blocks start..end-1 (0-indexed), with the in-context class tokens prepended at in_context_start
         for i in range(start, end):
+            if fine: # fine tokens (token_sizes): their own RoPE table, no in-context tokens
+                x = self.blocks[i](x, c_blocks, self.feat_rope_fine, res=res, index=i)
+                continue
             if self.in_context_len > 0 and i == self.in_context_start:
                 in_context_tokens = y_emb.unsqueeze(1).repeat(1, self.in_context_len, 1)
                 in_context_tokens += self.in_context_posemb
@@ -1020,7 +1168,7 @@ class JiT(nn.Module):
             x = self.blocks[i](x, c_blocks, self.feat_rope if i < self.in_context_start else self.feat_rope_incontext, res=res, index=i)
         return x
 
-    def forward(self, x, t, y, return_trunk=False):
+    def forward(self, x, t, y, return_trunk=False, patch=None):
         """
         x: (N, C, H, W)
         t: (N,)
@@ -1029,7 +1177,20 @@ class JiT(nn.Module):
         (skip_stop_grad in training). The skip branch then continues from a detached copy of the trunk's state at the
         injection point, so its loss trains only the skip pathway, the blocks after the injection point and the final
         layer, never the embeddings or the blocks before it. Returns (prediction with skip, trunk-only prediction).
+        patch (token_sizes): the token size for this call; None routes each sample by its t (TokenAllocation.fine_mask), a
+        mixed batch as two sub-forwards.
         """
+        fine = False
+        if self.token_sizes:
+            if patch is None:
+                m = self.alloc.fine_mask(t)
+                if bool(m.all()):
+                    patch = self.fine_patch
+                elif not bool(m.any()):
+                    patch = self.patch_size
+                else:
+                    return self.routed_forward(x, t, y, m)
+            fine = patch == self.fine_patch
         # class and time embeddings
         t_emb = self.t_embedder(t)
         y_emb = self.y_embedder(y)
@@ -1039,14 +1200,14 @@ class JiT(nn.Module):
         # forward JiT
         skip = self.skip_embedder(x) if self.skip_pathway and self.skip_decoder == 'linear' else None # from the noisy input
         x_input = x # the raw noisy image, for a skip_decoder
-        x = self.embed(x, c)
+        x = self.embed(x, c, fine)
 
         res = AttnResState(self, x, c) if self.attn_res != 'none' else None
         depth = len(self.blocks)
         k = self.skip_inject_after if self.skip_pathway else depth
-        x = self.run_blocks(x, res, 0, k, c_blocks, y_emb)
+        x = self.run_blocks(x, res, 0, k, c_blocks, y_emb, fine)
         if not self.skip_pathway:
-            return self.output(x[:, self.in_context_len:], c, head=self.sampled_head())
+            return self.output(x[:, self.in_context_len:], c, head=self.sampled_head(), fine=fine)
 
         two = return_trunk or self.skip_residual # skip_residual needs the trunk's prediction at inference too
         if two: # skip branch from a detached copy of the trunk at the injection point
@@ -1076,8 +1237,21 @@ class JiT(nn.Module):
             output = trunk_output.detach() + output
         return (output, trunk_output) if return_trunk else output
 
-    def embed(self, x, c):
+    @torch.compiler.disable
+    def routed_forward(self, x, t, y, m):
+        # a batch with samples on both token sizes (eval passes with mixed t): two sub-forwards, eager, since their sizes
+        # change from batch to batch (sampling calls share one t and never get here)
+        out = torch.empty_like(x)
+        out[m] = self.forward(x[m], t[m], y[m], patch=self.fine_patch)
+        out[~m] = self.forward(x[~m], t[~m], y[~m], patch=self.patch_size)
+        return out
+
+    def embed(self, x, c, fine=False):
         # (DC-AE stem) -> patch embedding (gated bottleneck) -> + position embedding
+        if fine: # fine tokens (token_sizes)
+            x = self.x_embedder_fine(x)
+            x += self.pos_embed_fine
+            return x
         if self.dcae_stem:
             x = self.input_stem(x, c)
         x = self.x_embedder(x, self.bottleneck_gate(c)) if self.gated_bottleneck else self.x_embedder(x)
@@ -1116,8 +1290,10 @@ class JiT(nn.Module):
             return self.trunk_output_head if self.dcae_trunk_head else None
         return self.sampled_head()
 
-    def output(self, x, c, final_layer=None, head=None):
+    def output(self, x, c, final_layer=None, head=None, fine=False):
         # final layer -> image (unpatchify, or overlap-add for patch_overlap / head_overlap) -> (DC-AE head)
+        if fine: # fine tokens (token_sizes)
+            return self.unpatchify(self.final_layer_fine(x, c), self.fine_patch)
         x = (final_layer or self.final_layer)(x, c)
         if self.out_overlap:
             o, p = self.out_overlap, self.patch_size

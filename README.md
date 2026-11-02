@@ -155,6 +155,61 @@ Their encoder setup is DINOv2-B rebuilt by timm at JiT's image and patch size:
 python train_jit.py config/jit_in100_128.py --repa_encoder=timm:vit_base_patch14_dinov2.lvd142m --repa_adapter=mta
 ```
 
+## Dispersive Loss
+
+`--disp_weight` adds Dispersive Loss (Wang & He 2025, "Diffuse and Disperse"), a contrastive loss without positive pairs on
+one block's output: L = log mean over the batch's pairs of exp(−D/τ), with D the squared distance between flattened token
+representations divided by their dimension, over the full B×B matrix. It needs no extra forward pass, no projection head
+and no external model (`repa.dispersive_loss`, checked against the official implementation). The paper's settings are the
+defaults: `--disp_temp=0.5`, block `depth // 4` (`--disp_blocks`, also a comma list or `all`), and weight 0.5 in the paper
+(0.25 in their PyTorch code). The training log prints the term. At batch B it lies in [log(1/B), 0]: pinned at log(1/B)
+means the features are too far apart for τ to give a gradient (raise `--disp_temp`); near 0 means collapse.
+
+`--disp_kind` selects the paper's other variants (`infonce_cos`, `hinge`, `covariance`; InfoNCE-L2 was best there).
+`--disp_balance=<share>` replaces the fixed weight with EnCodec's gradient balancer (`balancer.py`, from the Jazz repo):
+at the block, the dispersive loss gets that share of the gradient into the blocks below, the diffusion loss the rest, with
+the total tied to the diffusion branch's own running norm. (EnCodec's constant total of 1.0 is far above this loss's
+per-sample gradients and would keep gradient clipping on.) `analyze_dispersion.py` shows, per block of a finished
+checkpoint, how dispersed the features already are and what share of the gradient a fixed weight amounts to.
+
+## Two token sizes, allocated by noise level
+
+`--token_sizes=16,8` gives one JiT trunk two token sizes: coarse (the model's patch size) and fine, each with its own
+bottleneck patch embedding, final layer, sin-cos table and RoPE table. Fine positions are in coarse-token units with
+aligned centres, so the coarse path is exactly plain JiT. Each training step sends a fixed share of the batch
+(`--fine_frac`, the token budget: shapes stay static) through fine tokens and the rest through coarse ones, as two
+forwards. `model_jit.TokenAllocation` keeps running means of each path's per-sample loss per logit-t bin. These are
+different images, but the expected gain E[L_coarse − L_fine | t] needs no matched pairs, so there is no third forward.
+The fine quota is drawn without replacement in proportion to the relative gain (L_c − L_f) / L_c of each sample's bin,
+plus a floor (`--alloc_floor` × the mean gain). That is proportional, not greedy: every noise level keeps training both
+sizes, so the estimates stay valid and any allocation stays in distribution. Until the statistics cover the noise levels
+training visits, the draw is uniform. The eval log prints the gain and the realized fine share per t range.
+
+At sampling, every call shares one t. The top `infer_frac` of a uniform t grid, ranked by gain, gets fine tokens. That
+share defaults to `fine_frac`, and `eval_jit.py --fine_frac=<share>` sets it: one checkpoint covers a range of sampling
+compute. Eval-time batches with mixed t are routed per sample.
+
+Memory: each path backpropagates right after its forward, so the step's peak is the larger path's, not the sum. At fine
+share 0.25 and batch 1024, the fine path is 256 × 256 tokens, the same as B/16's 1024 × 64, so it fits wherever B/16 does
+without gradient accumulation (B/8 needed batch 256 × 4). `--act_memory_budget` (< 1) turns on torch.compile's selective
+recompute for more headroom, at some recompute cost. `bench_tokens.py` times full compiled training steps for B/16,
+B/16+8 at several fine shares (and one share with a single backward), and B/8, in one session: ms/step, img/s, peak
+memory, FLOPs per image, and the largest fine share that fits without accumulation. For comparison at 128px, 20 epochs:
+B/16 FID-10k 81.0 at 2065 img/s, B/8 65.6 at 529 img/s.
+
+Every eval of a two-size run adds `alloc_eval.py` (`--alloc_eval`, on by default):
+- Each size's held-out loss per t on the same images, noise and t (matched), and the gain with its standard error, next
+  to the running training statistics.
+- The training draw's fine share per t.
+- FID-1k (`--alloc_eval_images`) of the EMA weights under fixed allocations (`--alloc_eval_conditions`): all-coarse, the
+  learned ranking at the training share and at 0.5, all-fine, and fine tokens in one t quarter at a time. All share the
+  same noise and labels, so differences between allocations are far less noisy than 1k images alone suggest. The quarter
+  windows give the FID value of fine tokens per t range, to compare with the loss gain there.
+- Sample rows: the same labels and noise under every allocation, at every eval.
+
+Plots go to `{run}/diagnostics/allocation_{iter}.png`, `allocation_samples_{iter}.png` and `allocation_trends.png`,
+records to `{run}/allocation.jsonl`, scalars to wandb under `alloc/`. Queue: `queues/in1k_128_tokens.sh`.
+
 ## Muon
 
 `--optimizer_type=muon` (`muon.py`) uses Muon for the 2D weight matrices inside the transformer blocks and AdamW for the

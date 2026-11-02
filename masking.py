@@ -76,7 +76,8 @@ class TokenMasker(nn.Module):
         m = mask.view(-1, 1, g, g).float()
         return m.repeat_interleave(self.patch_size, dim=2).repeat_interleave(self.patch_size, dim=3)
 
-def flow_loss(denoiser, x, labels, masker=None, mask=None, weighting='effective_t', return_aux=False, parts=None, weighter=None):
+def flow_loss(denoiser, x, labels, masker=None, mask=None, weighting='effective_t', return_aux=False, parts=None, weighter=None,
+              backward=None):
     """
     JiT's training loss (Denoiser.forward: label dropout, logit-normal t, x-prediction, v-loss), with optional token
     masking. With mask=None this is numerically the same computation as denoiser(x, labels).
@@ -85,8 +86,13 @@ def flow_loss(denoiser, x, labels, masker=None, mask=None, weighting='effective_
     Skip pathway with skip_stop_grad, in training: the loss is L(with skip) + L(trunk only), the same objective on both
     predictions (see JiT.forward's return_trunk). parts: optional dict, filled with the two terms for logging.
     weighter: optional loss_weighting.LossWeighting (frequency / learned per-noise-level weighting of the residual).
+    backward: two-token-size models only (token_sizes): called on each path's share of the loss right after its forward, so
+    that path's activations are freed before the next one runs (peak memory = the larger path, not the sum); the returned
+    loss is then detached.
     """
     assert weighter is None or mask is None, 'loss weighting is not combined with token masking'
+    if getattr(denoiser.net, 'token_sizes', ()) and denoiser.training:
+        return _two_size_loss(denoiser, x, labels, return_aux, parts, weighter, mask, backward)
     labels = denoiser.drop_labels(labels) if denoiser.training else labels
     t = denoiser.sample_t(x.size(0), device=x.device).view(-1, *([1] * (x.ndim - 1)))
     e = torch.randn_like(x) * denoiser.noise_scale
@@ -118,6 +124,46 @@ def flow_loss(denoiser, x, labels, masker=None, mask=None, weighting='effective_
         loss = v_loss(x_pred)
         if parts is not None:
             parts['skip'] = loss
+    if return_aux:
+        return loss, t.flatten(), labels
+    return loss
+
+
+def _two_size_loss(denoiser, x, labels, return_aux, parts, weighter, mask, backward=None):
+    """
+    flow_loss for a two-token-size JiT (token_sizes, model_jit.TokenAllocation): a fixed quota of the batch (fine_frac) goes
+    through the fine tokens, drawn without replacement in proportion to the allocation's weights (Gumbel top-k: sampling
+    proportional to the gain, not greedy), the rest through the coarse tokens; two forwards of fixed sizes. Each path's
+    per-sample losses update the allocation's statistics. The loss is the per-sample mean over the whole batch, as usual.
+    backward: see flow_loss (each path backpropagated as soon as its loss exists).
+    """
+    net = denoiser.net
+    assert mask is None and not getattr(net, 'skip_pathway', False), 'token_sizes: no token masking or skip pathway'
+    labels = denoiser.drop_labels(labels)
+    B = x.size(0)
+    t = denoiser.sample_t(B, device=x.device).view(-1, *([1] * (x.ndim - 1)))
+    z = t * x + (1 - t) * torch.randn_like(x) * denoiser.noise_scale
+    k = max(1, min(B - 1, round(net.alloc.fine_frac * B)))
+    w = net.alloc.weights(t.flatten())
+    gumbel = -torch.log(-torch.log(torch.rand(B, device=x.device).clamp(1e-20, 1.0)))
+    fine = torch.zeros(B, dtype=torch.bool, device=x.device)
+    fine[torch.topk(torch.log(w.clamp_min(1e-20)) + gumbel, k).indices] = True
+    total = 0.0
+    paths = (((~fine).nonzero().squeeze(1), net.token_sizes[0]), (fine.nonzero().squeeze(1), net.token_sizes[1]))
+    for path, (sel, p) in enumerate(paths):
+        tp = t[sel]
+        x_pred = net(z[sel], tp.flatten(), labels[sel], patch=p)
+        r = (x[sel] - x_pred) / (1 - tp).clamp_min(denoiser.t_eps) # v - v_pred, with JiT's clamp
+        per = r.float().pow(2).mean(dim=(1, 2, 3))
+        net.alloc.update(tp.flatten(), per.detach(), path)
+        lp = (weighter(r, tp.flatten()) if weighter is not None else per.mean()) * (len(sel) / B)
+        if backward is not None:
+            backward(lp)
+            lp = lp.detach()
+        total = total + lp
+    loss = total
+    if parts is not None:
+        parts['skip'] = loss
     if return_aux:
         return loss, t.flatten(), labels
     return loss

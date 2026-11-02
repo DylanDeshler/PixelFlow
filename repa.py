@@ -19,6 +19,8 @@ Targets (repa_encoder in train_jit.py):
     file:/path/to/ckpt.pth                      any DINO-format ViT checkpoint (e.g. iBOT IN-1k / IN-22k, DeiT)
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -188,6 +190,40 @@ def repa_loss(hidden, target, projector):
     target = F.normalize(target.float(), dim=-1)
     return -(z * target).sum(-1).mean()
 
+def dispersive_loss(hidden, tau=0.5, kind='infonce_l2', margin=1.0):
+    """
+    Dispersive Loss (Wang & He 2025, "Diffuse and Disperse"; official code github.com/raywang4/DispLoss) on one block's
+    output, pushing the batch's representations apart without positive pairs. hidden [B, T, C] -> scalar. z_i = image i's
+    tokens flattened (T C), no projection head. Variants (the paper's Table 1; InfoNCE-L2 performed best):
+      infonce_l2   log mean_{i,j} exp(-D_ij / tau), D = squared L2 distance / dim, over the full B x B matrix including i = j,
+                   unnormalized z -- identical to the official PyTorch implementation (dividing by the dimension keeps D O(1)
+                   at any width; without it every off-diagonal term would underflow)
+      infonce_cos  the same with D = -cosine similarity
+      hinge        mean_{i != j} max(0, margin - D_ij)^2, D as infonce_l2 (positive pairs, i = j, discarded)
+      covariance   mean squared off-diagonal correlation between feature dimensions over the batch (features standardized
+                   per dimension, so the diagonal is 1), via the B x B Gram matrix: ||R||_F^2 = ||Z Z^T||_F^2 / B^2
+    Computed in fp32 with autocast off: squared distances come from norms minus dot products, which bf16 would cancel badly.
+    """
+    with torch.autocast(device_type=hidden.device.type, enabled=False):
+        z = hidden.float().flatten(1)
+        B, d = z.shape
+        off = 1 - torch.eye(B, device=z.device)
+        if kind in ('infonce_l2', 'hinge'):
+            sq = z.pow(2).sum(1)
+            D = (sq[:, None] + sq[None, :] - 2 * z @ z.T).clamp_min(0) / d * off # exactly 0 on the diagonal
+            if kind == 'hinge':
+                return ((margin - D).clamp_min(0).pow(2) * off).sum() / (B * (B - 1))
+            return torch.logsumexp(-D.flatten() / tau, dim=0) - math.log(B * B)
+        if kind == 'infonce_cos':
+            zn = F.normalize(z, dim=1)
+            D = -(zn @ zn.T)
+            return torch.logsumexp(-D.flatten() / tau, dim=0) - math.log(B * B)
+        if kind == 'covariance':
+            zs = (z - z.mean(0)) / z.std(0).clamp_min(1e-6) # standardized per dimension: correlation matrix R = zs^T zs / B
+            fro2 = (zs @ zs.T).pow(2).sum() / B ** 2 # ||R||_F^2 without forming the d x d matrix
+            return (fro2 - (zs.pow(2).mean(0)).pow(2).sum()) / (d * (d - 1))
+        raise ValueError(f"kind must be 'infonce_l2', 'infonce_cos', 'hinge' or 'covariance', got {kind}")
+
 class BlockCapture:
     """
     Forward hook that stores the output tokens of one JiT block (dropping in-context class tokens if present).
@@ -200,3 +236,25 @@ class BlockCapture:
 
     def hook(self, module, inputs, output):
         self.out = output[:, self.n_strip:]
+
+
+class DispCapture:
+    """
+    Forward hook on one block for the Dispersive Loss: stores the block's output tokens (in-context class tokens dropped).
+    With a balancer (balancer.GradientBalancer, tasks 'diff' and 'disp'), the hook also replaces the block's output by its
+    'diff' branch, so the rest of the network and the dispersive loss see the same values but their gradients into the
+    blocks below are each normalized to their share (EnCodec's balancing at the branch point).
+    """
+    def __init__(self, net, depth, balancer=None):
+        self.block_idx = depth - 1
+        self.n_strip = net.in_context_len if (net.in_context_len > 0 and self.block_idx >= net.in_context_start) else 0
+        self.balancer = balancer
+        self.out = None
+        net.blocks[self.block_idx].register_forward_hook(self.hook)
+
+    def hook(self, module, inputs, output):
+        if self.balancer is None:
+            self.out = output[:, self.n_strip:]
+            return None
+        self.out = self.balancer(output, 'disp')[:, self.n_strip:]
+        return self.balancer(output, 'diff') # replaces the block's output for the rest of the network

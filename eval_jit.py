@@ -148,6 +148,7 @@ save_samples = '' # '', 'png' or 'npz'
 device = 'cuda'
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float32'
 compile = True
+fine_frac = -1.0 # two-token-size models (token_sizes): share of sampling calls on fine tokens, a compute knob; < 0 = the model's training share
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'configurator.py')).read())
@@ -178,6 +179,9 @@ if compile:
     # every sampling call has the same batch (fixed_shape below), so one static graph serves the whole evaluation
     denoiser.net.compile()
 denoiser.time_schedule = time_schedule
+if getattr(denoiser.net, 'token_sizes', ()) and fine_frac >= 0: # two-size model: the fine-token share of sampling calls
+    denoiser.net.alloc.infer_frac = fine_frac
+    print(f"fine tokens on ~{fine_frac:.2f} of sampling calls (training share {denoiser.net.alloc.fine_frac})")
 is_quadtree = getattr(denoiser.net, 'family', 'jit') == 'quadtree'
 if is_quadtree:
     denoiser.net.route_every = quad_route_every

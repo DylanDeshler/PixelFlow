@@ -99,14 +99,16 @@ def describe_arch(model, arch):
                   skip_pathway=False, skip_head_blocks=0, skip_inject_block=0, dcae_stem=False, dcae_head=False, dcae_width=128,
                   dcae_kernel2=1, patch_overlap=0, head_overlap=0, layernorm=False, skip_final_layer=False, skip_residual=False, dcae_trunk_head=False, gate_init='zero', dcae_norm='channel',
                   skip_decoder='linear', skip_decoder_dim=0, skip_decoder_blocks=2, skip_decoder_rank=0, skip_decoder_conv=False, skip_decoder_attnres=False,
-                  skip_decoder_modulation=True)
+                  skip_decoder_modulation=True, token_sizes='', fine_frac=0.25, alloc_floor=0.1, alloc_gain='rel')
     full = dict(preset, **arch)
     parts = []
     for k in ('depth', 'hidden_size', 'num_heads', 'patch_size', 'layernorm', 'bottleneck_dim', 'gated_bottleneck', 'patch_overlap', 'head_overlap', 'dcae_stem', 'dcae_head', 'dcae_trunk_head', 'dcae_norm', 'dcae_width', 'dcae_kernel2',
               'skip_pathway', 'skip_decoder', 'skip_decoder_dim', 'skip_decoder_blocks', 'skip_decoder_rank', 'skip_decoder_conv', 'skip_decoder_attnres',
               'skip_decoder_modulation', 'skip_head_blocks', 'skip_inject_block', 'skip_final_layer', 'skip_residual', 'mlp_ratio', 'in_context_len', 'in_context_start',
-              'attn_res', 'attn_res_block_size', 'attn_res_adaln', 'adaln_single', 'gate_init'):
+              'attn_res', 'attn_res_block_size', 'attn_res_adaln', 'adaln_single', 'gate_init', 'token_sizes', 'fine_frac', 'alloc_floor', 'alloc_gain'):
         v = full[k]
+        if k in ('fine_frac', 'alloc_floor', 'alloc_gain') and not full['token_sizes']:
+            continue
         if k == 'in_context_start' and full['in_context_len'] == 0:
             continue # unused without in-context tokens
         if (k == 'attn_res_block_size' and full['attn_res'] != 'block') or (k == 'attn_res_adaln' and full['attn_res'] == 'none') \
@@ -545,7 +547,7 @@ _NAME_EXCLUDE = {
     'eval_only', 'init_from', 'wandb_log', 'wandb_project', 'wandb_run_name', 'fid_num_images', 'fid_cfg',
     'fid_interval_min', 'fid_interval_max', 'sample_cfg', 'sample_interval_min', 'sample_interval_max',
     'sampling_method', 'sampling_eta', 'num_sampling_steps', 'time_schedule', 'gen_batch_size', 'eval_loss_images',
-    'device', 'dtype', 'compile', 'trend_plots', 'progress_gif', 'data_workers', 'data_prefetch', 'quad_route_baseline', 'quad_route_every',
+    'device', 'dtype', 'compile', 'act_memory_budget', 'alloc_eval', 'alloc_eval_conditions', 'alloc_eval_images', 'alloc_eval_loss_images', 'alloc_eval_ts', 'alloc_eval_show', 'trend_plots', 'progress_gif', 'data_workers', 'data_prefetch', 'quad_route_baseline', 'quad_route_every',
 }
 _ARCH_SHORT = {'depth': 'd', 'hidden_size': 'w', 'num_heads': 'h', 'patch_size': 'p', 'bottleneck_dim': 'bn',
                'in_context_len': 'icl', 'in_context_start': 'ics', 'mlp_ratio': 'mlp', 'pixel_depth': 'pd', 'pixel_dim': 'pdim'}
@@ -556,7 +558,7 @@ _ARCH_SHORT = {'depth': 'd', 'hidden_size': 'w', 'num_heads': 'h', 'patch_size':
 _NAME_TOKENS = {
     'optimizer_type': '', 'muon_adjust_lr': 'muon-', 'muon_lr': 'muonlr', 'muon_weight_decay': 'muonwd',
     'muon_momentum': 'muonmom', 'muon_ns_steps': 'muonns', 'muon_split_fused': 'muonsplit', 'muon_adaln': 'muonadaln',
-    'noise_scale': 'noise', 'P_mean': 'pmean', 'loss_freq_weight': 'lossf-', 'loss_freq_table': 'lossftable-', 'loss_t_weight': 'losst-', 'loss_weight_normalize': 'lossnorm', 'P_std': 'pstd', 't_eps': 'teps', 'label_drop_prob': 'labeldrop',
+    'noise_scale': 'noise', 'P_mean': 'pmean', 'token_sizes': 'tok-', 'fine_frac': 'fine', 'alloc_floor': 'allocfloor', 'alloc_gain': 'allocgain-', 'loss_freq_weight': 'lossf-', 'loss_freq_table': 'lossftable-', 'loss_t_weight': 'losst-', 'loss_weight_normalize': 'lossnorm', 'P_std': 'pstd', 't_eps': 'teps', 'label_drop_prob': 'labeldrop',
     'blr': 'blr', 'lr_schedule': 'lr-', 'min_lr': 'minlr', 'warmup_epochs': 'warmup', 'weight_decay': 'wd',
     'beta1': 'beta1-', 'beta2': 'beta2-', 'grad_clip': 'clip', 'ema_decay1': 'ema', 'ema_decay2': 'ema2-', 'ema_warmup': 'emawarmup',
     'attn_dropout': 'attndrop', 'proj_dropout': 'projdrop', 'attn_res': 'attnres-', 'attn_res_block_size': 'attnresbs',
@@ -565,7 +567,7 @@ _NAME_TOKENS = {
     'dcae_stem': 'dcaestem', 'dcae_head': 'dcaehead', 'dcae_trunk_head': 'dcaetrunkhead', 'gate_init': 'gateinit-', 'dcae_norm': 'dcaenorm-', 'pixeldit_prediction': 'pred-',
     'skip_decoder': 'skipdec-', 'skip_decoder_dim': 'skipdecdim', 'skip_decoder_blocks': 'skipdecblocks', 'skip_decoder_rank': 'skipdecrank',
     'skip_decoder_conv': 'skipdecconv', 'skip_decoder_attnres': 'skipdecattnres', 'skip_decoder_modulation': 'skipdecmod', 'dcae_width': 'dcaew', 'dcae_kernel2': 'dcaek', 'patch_overlap': 'overlap', 'head_overlap': 'headoverlap', 'layernorm': 'layernorm',
-    'repa_encoder': 'repa-', 'repa_adapter': 'adapter-', 'repa_depth': 'repadepth', 'repa_coeff': 'repacoeff', 'repa_proj_dim': 'repaproj',
+    'disp_weight': 'disp', 'disp_temp': 'disptemp', 'disp_blocks': 'dispblocks-', 'disp_kind': 'dispkind-', 'disp_balance': 'dispbal', 'repa_encoder': 'repa-', 'repa_adapter': 'adapter-', 'repa_depth': 'repadepth', 'repa_coeff': 'repacoeff', 'repa_proj_dim': 'repaproj',
     'repa_mask_ratio': 'repamask', 'repa_adapter_depth': 'adapterdepth',
     'mask_ratio': 'mask', 'mask_prob': 'maskprob', 'mask_weighting': 'maskweight-',
     'quad_tokens': 'K', 'quad_levels': 'levels', 'quad_router': 'route-', 'quad_route_dino': 'dino-', 'quad_route_t_min': 'routetmin',
