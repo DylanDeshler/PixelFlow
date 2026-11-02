@@ -152,7 +152,9 @@ P_mean = -0.8
 P_std = 0.8
 t_eps = 5e-2
 noise_scale = 0.0 # 0 -> img_size / 256, JiT's resolution rule (1.0 at 256, 2.0 at 512)
-loss_freq_weight = 'none' # 'wiener': weight the residual's frequencies by their Wiener gain at each noise level, normalized per level (loss_weighting.py)
+loss_freq_weight = 'none' # 'wiener': weight the residual's frequencies by their Wiener gain at each noise level, normalized per level (loss_weighting.py);
+                          # 'table': by the share a trained model recovers instead (--loss_freq_table, from build_freq_table.py)
+loss_freq_table = '' # JSON from build_freq_table.py, for loss_freq_weight='table'
 loss_t_weight = 'none' # 'learned': EDM2-style learned per-noise-level weight (loss L / e^u(t) + u(t)); the logged loss then includes u
 loss_weight_lr_mult = 50.0 # the learned weight's lr / lr: u(t) must travel to log E[L | t] (~-3..1), too slow at the model's lr
 label_drop_prob = 0.1
@@ -461,7 +463,9 @@ if mask_ratio > 0:
 loss_weighter = None
 if loss_freq_weight != 'none' or loss_t_weight != 'none':
     power = image_power_spectrum(data) if loss_freq_weight == 'wiener' else None
-    loss_weighter = LossWeighting(noise_scale, power, freq=loss_freq_weight, t_weight=loss_t_weight).to(device)
+    assert (loss_freq_weight == 'table') == bool(loss_freq_table), "--loss_freq_table goes with --loss_freq_weight=table"
+    table = json.load(open(loss_freq_table)) if loss_freq_table else None
+    loss_weighter = LossWeighting(noise_scale, power, freq=loss_freq_weight, t_weight=loss_t_weight, table=table, img_size=img_size).to(device)
     print(f"loss weighting: frequencies {loss_freq_weight}, noise levels {loss_t_weight}")
 trainable = list(denoiser.named_parameters()) + (list(projector.named_parameters()) if projector is not None else []) \
     + (list(masker.named_parameters()) if masker is not None else [])

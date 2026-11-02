@@ -556,7 +556,7 @@ _ARCH_SHORT = {'depth': 'd', 'hidden_size': 'w', 'num_heads': 'h', 'patch_size':
 _NAME_TOKENS = {
     'optimizer_type': '', 'muon_adjust_lr': 'muon-', 'muon_lr': 'muonlr', 'muon_weight_decay': 'muonwd',
     'muon_momentum': 'muonmom', 'muon_ns_steps': 'muonns', 'muon_split_fused': 'muonsplit', 'muon_adaln': 'muonadaln',
-    'noise_scale': 'noise', 'P_mean': 'pmean', 'loss_freq_weight': 'lossf-', 'loss_t_weight': 'losst-', 'P_std': 'pstd', 't_eps': 'teps', 'label_drop_prob': 'labeldrop',
+    'noise_scale': 'noise', 'P_mean': 'pmean', 'loss_freq_weight': 'lossf-', 'loss_freq_table': 'lossftable-', 'loss_t_weight': 'losst-', 'P_std': 'pstd', 't_eps': 'teps', 'label_drop_prob': 'labeldrop',
     'blr': 'blr', 'lr_schedule': 'lr-', 'min_lr': 'minlr', 'warmup_epochs': 'warmup', 'weight_decay': 'wd',
     'beta1': 'beta1-', 'beta2': 'beta2-', 'grad_clip': 'clip', 'ema_decay1': 'ema', 'ema_decay2': 'ema2-', 'ema_warmup': 'emawarmup',
     'attn_dropout': 'attndrop', 'proj_dropout': 'projdrop', 'attn_res': 'attnres-', 'attn_res_block_size': 'attnresbs',

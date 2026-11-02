@@ -12,11 +12,19 @@ freq='wiener'   within each noise level, weight every frequency f of the residua
                 within a level; how much each level counts is still set by the t distribution (P_mean / P_std). At high
                 noise only the coarsest frequencies survive, so the factor can be large (it hands that level's whole
                 budget to its predictable part); it's capped at norm_cap for stability and logged (wiener_norm_t*).
+freq='table'    the same, with a measured gain table instead of the linear (Gaussian) Wiener gain: the share of each frequency
+                ring a trained denoiser recovers at each noise level (build_freq_table.py), interpolated in logit(t) and held
+                at its end values beyond the measured range. The Wiener gain is what a linear denoiser recovers; a network
+                predicts far more fine detail from context, which the linear gain under-weights (on ImageNet that made FID
+                worse). Same per-level normalization.
 t_weight='learned'
                 EDM2's uncertainty weighting (Karras et al. 2024): a learned log-variance u(t) per noise level (random Fourier
                 features of logit(t) -> linear, zero init), loss L / e^u + u, so e^u tracks E[L | t] and every level's loss
                 is normalized to ~1. It balances loss scales across levels; the allocation is then set by the t
                 distribution. With freq='wiener', the normalized loss reflects the predictable part of the error.
+                By default (normalize_learned) the model's gradient uses the weights divided by their batch mean, so its
+                scale matches the plain loss: EDM2's form multiplies it by ~1/E[L] (10-25x for JiT's v-loss), which kept
+                gradient clipping (grad_clip = 1.0) active on most steps of the first ImageNet run.
 """
 
 import math
@@ -46,15 +54,26 @@ def image_power_spectrum(data, n_images=2048, seed=0):
 
 class LossWeighting(nn.Module):
     def __init__(self, noise_scale, power=None, freq='none', t_weight='none', bins=48, logit_range=8.0, decay=0.99, fourier=16,
-                 norm_cap=100.0):
+                 norm_cap=100.0, table=None, img_size=None, table_floor=0.01, normalize_learned=True):
         super().__init__()
-        assert freq in ('none', 'wiener'), f"freq must be 'none' or 'wiener', got {freq}"
+        assert freq in ('none', 'wiener', 'table'), f"freq must be 'none', 'wiener' or 'table', got {freq}"
         assert t_weight in ('none', 'learned'), f"t_weight must be 'none' or 'learned', got {t_weight}"
-        assert freq == 'none' or power is not None, "freq='wiener' needs the data's power spectrum"
+        assert freq != 'wiener' or power is not None, "freq='wiener' needs the data's power spectrum"
+        assert freq != 'table' or table is not None, "freq='table' needs a gain table (build_freq_table.py)"
         self.freq, self.t_weight, self.noise_scale = freq, t_weight, noise_scale
+        self.normalize_learned = normalize_learned # see forward: keeps the plain loss's gradient scale (False: EDM2's form)
         self.bins, self.logit_range, self.decay, self.norm_cap = bins, logit_range, decay, norm_cap
-        if freq == 'wiener':
-            self.register_buffer('power', power.float())
+        if freq == 'table':
+            H = table['img_size']
+            assert img_size is None or img_size == H, f"the gain table was measured at {H}px, the data is {img_size}px"
+            self.register_buffer('table_logit', torch.tensor(table['logit_t'], dtype=torch.float32)) # [n_t], increasing
+            # floored, so a level the model recovers nothing at falls back to the plain loss (floor x the normalization cap = 1)
+            self.register_buffer('table_gain', torch.tensor(table['gain'], dtype=torch.float32).clamp_min(table_floor)) # [n_t, n_rings]
+            f = torch.fft.fftfreq(H) * H
+            self.register_buffer('ring', torch.sqrt(f.view(-1, 1) ** 2 + f.view(1, -1) ** 2).round().long()) # [H, H]
+        if freq in ('wiener', 'table'):
+            if freq == 'wiener':
+                self.register_buffer('power', power.float())
             # running mean of the plain and weighted loss per logit(t) bin, for the per-level normalization
             self.register_buffer('ema_plain', torch.zeros(bins))
             self.register_buffer('ema_weighted', torch.zeros(bins))
@@ -82,6 +101,17 @@ class LossWeighting(nn.Module):
         snr = tt ** 2 * self.power / ((1 - tt) ** 2 * self.noise_scale ** 2)
         return snr / (1 + snr)
 
+    def table_gain_at(self, t):
+        # [B, H, W]: the measured gain table, linearly interpolated in logit(t) (end values held), per frequency ring
+        lt = self._logit(t).clamp(self.table_logit[0], self.table_logit[-1])
+        i = torch.searchsorted(self.table_logit, lt).clamp(1, len(self.table_logit) - 1)
+        a = (lt - self.table_logit[i - 1]) / (self.table_logit[i] - self.table_logit[i - 1])
+        g = self.table_gain[i - 1] * (1 - a)[:, None] + self.table_gain[i] * a[:, None] # [B, n_rings]
+        return g[:, self.ring] # [B, H, W]
+
+    def gain(self, t):
+        return self.wiener_gain(t) if self.freq == 'wiener' else self.table_gain_at(t)
+
     def _bin(self, t):
         lt = self._logit(t).clamp(-self.logit_range, self.logit_range - 1e-6)
         return ((lt + self.logit_range) / (2 * self.logit_range) * self.bins).long()
@@ -103,17 +133,23 @@ class LossWeighting(nn.Module):
         """
         plain = r.float().pow(2).mean(dim=(1, 2, 3))
         per = plain
-        if self.freq == 'wiener':
+        if self.freq in ('wiener', 'table'):
             H, W = r.shape[-2:]
             R2 = torch.fft.fft2(r.float()).abs().pow(2).mean(dim=1) / (H * W) ** 2 # [B, H, W]; sums over f to plain
-            weighted = (self.wiener_gain(t) * R2).sum(dim=(1, 2))
+            weighted = (self.gain(t) * R2).sum(dim=(1, 2))
             b = self._bin(t)
             if self.training:
                 self._update(b, plain.detach(), weighted.detach())
             per = weighted * (self.ema_plain / self.ema_weighted.clamp_min(1e-12)).clamp(max=self.norm_cap)[b]
         if self.t_weight == 'learned':
             u = self.log_variance(t)
-            per = per / torch.exp(u) + u
+            if self.normalize_learned:
+                # the model's gradient: the learned weights e^-u divided by their batch mean, so the gradient keeps the plain
+                # loss's scale (gradient clipping and AdamW behave as without the weighting); u learns from its own term,
+                # L e^-u + u with L detached, exactly as in EDM2 (e^u -> E[L | t])
+                w = torch.exp(-u).detach()
+                return (per * (w / w.mean())).mean() + (per.detach() * torch.exp(-u) + u).mean()
+            per = per / torch.exp(u) + u # EDM2's form: the model's gradient scaled by e^-u (~10-25x on ImageNet's v-loss)
         return per.mean()
 
     @torch.no_grad()
@@ -124,7 +160,7 @@ class LossWeighting(nn.Module):
         out = {}
         if self.t_weight == 'learned':
             out.update({f'loss_weight_t{v:.2f}': w for v, w in zip(ts, torch.exp(-self.log_variance(t)).tolist())})
-        if self.freq == 'wiener':
+        if self.freq in ('wiener', 'table'):
             b = self._bin(t)
             ratio = (self.ema_plain / self.ema_weighted.clamp_min(1e-12)).clamp(max=self.norm_cap)[b]
             out.update({f'wiener_norm_t{v:.2f}': (q if s else float('nan')) for v, q, s in zip(ts, ratio.tolist(), self.seen[b].tolist())})

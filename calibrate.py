@@ -96,11 +96,19 @@ def save(force=False):
 def should_run(step):
     return step in todo and (step not in state or step in redo_set)
 
-def run(cmd, log_name):
-    # runs a command, teeing its output to {calib_dir}/{log_name}.log; returns the output (None in a dry run)
+def run(cmd, log_name, out_dir=None):
+    # runs a command, teeing its output to {calib_dir}/{log_name}.log; returns the output (None in a dry run). A training
+    # run (out_dir) that already finished -- its log ends with train_jit's "done." line and its checkpoint exists -- is
+    # reused rather than retrained (e.g. after the driver itself stopped between the run and recording it)
     print('\n$ ' + ' '.join(shlex.quote(c) for c in cmd), flush=True)
     if dry_run:
         return None
+    log_path = os.path.join(calib_dir, f'{log_name}.log')
+    if out_dir and os.path.exists(log_path) and os.path.exists(os.path.join(out_dir, 'ckpt.pt')):
+        prev = open(log_path).read()
+        if 'done. best FID' in prev:
+            print(f'  already finished: reusing {out_dir}', flush=True)
+            return prev
     lines = []
     with open(os.path.join(calib_dir, f'{log_name}.log'), 'w') as log:
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=here)
@@ -116,7 +124,7 @@ def run(cmd, log_name):
 
 def last_fid(output):
     # the last "FID-10k 83.08" (train_jit.py) / "FID-10k 83.080" (eval_jit.py) in a tool's output
-    m = re.findall(r'FID-[\d.]+k ([\d.]+)', output or '')
+    m = re.findall(r'FID-[\d.]+k (\d+(?:\.\d+)?)', output or '') # not the sentence's trailing period ("best FID-10k 108.07.")
     return float(m[-1]) if m else None
 
 def train_cmd(out_dir, epochs, P_mean, P_std):
@@ -151,7 +159,7 @@ start_mean, start_std = st['start']
 
 warm_dir = os.path.join(calib_dir, 'warmup')
 if should_run('warmup'):
-    out = run(train_cmd(warm_dir, warmup_epochs, start_mean, start_std), 'warmup')
+    out = run(train_cmd(warm_dir, warmup_epochs, start_mean, start_std), 'warmup', warm_dir)
     state['warmup'] = {'out_dir': warm_dir, 'epochs': warmup_epochs, 'P_mean': start_mean, 'P_std': start_std, 'fid': last_fid(out)}
     save()
 
@@ -200,7 +208,7 @@ if should_run('sweep'):
     results = []
     for m in means:
         d = os.path.join(calib_dir, f'sweep_pmean{m:+.2f}')
-        out = run(train_cmd(d, sweep_epochs, m, start_std), f'sweep_pmean{m:+.2f}')
+        out = run(train_cmd(d, sweep_epochs, m, start_std), f'sweep_pmean{m:+.2f}', d)
         r = {'P_mean': m, 'P_std': start_std, 'out_dir': d, 'fid': last_fid(out)}
         if 'snr' in state:
             r['noisy_mass'] = noisy_mass(m, start_std, state['snr']['t'], state['snr']['signal_fraction'])
