@@ -611,8 +611,10 @@ def nn_distances(queries, bank, bank_chunk=65536):
         best = torch.minimum(best, torch.cdist(q, b).min(dim=1).values)
     return best
 
-def memorization(gen_feats, train_bank, val_feats):
-    # gen_feats / val_feats on device, train_bank numpy [N, 2048]
+def memorization(gen_feats, train_bank, val_feats, cache=None):
+    # gen_feats / val_feats on device, train_bank numpy [N, 2048]; cache: a dict kept across calls, which holds the
+    # val -> train distances after the first call (fixed features, so they never change: one pass over the bank per eval
+    # instead of two, and 50k fewer queries on ImageNet)
     """
     Distance from each generated sample to its nearest training image (Inception space), relative to the same
     distance for held-out real images, which are novel by construction.
@@ -620,7 +622,12 @@ def memorization(gen_feats, train_bank, val_feats):
       near_dup_rate: fraction of samples closer than the 1st percentile of val->train distances (baseline for novel images: 1%).
     """
     d_gen = nn_distances(gen_feats, train_bank)
-    d_val = nn_distances(val_feats, train_bank)
+    if cache is not None and 'd_val' in cache:
+        d_val = cache['d_val']
+    else:
+        d_val = nn_distances(val_feats, train_bank)
+        if cache is not None:
+            cache['d_val'] = d_val
     threshold = torch.quantile(d_val, 0.01)
     return {
         'nn_ratio': (d_gen.median() / d_val.median()).item(),

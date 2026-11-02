@@ -19,6 +19,7 @@ and fid.py's feature files) and writes them to wandb and {out_dir}/diagnostics/.
 """
 
 import os
+import sys
 import re
 import time
 import math
@@ -42,6 +43,8 @@ import diagnostics as diag_lib
 import alloc_eval as alloc_lib
 import plot_trends
 from progress_gif import make_progress_gifs
+
+sys.stdout.reconfigure(line_buffering=True) # logs redirected to a file (the queues, nohup) show each line as it's printed
 
 # -----------------------------------------------------------------------------
 # I/O
@@ -237,6 +240,8 @@ diag_trajectory_t0 = '0.3,0.5,0.7,0.85' # 9: held-out images noised to each t0 a
 diag_trajectory_images = 256
 progress_gif = True # after each eval, rebuild samples/progress*.gif from all saved sample grids (same seed / classes) and log to wandb
 trend_plots = True # after each eval, regenerate the plot_trends.py figures in {out_dir}/trends and log them to wandb (needs diag)
+diag_memorization = True # 7: nearest training image of each sample (Inception space), one pass over the train features
+                         # (train_inception.npy: ~5 GB on ImageNet, read from disk if not cached) per eval
 diag_opt_stats = True # 4: grad norms and update/weight ratios per block, every log_interval
 # system
 device = 'cuda'
@@ -706,6 +711,7 @@ if diag:
     pr_idx = np.sort(np.random.default_rng(0).choice(len(train_bank), min(fid_num_images, len(train_bank)), replace=False))
     pr_real = torch.from_numpy(train_bank[pr_idx].astype(np.float32)).to(device)
     val_feats = torch.from_numpy(np.load(os.path.join(val_dir, 'val_inception.npy')).astype(np.float32)).to(device)
+    memorization_cache = {} # the val -> train distances, computed at the first eval
     # 6: spectrum of real held-out images, on the same [0, 1] scale as the generated uint8 samples
     real_spectrum = 0
     for i in range(0, min(diag_spectrum_images, len(val_data)), 256):
@@ -828,8 +834,9 @@ def evaluate(step):
     # 2. precision / recall
     log['val/precision'], log['val/recall'] = precision_recall(pr_real, gen_feats)
     # 7. memorization
-    for k, v in diag_lib.memorization(gen_feats, train_bank, val_feats).items():
-        log[f'mem/{k}'] = v
+    if diag_memorization:
+        for k, v in diag_lib.memorization(gen_feats, train_bank, val_feats, memorization_cache).items():
+            log[f'mem/{k}'] = v
     # 3. raw weights
     if diag_raw:
         raw = generate()

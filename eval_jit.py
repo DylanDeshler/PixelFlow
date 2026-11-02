@@ -28,6 +28,7 @@ and a {name}_classes.json mapping label -> ImageNet-1k index and class name.
 """
 
 import os
+import sys
 import json
 from contextlib import nullcontext
 
@@ -124,6 +125,8 @@ def plot_cfg_sweep(results, cfgs, path, title):
     fig.savefig(path, dpi=150, facecolor=SURFACE)
     plt.close(fig)
     return path
+
+sys.stdout.reconfigure(line_buffering=True) # logs redirected to a file (the queues, nohup) show each line as it's printed
 
 # -----------------------------------------------------------------------------
 ckpt = ''
