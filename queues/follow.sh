@@ -9,8 +9,10 @@ dir=runs/queue_logs
 lines=${1:-20}
 cur="" pid=""
 trap '[ -n "$pid" ] && kill $pid 2>/dev/null; exit 0' INT TERM
+[ -d "$dir" ] || { echo "no $dir here: run from the repo root (where the queues were started)"; exit 1; }
+echo "watching $dir for the running step's log..."
 while true; do
-    new=$(ls -t "$dir"/*.log 2>/dev/null | grep -v '/queue_' | head -1)
+    new=$(ls -t "$dir"/*.log 2>/dev/null | grep -v '/queue_[^/]*$' | head -1) # skip the queues' own queue_*.log files
     if [ -n "$new" ] && [ "$new" != "$cur" ]; then
         [ -n "$pid" ] && kill $pid 2>/dev/null
         cur=$new
