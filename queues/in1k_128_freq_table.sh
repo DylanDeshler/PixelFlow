@@ -2,9 +2,9 @@
 # in1k_128 follow-up (2026-10-31): frequency weighting by what a trained model recovers (the nonlinear counterpart of the
 # Wiener gain, which made FID worse). Builds the gain table from the best checkpoint (the 80-epoch recipe run, EMA weights:
 # recovery is a property of the data and noise, the model only estimates it, so the strongest model estimates it best), then
-# a 20-epoch run matched to the baseline runs/in1k_128/jit-b16_icl0/muon (batch 1024). Waits for the main queue
-# (in1k_128_weighting_batch.sh) to finish first, so it can be started now. Resumes like the main queue (.done markers,
-# interrupted training continues from its checkpoint).
+# a 20-epoch run matched to the baseline runs/in1k_128/jit-b16_icl0/muon (batch 1024). The queues share a GPU lock
+# (runs/queue_logs/gpu.lock), so it can be started any time. Resumes like the main queue (.done markers, interrupted training
+# continues from its checkpoint).
 #
 #   nohup bash queues/in1k_128_freq_table.sh > runs/queue_logs/queue_freq_table.log 2>&1 &
 set -u
@@ -12,7 +12,9 @@ DATA=${JIT_DATA_ROOT:-/data}/in1k_128
 TABLE=runs/freq_tables/in1k_128_recipe80.json
 BASE="config/jit_in1k_128.py --optimizer_type=muon --data_dir=$DATA --epochs=20"
 mkdir -p runs/queue_logs runs/freq_tables
-while pgrep -f in1k_128_weighting_batch.sh > /dev/null; do sleep 300; done # the GPU is the main queue's until it's done
+# one GPU: every step of every queue holds this lock while it runs, so the queues can be started in any order and take
+# turns step by step (an earlier version only checked which queues were running at start, and three runs collided)
+GPU_LOCK=runs/queue_logs/gpu.lock
 step() { # step name command... (as in in1k_128_weighting_batch.sh)
     local name=$1; shift
     local log="runs/queue_logs/$name.log" done="runs/queue_logs/$name.done"
@@ -23,7 +25,7 @@ step() { # step name command... (as in in1k_128_weighting_batch.sh)
         if [ -n "$dir" ] && [ -e "$dir/ckpt.pt" ]; then extra=(--init_from=resume); mode=">>"; fi
     fi
     echo "=== $(date '+%F %T') start $name ${extra[*]:-}: $*"
-    if [ "$mode" = ">>" ]; then "$@" "${extra[@]}" >> "$log" 2>&1; else "$@" > "$log" 2>&1; fi
+    if [ "$mode" = ">>" ]; then flock "$GPU_LOCK" "$@" "${extra[@]}" >> "$log" 2>&1; else flock "$GPU_LOCK" "$@" > "$log" 2>&1; fi
     local rc=$?
     [ $rc -eq 0 ] && touch "$done"
     echo "=== $(date '+%F %T') end $name (exit $rc)"

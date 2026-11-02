@@ -156,6 +156,7 @@ loss_freq_weight = 'none' # 'wiener': weight the residual's frequencies by their
                           # 'table': by the share a trained model recovers instead (--loss_freq_table, from build_freq_table.py)
 loss_freq_table = '' # JSON from build_freq_table.py, for loss_freq_weight='table'
 loss_t_weight = 'none' # 'learned': EDM2-style learned per-noise-level weight (loss L / e^u(t) + u(t)); the logged loss then includes u
+loss_weight_normalize = True # learned weight: divide by the batch mean so the gradient keeps the plain loss's scale; False = EDM2's form (as the first in1k run)
 loss_weight_lr_mult = 50.0 # the learned weight's lr / lr: u(t) must travel to log E[L | t] (~-3..1), too slow at the model's lr
 label_drop_prob = 0.1
 # optimizer
@@ -465,7 +466,8 @@ if loss_freq_weight != 'none' or loss_t_weight != 'none':
     power = image_power_spectrum(data) if loss_freq_weight == 'wiener' else None
     assert (loss_freq_weight == 'table') == bool(loss_freq_table), "--loss_freq_table goes with --loss_freq_weight=table"
     table = json.load(open(loss_freq_table)) if loss_freq_table else None
-    loss_weighter = LossWeighting(noise_scale, power, freq=loss_freq_weight, t_weight=loss_t_weight, table=table, img_size=img_size).to(device)
+    loss_weighter = LossWeighting(noise_scale, power, freq=loss_freq_weight, t_weight=loss_t_weight, table=table, img_size=img_size,
+                                  normalize_learned=loss_weight_normalize).to(device)
     print(f"loss weighting: frequencies {loss_freq_weight}, noise levels {loss_t_weight}")
 trainable = list(denoiser.named_parameters()) + (list(projector.named_parameters()) if projector is not None else []) \
     + (list(masker.named_parameters()) if masker is not None else [])

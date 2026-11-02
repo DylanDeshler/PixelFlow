@@ -16,6 +16,9 @@ DATA=${JIT_DATA_ROOT:-/data}/in1k_128
 FROM=${QUEUE_FROM:-1}
 BASE="config/jit_in1k_128.py --optimizer_type=muon --data_dir=$DATA --epochs=20"
 mkdir -p runs/queue_logs
+# one GPU: every step of every queue holds this lock while it runs, so the queues can be started in any order and take
+# turns step by step (an earlier version only checked which queues were running at start, and three runs collided)
+GPU_LOCK=runs/queue_logs/gpu.lock
 step() { # step N name command...
     local n=$1 name=$2; shift 2
     local log="runs/queue_logs/$name.log" done="runs/queue_logs/$name.done"
@@ -28,7 +31,7 @@ step() { # step N name command...
         if [ -n "$dir" ] && [ -e "$dir/ckpt.pt" ]; then extra=(--init_from=resume); mode=">>"; fi
     fi
     echo "=== $(date '+%F %T') start $n $name ${extra[*]:-}: $*"
-    if [ "$mode" = ">>" ]; then "$@" "${extra[@]}" >> "$log" 2>&1; else "$@" > "$log" 2>&1; fi
+    if [ "$mode" = ">>" ]; then flock "$GPU_LOCK" "$@" "${extra[@]}" >> "$log" 2>&1; else flock "$GPU_LOCK" "$@" > "$log" 2>&1; fi
     local rc=$?
     [ $rc -eq 0 ] && touch "$done"
     echo "=== $(date '+%F %T') end $n $name (exit $rc)"
