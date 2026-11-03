@@ -19,7 +19,9 @@
 #   4. block   --attn_res=block (Block AttnRes: 1.14x plain step time vs full's 1.25x), if full AttnRes was adopted; adopted if
 #              FID-10k is within ATTNRES_BLOCK_TOL (default 0.5) of the best: a speed change
 #   (hyperparameter / noise tuning stages slot in here when added; patch allocation stays last: it slows every step)
-#   5. tokens  --token_sizes=16,8 --fine_frac=0.25: bench_tokens.py (minutes, with and without selective recompute), the run,
+#   5. budget  extra tokens at equal compute (x1.34 FLOPs): JiT's 32 in-context tokens from block 4 vs two token sizes at fine
+#              share 0.11; the better is adopted if it beats the best
+#   6. tokens  --token_sizes=16,8 --fine_frac=0.25: bench_tokens.py (minutes, with and without selective recompute), the run,
 #              sampling budgets on its checkpoint (FID-10k with fine tokens on 0 / 0.1 / 0.5 / 1.0 of the calls), and, if it
 #              wins per image, the previous best continued to the same GPU-hours (per-hour comparison; its 20-epoch
 #              checkpoint kept as ckpt_20ep.pt). Adoption is per image; the log prints the per-hour numbers next to it
@@ -34,8 +36,11 @@ DISP_KIND=infonce_l2n # scale-invariant (repa.dispersive_loss): plain infonce_l2
 DISP_POOL=mean # one vector per image: the unpooled normalized form saturated in ~600 steps through the input-noise shortcut (2026-11-03)
 DISP_ARGS="--disp_kind=$DISP_KIND --disp_pool=$DISP_POOL"
 ATTNRES_BLOCK_TOL=${ATTNRES_BLOCK_TOL:-0.5} # stage 5: FID-10k Block AttnRes may lose and still be adopted (about run-to-run noise)
-DISP_ARMS=${DISP_ARMS:-"8:0.5 8:0.1"} # block:weight, in order. Block 8: where probes peak (kNN 3.42 vs 2.24 at block 4, 1.06 at
-                                     # block 12); weight 0.5 (the paper's), then 0.1 in case 0.5 is too strong
+DISP_ARMS=${DISP_ARMS:-"8:0.5 8:0.1 8:0.1:32:l2s 8:0.5:32:l2s 8:0.05 8:0.01"} # block:weight[:group[:form]], in order (form: l2n, the
+    # default, or l2s). Block 8: where probes peak (kNN 3.42 vs 2.24 at block 4, 1.06 at block 12). Weight 0.5 (the paper's) failed
+    # (FID 90.87 @10, linear probe 5.68 -> 1.24), then 0.1. Then the paper's setting made scale-safe: batch-standardized InfoNCE-L2
+    # (scale- and translation-invariant) within groups of 32 (the paper's per-GPU batch), weight 0.1, then 0.5; then weaker
+    # weights 0.05, 0.01 of the per-sample-normalized form on the whole batch
 BASE="config/jit_in1k_128.py --optimizer_type=muon --data_dir=$DATA"
 IMPL="--attn_res_chunk=8" # implementation only (same results, not in run names): full AttnRes mixed in chunks of 8, 1.38x -> 1.25x plain
 mkdir -p runs/queue_logs
@@ -106,20 +111,22 @@ REF10=$(fid_at_epoch "$BEST_RUN" 10)
 echo "dispersive stage: reference FID-10k at 10 epochs ${REF10:-unknown} ($BEST_RUN)"
 win=""; wlam=""
 for arm in $DISP_ARMS; do
-    b=${arm%%:*}; lam=${arm##*:}
-    step "stack_disp3_b${b}_w${lam}_10ep" python train_jit.py $BASE $IMPL $BEST_ARGS --epochs=10 $DISP_ARGS --disp_weight=$lam --disp_blocks=$b
-    f=$(last_fid "stack_disp3_b${b}_w${lam}_10ep")
-    echo "screen: block $b, weight $lam -> FID-10k ${f:-none (stopped or failed)} at 10 epochs (reference ${REF10:-unknown})"
-    if [ -n "$f" ] && [ -n "$REF10" ] && lt "$f" "$REF10"; then win=$b; wlam=$lam; break; fi
+    IFS=: read -r b lam grp form <<< "$arm"
+    gtag=${grp:+_g$grp}; gargs=${grp:+--disp_group=$grp}
+    if [ -n "$form" ] && [ "$form" != l2n ]; then gtag="${gtag}_$form"; gargs="$gargs --disp_kind=infonce_$form"; fi
+    step "stack_disp3_b${b}_w${lam}${gtag}_10ep" python train_jit.py $BASE $IMPL $BEST_ARGS --epochs=10 $DISP_ARGS $gargs --disp_weight=$lam --disp_blocks=$b
+    f=$(last_fid "stack_disp3_b${b}_w${lam}${gtag}_10ep")
+    echo "screen: block $b, weight $lam${grp:+, groups of $grp}${form:+, form $form} -> FID-10k ${f:-none (stopped or failed)} at 10 epochs (reference ${REF10:-unknown})"
+    if [ -n "$f" ] && [ -n "$REF10" ] && lt "$f" "$REF10"; then win=$b; wlam=$lam; wtag=$gtag; wargs=$gargs; break; fi
 done
 if [ -n "$win" ]; then
-    step "stack_disp3_b${win}_w${wlam}_20ep" python train_jit.py $BASE $IMPL $BEST_ARGS --epochs=20 $DISP_ARGS --disp_weight=$wlam --disp_blocks=$win --init_from=resume
-    step "stack_disp3_balance${SHARE}_b${win}" python train_jit.py $BASE $IMPL $BEST_ARGS --epochs=20 $DISP_ARGS --disp_balance=$SHARE --disp_blocks=$win
-    fw=$(last_fid "stack_disp3_b${win}_w${wlam}_20ep"); fb=$(last_fid "stack_disp3_balance${SHARE}_b${win}")
+    step "stack_disp3_b${win}_w${wlam}${wtag}_20ep" python train_jit.py $BASE $IMPL $BEST_ARGS --epochs=20 $DISP_ARGS $wargs --disp_weight=$wlam --disp_blocks=$win --init_from=resume
+    step "stack_disp3_balance${SHARE}_b${win}${wtag}" python train_jit.py $BASE $IMPL $BEST_ARGS --epochs=20 $DISP_ARGS $wargs --disp_balance=$SHARE --disp_blocks=$win
+    fw=$(last_fid "stack_disp3_b${win}_w${wlam}${wtag}_20ep"); fb=$(last_fid "stack_disp3_balance${SHARE}_b${win}${wtag}")
     if [ -n "$fb" ] && { [ -z "$fw" ] || lt "$fb" "$fw"; }; then
-        adopt "stack_disp3_balance${SHARE}_b${win}" "$DISP_ARGS --disp_balance=$SHARE --disp_blocks=$win"
+        adopt "stack_disp3_balance${SHARE}_b${win}${wtag}" "$DISP_ARGS $wargs --disp_balance=$SHARE --disp_blocks=$win"
     else
-        adopt "stack_disp3_b${win}_w${wlam}_20ep" "$DISP_ARGS --disp_weight=$wlam --disp_blocks=$win"
+        adopt "stack_disp3_b${win}_w${wlam}${wtag}_20ep" "$DISP_ARGS $wargs --disp_weight=$wlam --disp_blocks=$win"
     fi
 else
     echo ">>> dispersive: no arm beat the reference at 10 epochs; not adopted"
@@ -143,7 +150,24 @@ fi
 # (hyperparameter and noise tuning go here when added: weight decay, Muon momentum / beta2, lr, noise schedule; patch
 #  allocation stays last because it slows every step, unless the tuning is better done on the final architecture)
 
-# 5. tokens (last: two forwards per step make it the slowest stage)
+# 5. extra-token budget at equal compute: registers or finer detail? JiT's 32 in-context class tokens from block 4 (85.3 tokens
+#    per block on average, x1.34 FLOPs at 128px; the paper's count, though at 256px it was only +8% tokens) against two token
+#    sizes at the FLOP-matched fine share 0.11. The better is adopted if it beats the best (the per-image comparison between
+#    the two is the result; both logs print img/s)
+step stack_icl32 python train_jit.py $BASE $IMPL $BEST_ARGS --epochs=20 --in_context_len=32
+step stack_fine0.11 python train_jit.py $BASE $IMPL $BEST_ARGS --epochs=20 --token_sizes=16,8 --fine_frac=0.11
+fi=$(last_fid stack_icl32); ff=$(last_fid stack_fine0.11)
+echo "extra tokens at x1.34 FLOPs: in-context 32 -> FID-10k ${fi:-none} ($(ips "$(run_of stack_icl32)") img/s), fine 0.11 -> ${ff:-none} ($(ips "$(run_of stack_fine0.11)") img/s); best $BEST_FID"
+ICL=""
+if [ -n "$fi" ] && { [ -z "$ff" ] || lt "$fi" "$ff"; }; then
+    adopt stack_icl32 "--in_context_len=32" && ICL=1
+elif [ -n "$ff" ]; then
+    adopt stack_fine0.11 "--token_sizes=16,8 --fine_frac=0.11"
+fi
+
+# 6. tokens (last: two forwards per step make it the slowest stage); skipped if in-context tokens were adopted (the two-size
+#    model doesn't support them)
+if [ -n "$ICL" ]; then echo ">>> tokens: skipped (in-context tokens adopted; not supported with two token sizes)"; else
 step stack_tokens_bench$BENCH_TAG python bench_tokens.py $ARCH_ARGS $IMPL
 step stack_tokens_bench${BENCH_TAG}_mem0.5 python bench_tokens.py $ARCH_ARGS $IMPL --act_memory_budget=0.5
 step stack_tokens python train_jit.py $BASE $IMPL $BEST_ARGS --epochs=20 --token_sizes=16,8 --fine_frac=0.25
@@ -161,6 +185,8 @@ if adopt stack_tokens "--token_sizes=16,8 --fine_frac=0.25"; then
     [ -e "$PREV_RUN/ckpt_20ep.pt" ] || cp "$PREV_RUN/ckpt.pt" "$PREV_RUN/ckpt_20ep.pt"
     step "stack_tokens_matched_${ep}ep" python train_jit.py $BASE $IMPL $PREV_ARGS --epochs=$ep --init_from=resume
     echo ">>> per GPU-hour: 16/8 tokens FID-10k $BEST_FID at 20 epochs vs the previous best continued to $ep epochs (same hours): $(last_fid "stack_tokens_matched_${ep}ep")"
+fi
+
 fi
 
 printf 'FID-10k %s\nrun %s\nargs %s %s\n' "$BEST_FID" "$BEST_RUN" "$BASE" "$BEST_ARGS" > runs/queue_logs/stack_best.txt

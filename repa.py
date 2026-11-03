@@ -190,7 +190,7 @@ def repa_loss(hidden, target, projector):
     target = F.normalize(target.float(), dim=-1)
     return -(z * target).sum(-1).mean()
 
-def dispersive_loss(hidden, tau=0.5, kind='infonce_l2', margin=1.0, pool='none'):
+def dispersive_loss(hidden, tau=0.5, kind='infonce_l2', margin=1.0, pool='none', group=0):
     """
     Dispersive Loss (Wang & He 2025, "Diffuse and Disperse"; official code github.com/raywang4/DispLoss) on one block's
     output, pushing the batch's representations apart without positive pairs. hidden [B, T, C] -> scalar. z_i = image i's
@@ -205,6 +205,12 @@ def dispersive_loss(hidden, tau=0.5, kind='infonce_l2', margin=1.0, pool='none')
                    directions apart; tau keeps the meaning it has for the O(1)-scale DiT features the paper tuned on. Equals
                    infonce_cos at tau / 2 (D = 2 - 2 cos for unit-RMS vectors); best value ~log((1 + (B-1) e^(-2/tau)) / B)
                    with every pair orthogonal (-3.95 at B 1024, tau 0.5)
+      infonce_l2s  infonce_l2 on batch-standardized features: subtract the batch mean, divide by one RMS over the batch and all
+                   dimensions (gradient through both). Translation-invariant like the paper's loss (a component shared by the
+                   batch changes no distance; infonce_l2n's per-sample normalization lets removing it lower the loss), scale-
+                   invariant (unlike the paper's, which the network gamed by growing its features), and the samples' relative
+                   norms are kept. For features already at zero mean and unit RMS it is infonce_l2 exactly, so tau keeps the
+                   paper's meaning. (Proposed in DISPERSIVE_ANALYSIS.md, F1; with group: standardized over the whole batch, pairs compared within groups)
       infonce_cos  the same with D = -cosine similarity
       hinge        mean_{i != j} max(0, margin - D_ij)^2, D as infonce_l2 (positive pairs, i = j, discarded)
       covariance   mean squared off-diagonal correlation between feature dimensions over the batch (features standardized
@@ -216,15 +222,33 @@ def dispersive_loss(hidden, tau=0.5, kind='infonce_l2', margin=1.0, pool='none')
     the shortcut: averaging T tokens shrinks independent noise by sqrt(T) (8x) while content that is consistent across tokens
     survives, so the noise has to grow ~8x relative to coherent content before it wins; but pure noise, pooled and normalized,
     still scores almost the best value (1024 random 768-d vectors are nearly orthogonal). train_jit.py stops a run that gets there.
+    group: > 0 computes the loss within consecutive groups of this many samples (the batch is shuffled) and averages, as the
+    paper's code does per GPU (~32 samples per device); 0 = the whole batch. Spreading a small group needs only the few
+    semantic directions the features already have; spreading 1024 samples nearly uniformly needs many independent
+    directions, which the network supplied with non-semantic variation (pooled block 8, lambda 0.5: the loss at its best
+    value while the linear probe fell 5.68 -> 1.24).
     Computed in fp32 with autocast off: squared distances come from norms minus dot products, which bf16 would cancel badly.
     """
+    if group and hidden.shape[0] > group:
+        n = hidden.shape[0] // group * group # (a remainder smaller than a group is left out)
+        if kind == 'infonce_l2s': # standardize with the whole batch's statistics (a stable scale), then compare pairs within groups
+            with torch.autocast(device_type=hidden.device.type, enabled=False):
+                z = hidden.float().mean(1) if pool == 'mean' else hidden.float().flatten(1)
+                z = z - z.mean(0, keepdim=True)
+                z = z * torch.rsqrt(z.pow(2).mean() + 1e-12)
+            return torch.stack([dispersive_loss(z[i:i + group], tau, 'infonce_l2') for i in range(0, n, group)]).mean()
+        return torch.stack([dispersive_loss(hidden[i:i + group], tau, kind, margin, pool) for i in range(0, n, group)]).mean()
     with torch.autocast(device_type=hidden.device.type, enabled=False):
         z = hidden.float().mean(1) if pool == 'mean' else hidden.float().flatten(1)
         B, d = z.shape
         off = 1 - torch.eye(B, device=z.device)
         if kind == 'infonce_l2n':
             z = z * torch.rsqrt(z.pow(2).mean(1, keepdim=True) + 1e-12) # unit RMS per sample
-        if kind in ('infonce_l2', 'infonce_l2n', 'hinge'):
+        if kind == 'infonce_l2s':
+            z = z - z.mean(0, keepdim=True) # the batch mean
+            z = z * torch.rsqrt(z.pow(2).mean() + 1e-12) # one RMS over the batch and all dimensions (a floor far below JiT's pooled
+                                                          # feature variance ~1e-6, which a 1e-8 floor made ~1% scale-dependent)
+        if kind in ('infonce_l2', 'infonce_l2n', 'infonce_l2s', 'hinge'):
             sq = z.pow(2).sum(1)
             D = (sq[:, None] + sq[None, :] - 2 * z @ z.T).clamp_min(0) / d * off # exactly 0 on the diagonal
             if kind == 'hinge':
@@ -238,7 +262,7 @@ def dispersive_loss(hidden, tau=0.5, kind='infonce_l2', margin=1.0, pool='none')
             zs = (z - z.mean(0)) / z.std(0).clamp_min(1e-6) # standardized per dimension: correlation matrix R = zs^T zs / B
             fro2 = (zs @ zs.T).pow(2).sum() / B ** 2 # ||R||_F^2 without forming the d x d matrix
             return (fro2 - (zs.pow(2).mean(0)).pow(2).sum()) / (d * (d - 1))
-        raise ValueError(f"kind must be 'infonce_l2', 'infonce_l2n', 'infonce_cos', 'hinge' or 'covariance', got {kind}")
+        raise ValueError(f"kind must be 'infonce_l2', 'infonce_l2n', 'infonce_l2s', 'infonce_cos', 'hinge' or 'covariance', got {kind}")
 
 class BlockCapture:
     """

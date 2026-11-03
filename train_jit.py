@@ -207,8 +207,9 @@ repa_depth = 4 # align the output of this block (1-indexed); JiT-B's in_context_
 disp_weight = 0.0 # Dispersive Loss (Wang & He 2025, repa.dispersive_loss): weight lambda, 0 = off (the paper: 0.5; their PyTorch code: 0.25)
 disp_temp = 0.5 # its temperature tau (the paper: 0.5; their PyTorch code: 1.0)
 disp_blocks = '' # blocks whose outputs it disperses (1-indexed): '' -> depth // 4 (the paper's default, block 3 of JiT-B's 12), a comma list, or 'all' (averaged)
-disp_kind = 'infonce_l2' # 'infonce_l2' (best in the paper), 'infonce_l2n' (the same on unit-RMS features: scale-invariant, use this for
-                          # JiT, see repa.dispersive_loss), 'infonce_cos', 'hinge', 'covariance'
+disp_kind = 'infonce_l2' # 'infonce_l2' (best in the paper), 'infonce_l2n' (on unit-RMS features per sample: scale-invariant), 'infonce_l2s'
+                          # (on batch-standardized features: scale- and translation-invariant), 'infonce_cos', 'hinge', 'covariance'
+disp_group = 0 # > 0: the dispersive loss within groups of this many samples, averaged (the paper's per-GPU ~32); 0 = the whole batch
 disp_pool = 'none' # 'none' (the paper: every token flattened) or 'mean' (one vector per image, tokens averaged; see repa.dispersive_loss)
 disp_balance = 0.0 # > 0: instead of the fixed weight, EnCodec's gradient balancer at the block: the dispersive loss gets this share
                    # of the gradient into the blocks below (the diffusion loss gets 1 - share); disp_weight is then ignored (one block only)
@@ -506,7 +507,7 @@ if disp_weight > 0 or disp_balance > 0:
         disp_weight = 1.0 # the balancer sets the gradient shares; the loss term enters unweighted
     disp_captures = [DispCapture(denoiser.net, b, disp_balancer) for b in disp_idx]
     print(f"dispersive loss ({disp_kind}): " + (f"balanced, share {disp_balance} of the gradient below block {disp_idx[0]}" if disp_balancer
-          else f"weight {disp_weight}") + f", temperature {disp_temp}, block(s) {disp_idx} of {n_blocks}, pooling {disp_pool}")
+          else f"weight {disp_weight}") + f", temperature {disp_temp}, block(s) {disp_idx} of {n_blocks}, pooling {disp_pool}" + (f", groups of {disp_group}" if disp_group else ""))
 if repa_encoder:
     assert repa_adapter in ('mlp', 'mta'), f"repa_adapter must be 'mlp' or 'mta', got {repa_adapter}"
     repa_coeff = repa_coeff if repa_coeff >= 0 else (0.5 if repa_adapter == 'mlp' else 0.1)
@@ -1223,7 +1224,7 @@ while True:
                 # two token sizes: each path backpropagates right after its forward (peak memory = the larger path)
                 path_backward = (lambda l: (l / gradient_accumulation_steps).backward()) if token_sizes else None
                 # two token sizes + Dispersive Loss: each forward's term, from that forward's captured blocks
-                path_disp = (lambda: sum(dispersive_loss(c.out, disp_temp, disp_kind, pool=disp_pool) for c in disp_captures) / len(disp_captures)) \
+                path_disp = (lambda: sum(dispersive_loss(c.out, disp_temp, disp_kind, pool=disp_pool, group=disp_group) for c in disp_captures) / len(disp_captures)) \
                     if token_sizes and disp_captures else None
                 loss_fm, t_used, y_used = flow_loss(denoiser, X, Y, masker, token_mask, mask_weighting, return_aux=True, parts=loss_parts,
                                                     weighter=loss_weighter, backward=path_backward,
@@ -1239,7 +1240,7 @@ while True:
             if disp_captures and token_sizes: # added (and backpropagated) per path inside flow_loss
                 loss_disp = loss_parts['aux'] / disp_weight
             elif disp_captures:
-                loss_disp = sum(dispersive_loss(c.out, disp_temp, disp_kind, pool=disp_pool) for c in disp_captures) / len(disp_captures)
+                loss_disp = sum(dispersive_loss(c.out, disp_temp, disp_kind, pool=disp_pool, group=disp_group) for c in disp_captures) / len(disp_captures)
                 loss = loss + disp_weight * loss_disp
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately fetch the next batch while the GPU works on the forward pass
@@ -1288,7 +1289,7 @@ while True:
             # Not applied to infonce_l2n: its best value (all pairs orthogonal) is the loss's goal, reached by spreading content or
             # by carrying noise alike, so only FID / the probes can tell; a 2026-11-03 guard on it stopped pooled runs at ~1.6 epochs
             k_fine = round(fine_frac * batch_size) if token_sizes else 0 # two token sizes: the term averages two sub-batches' floors
-            best = lambda n: math.log(1.0 / n) # every pair maximally far
+            best = lambda n: math.log(1.0 / min(n, disp_group or n)) # every pair maximally far (within a group, with --disp_group)
             floor = best(batch_size) if not k_fine else ((batch_size - k_fine) * best(batch_size - k_fine) + k_fine * best(k_fine)) / batch_size
             disp_pinned = disp_pinned + 1 if loss_disp.item() < floor + 0.05 else 0
             if disp_pinned >= 10:

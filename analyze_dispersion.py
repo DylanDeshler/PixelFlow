@@ -38,6 +38,7 @@ batch_size = 1024 # one batch; the loss's floor is log(1/B)
 taus = '0.25,0.5,1.0,2.0'
 tau = 0.5 # for the gradient norms
 weight = 0.5 # for the share column (the paper's lambda)
+group = 0 # > 0: within groups of this many samples (see repa.dispersive_loss)
 pool = 'none' # 'mean': one vector per image (see repa.dispersive_loss)
 kind = 'infonce_l2' # repa.dispersive_loss variant (infonce_l2n: on unit-RMS features, scale-invariant)
 seed = 0
@@ -107,9 +108,9 @@ for spec in ckpts.split(','):
         h_full = outs[i]
         h = h_full[:, n_strip(i):].detach().float()
         g_diff = h_full.grad[:, n_strip(i):].float().flatten(1).norm(dim=1).mean().item()
-        vals = {tv: dispersive_loss(h, tv, kind, pool=pool).item() for tv in tau_list}
+        vals = {tv: dispersive_loss(h, tv, kind, pool=pool, group=group).item() for tv in tau_list}
         hg = h.clone().requires_grad_(True)
-        gd, = torch.autograd.grad(dispersive_loss(hg, tau, kind, pool=pool), hg)
+        gd, = torch.autograd.grad(dispersive_loss(hg, tau, kind, pool=pool, group=group), hg)
         g_disp = gd.flatten(1).norm(dim=1).mean().item()
         rows.append({'block': i + 1, 'rms': h.pow(2).mean().sqrt().item(), 'disp': vals,
                      'pos': {tv: (v - floor) / (0 - floor) for tv, v in vals.items()},
