@@ -41,6 +41,7 @@ from loss_weighting import LossWeighting, image_power_spectrum
 from muon import Muon, CombinedOptimizer
 import diagnostics as diag_lib
 import alloc_eval as alloc_lib
+from util.progress import bar, stage
 import plot_trends
 from progress_gif import make_progress_gifs
 
@@ -661,7 +662,7 @@ if token_sizes and alloc_eval:
     alloc_show_labels = torch.linspace(0, num_classes - 1, alloc_eval_show).long().to(device)
 
 @torch.no_grad()
-def estimate_loss(images, labels, chunk=256, seed=0):
+def estimate_loss(images, labels, chunk=256, seed=0, desc='eval loss'):
     """
     The training objective (flow-matching v-loss, no label dropout, no masking) on fixed images with fixed noise and t,
     using the raw weights. Same seed every eval, so values are comparable across evals and between train / val.
@@ -671,7 +672,7 @@ def estimate_loss(images, labels, chunk=256, seed=0):
     total = 0.0
     with torch.random.fork_rng(devices=[device] if device_type == 'cuda' else []):
         torch.manual_seed(seed)
-        for i in range(0, len(images), chunk):
+        for i in bar(range(0, len(images), chunk), f'{desc} ({len(images)} images)'):
             x = to_model_input(images[i:i + chunk], flip=False, device=device)
             y = torch.from_numpy(labels[i:i + chunk]).to(device)
             with ctx:
@@ -684,6 +685,8 @@ def spaced(n, k):
     return np.linspace(0, n - 1, min(k, n)).round().astype(np.int64)
 
 if diag:
+    _t_diag = time.time()
+    print(f"diagnostics setup: fixed images ({2 * diag_images} + {diag_probe_train_images} + {diag_probe_val_images} probe), real-image Inception features ...", flush=True)
     val_dir = os.path.join(data_dir, 'val') # presence checked by check_prepared
     val_data = MemmapImages(val_dir)
     # 1/4/6: fixed batches, no flips
@@ -719,7 +722,7 @@ if diag:
         real_spectrum = real_spectrum + diag_lib.band_power(torch.from_numpy(xs).to(device).permute(0, 3, 1, 2).float() / 255, band_masks)
     real_spectrum = real_spectrum / min(diag_spectrum_images, len(val_data))
     os.makedirs(os.path.join(out_dir, 'diagnostics'), exist_ok=True)
-    print(f"diagnostics on: {len(val_data):,} held-out images, probes on blocks {probe_blocks} at t={probe_ts}, attention tiles {window_tiles}")
+    print(f"diagnostics on ({time.time() - _t_diag:.0f}s to set up): {len(val_data):,} held-out images, probes on blocks {probe_blocks} at t={probe_ts}, attention tiles {window_tiles}")
 
 def get_lr(it):
     # per-iteration version of JiT's schedule: linear warmup, then constant or half-cycle cosine
@@ -762,6 +765,7 @@ class EvalTimer:
             torch.cuda.synchronize()
         now = time.time()
         self.times[name] = self.times.get(name, 0.0) + (now - self.t) / 60
+        print(f"eval: {name} done in {now - self.t:.0f}s", flush=True)
         self.t = now
 
 eval_timer = EvalTimer()
@@ -774,9 +778,11 @@ def evaluate(step):
     t_start = time.time()
     global eval_timer
     eval_timer = timer = EvalTimer()
+    print(f"eval at iter {step} (epoch {step / iters_per_epoch:.2f}): val loss, FID-{fid_num_images / 1000:g}k"
+          + (", diagnostics" if diag else "") + (", allocation eval" if token_sizes and alloc_eval else "") + " ...", flush=True)
     log, images, record = {}, {}, {}
     for split, (xs, ys) in loss_sets.items():
-        log[f'eval/{split}_loss'] = estimate_loss(xs, ys)
+        log[f'eval/{split}_loss'] = estimate_loss(xs, ys, desc=f'eval loss, {split}')
     timer.lap('val loss')
     spectrum = SpectrumAccumulator(diag_spectrum_images) if diag else None
     with ema_weights(denoiser, 1):
@@ -800,8 +806,8 @@ def evaluate(step):
         if diag:
             # 5. probes on the EMA weights (the model that is sampled from)
             denoiser.eval()
-            tr = diag_lib.probe_features(denoiser.net, probe_train_x, probe_ts, probe_blocks, num_classes, ctx, device, noise_scale)
-            va = diag_lib.probe_features(denoiser.net, probe_val_x, probe_ts, probe_blocks, num_classes, ctx, device, noise_scale)
+            tr = diag_lib.probe_features(denoiser.net, probe_train_x, probe_ts, probe_blocks, num_classes, ctx, device, noise_scale, desc='probe features, train')
+            va = diag_lib.probe_features(denoiser.net, probe_val_x, probe_ts, probe_blocks, num_classes, ctx, device, noise_scale, desc='probe features, held-out')
             timer.lap('probe features')
             # 9. error along the sampler's own trajectory from held-out images noised to t0 (same sampler as the FID)
             trajectory = diag_lib.trajectory_pass(denoiser, *diag_val, trajectory_t0s, noise_scale, ctx, band_masks,
@@ -852,22 +858,25 @@ def evaluate(step):
                                               os.path.join(out_dir, 'diagnostics', f'probes_{step}.png'))
     # 1 + 4 + 6. per-noise-level pass on the raw weights (the ones being optimized)
     denoiser.eval()
-    passes = {split: diag_lib.noise_level_pass(denoiser.net, xb, yb, diag_ts, noise_scale, t_eps, ctx, band_masks)
+    passes = {split: diag_lib.noise_level_pass(denoiser.net, xb, yb, diag_ts, noise_scale, t_eps, ctx, band_masks, desc=f'noise-level pass, {split}')
               for split, (xb, yb) in (('train', diag_train), ('val', diag_val))}
     timer.lap('noise-level passes')
     # 4. locality ablation on the held-out batch: same images / noise / t, attention confined to tiles
-    window_passes = {k: diag_lib.noise_level_pass(denoiser.net, *diag_val, diag_ts, noise_scale, t_eps, ctx, band_masks, tile=k)
+    window_passes = {k: diag_lib.noise_level_pass(denoiser.net, *diag_val, diag_ts, noise_scale, t_eps, ctx, band_masks, tile=k,
+                                                  desc=f'window ablation, {k}x{k} tiles')
                      for k in window_tiles}
     timer.lap('window ablation')
     # skip pathway: the trunk-only prediction on the same held-out images and noise (what the trunk is trained on; never sampled)
     has_skip = getattr(denoiser.net, 'skip_pathway', False)
-    trunk_pass = diag_lib.noise_level_pass(denoiser.net, *diag_val, diag_ts, noise_scale, t_eps, ctx, band_masks, skip_on=False) if has_skip else None
+    trunk_pass = diag_lib.noise_level_pass(denoiser.net, *diag_val, diag_ts, noise_scale, t_eps, ctx, band_masks, skip_on=False,
+                                           desc='noise-level pass, trunk only') if has_skip else None
     # quadtree: area per patch level, per noise level, with the router the model trains with
     layout = diag_lib.layout_stats(denoiser.net, *diag_val, diag_ts, noise_scale, ctx) if is_quadtree else None
     # 8. input sensitivity of the sampled prediction (and of the trunk-only one, for comparison on the same z)
     sensitivity = {}
     if diag_sensitivity_images > 0:
-        sensitivity['sampled'] = diag_lib.input_sensitivity(denoiser.net, *diag_val, diag_ts, noise_scale, ctx, diag_sensitivity_images, masks=band_masks)
+        sensitivity['sampled'] = diag_lib.input_sensitivity(denoiser.net, *diag_val, diag_ts, noise_scale, ctx, diag_sensitivity_images, masks=band_masks,
+                                                            desc='input sensitivity')
         if has_skip:
             sensitivity['trunk'] = diag_lib.input_sensitivity(denoiser.net, *diag_val, diag_ts, noise_scale, ctx, diag_sensitivity_images,
                                                               skip_on=False, masks=band_masks)

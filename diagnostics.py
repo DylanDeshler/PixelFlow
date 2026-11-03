@@ -26,6 +26,7 @@ import torch.nn.functional as F
 
 from model_jit import modulate, AttnResState, BottleneckPatchEmbed
 from evaluation import knn_classifier
+from util.progress import bar
 
 
 # -----------------------------------------------------------------------------
@@ -259,7 +260,7 @@ def t_grid(n_bins, lo=-3.0, hi=3.0):
     return torch.sigmoid(torch.linspace(lo, hi, n_bins))
 
 @torch.no_grad()
-def noise_level_pass(net, x, y, ts, noise_scale, t_eps, ctx, masks, seed=0, chunk=128, tile=None, skip_on=True):
+def noise_level_pass(net, x, y, ts, noise_scale, t_eps, ctx, masks, seed=0, chunk=128, tile=None, skip_on=True, desc='noise-level pass'):
     """
     For each t in ts, noises the fixed batch x with fixed noise and records:
       v_loss (the training objective), x_mse, relative prediction error per frequency band,
@@ -277,7 +278,7 @@ def noise_level_pass(net, x, y, ts, noise_scale, t_eps, ctx, masks, seed=0, chun
     noise = torch.randn(x.shape, generator=g, device=x.device) * noise_scale
     out = defaultdict(list)
     spectrum = torch.fft.fft2(x.float()).abs().pow(2).mean(dim=(0, 1)) # mean signal power per frequency
-    for t_val in ts.tolist():
+    for t_val in bar(ts.tolist(), desc):
         acc = defaultdict(float)
         err_power, x_power, copy_power, wiener_power = 0, 0, 0, 0
         # noise power per frequency in z / t (unnormalized FFT of white noise: H * W * variance), and the Wiener gain
@@ -314,7 +315,7 @@ def noise_level_pass(net, x, y, ts, noise_scale, t_eps, ctx, masks, seed=0, chun
 # -----------------------------------------------------------------------------
 # 8. input sensitivity
 
-def input_sensitivity(net, x, y, ts, noise_scale, ctx, n_images=256, seed=0, chunk=64, skip_on=True, masks=None):
+def input_sensitivity(net, x, y, ts, noise_scale, ctx, n_images=256, seed=0, chunk=64, skip_on=True, masks=None, desc='input sensitivity'):
     """
     How strongly the x prediction reacts to its noisy input z, per noise level: the Jacobian J = d x_hat / d z of each
     image's n = 3 H W outputs w.r.t. its n inputs, from one Rademacher probe r per image through a vector-Jacobian
@@ -346,7 +347,7 @@ def input_sensitivity(net, x, y, ts, noise_scale, ctx, n_images=256, seed=0, chu
     n, count, hw = x[0].numel(), len(x), x.shape[-2] * x.shape[-1]
     dof = masks.sum(dim=(1, 2)) * x.shape[1] * count if masks is not None else None # tr(P_b) summed over channels and images
     out = defaultdict(list)
-    for t_val in ts.tolist():
+    for t_val in bar(ts.tolist(), desc):
         acc = defaultdict(float)
         for i in range(0, count, chunk):
             xb, yb, eb, rb = x[i:i + chunk], y[i:i + chunk], noise[i:i + chunk], probes[i:i + chunk]
@@ -394,7 +395,7 @@ def trajectory_pass(denoiser, x, y, t0s, noise_scale, ctx, masks, n_images=256, 
     denoiser.cfg_scale, denoiser.fixed_shape = 1.0, False
     out = defaultdict(list)
     try:
-        for t0 in t0s:
+        for t0 in bar(t0s, 'trajectory pass (sampling from noised held-out images)'):
             x_power, onestep_power, traj_power, final_power = 0, 0, 0, 0
             for i in range(0, len(x), chunk):
                 xb, yb, eb = x[i:i + chunk], y[i:i + chunk], noise[i:i + chunk]
@@ -435,7 +436,7 @@ def layout_stats(net, x, y, ts, noise_scale, ctx, n_images=256, seed=0, chunk=12
         with ctx:
             clean = torch.cat([net.route_clean(x[i:i + chunk]) for i in range(0, len(x), chunk)])
     out = {'area': [], 'x_mse': [], 'clean_agreement': []}
-    for t_val in ts.tolist():
+    for t_val in bar(ts.tolist(), 'layout stats'):
         area, err_sum, err_cnt, agree = 0, torch.zeros(L), torch.zeros(L), 0
         for i in range(0, len(x), chunk):
             xb, yb, eb = x[i:i + chunk], y[i:i + chunk], noise[i:i + chunk]
@@ -540,7 +541,7 @@ def sampling_layout_stats(denoiser, labels, x_real, noise_scale, ctx, t_ref=0.95
 # 5. representation probes
 
 @torch.no_grad()
-def probe_features(net, images, ts, blocks, null_label, ctx, device, noise_scale=1.0, seed=0, chunk=256):
+def probe_features(net, images, ts, blocks, null_label, ctx, device, noise_scale=1.0, seed=0, chunk=256, desc='probe features'):
     """
     Mean-pooled patch tokens after each block in `blocks`, for each noise level in ts.
     images: uint8 numpy [N, R, R, 3] (kept on CPU, moved to the GPU chunk by chunk).
@@ -550,9 +551,11 @@ def probe_features(net, images, ts, blocks, null_label, ctx, device, noise_scale
     """
     from data_jit import to_model_input
     feats = defaultdict(list)
+    progress = bar(desc=f'{desc} ({len(images)} images x {len(ts)} noise levels)', total=len(ts) * ((len(images) + chunk - 1) // chunk))
     for t_val in ts:
         g = torch.Generator(device=device).manual_seed(seed) # same noise for every t
         for i in range(0, len(images), chunk):
+            progress.update()
             xb = to_model_input(images[i:i + chunk], flip=False, device=device)
             eb = torch.randn(xb.shape, generator=g, device=device) * noise_scale
             t = torch.full((len(xb),), t_val, device=device)
@@ -563,6 +566,7 @@ def probe_features(net, images, ts, blocks, null_label, ctx, device, noise_scale
                 _, _, captured = instrumented_forward(net, z, t, y, capture_blocks=blocks)
             for b in blocks:
                 feats[(b, t_val)].append(captured[b].float().mean(1))
+    progress.close()
     return {k: torch.cat(v) for k, v in feats.items()}
 
 def linear_probe(train_x, train_y, val_x, val_y, num_classes, steps=1000, batch_size=1024, lr=1e-3, wd=1e-4):
@@ -588,7 +592,7 @@ def linear_probe(train_x, train_y, val_x, val_y, num_classes, steps=1000, batch_
 
 def run_probes(train_feats, train_y, val_feats, val_y, num_classes, knn_k=20):
     results = {}
-    for key in train_feats:
+    for key in bar(list(train_feats), 'probe fits (kNN + linear, per block and noise level)'):
         tr, va = train_feats[key], val_feats[key]
         knn_top1, _ = knn_classifier(F.normalize(tr, dim=-1), train_y, F.normalize(va, dim=-1), val_y,
                                      k=min(knn_k, len(tr)), num_classes=num_classes)
@@ -606,7 +610,7 @@ def nn_distances(queries, bank, bank_chunk=65536):
     """
     best = torch.full((len(queries),), float('inf'), device=queries.device)
     q = queries.float()
-    for i in range(0, len(bank), bank_chunk):
+    for i in bar(range(0, len(bank), bank_chunk), f'nearest training image ({len(queries)} queries x {len(bank)} train features)'):
         b = torch.from_numpy(np.asarray(bank[i:i + bank_chunk], dtype=np.float32)).to(queries.device)
         best = torch.minimum(best, torch.cdist(q, b).min(dim=1).values)
     return best

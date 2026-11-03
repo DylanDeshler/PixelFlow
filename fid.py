@@ -21,6 +21,8 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from util.progress import stage
+
 
 class InceptionMetrics:
     def __init__(self, device):
@@ -36,12 +38,34 @@ class InceptionMetrics:
         return f.float().cpu(), logits.float().cpu()
 
     def compute(self, features, logits, ref_stats):
-        from torch_fidelity.metric_fid import fid_features_to_statistics, fid_statistics_to_metric
         from torch_fidelity.metric_isc import isc_features_to_metric
-        stats = fid_features_to_statistics(features)
-        fid = fid_statistics_to_metric(stats, ref_stats, verbose=False)['frechet_inception_distance']
-        isc = isc_features_to_metric(logits)['inception_score_mean']
+        with stage(f'FID / IS from {len(features)} samples'):
+            fid = frechet_distance(features, ref_stats, self.device)
+            isc = isc_features_to_metric(logits)['inception_score_mean']
         return fid, isc
+
+@torch.no_grad()
+def frechet_distance(features, ref_stats, device):
+    """
+    FID of features [N, 2048] against ref_stats {'mu', 'sigma'}: torch-fidelity's statistics (float32 mean, float64
+    covariance) and formula, |mu1 - mu2|^2 + tr S1 + tr S2 - 2 tr sqrt(S1 S2), but on the GPU in float64 and with
+    symmetric eigendecompositions: S1 S2 has the same eigenvalues as S1^1/2 S2 S1^1/2, which is symmetric PSD, so
+    tr sqrt(S1 S2) = sum sqrt(eigvalsh(S1^1/2 S2 S1^1/2)). torch-fidelity's general eigvals on the CPU (np.linalg.eigvals
+    of a 2048 x 2048 non-symmetric matrix) can take many minutes on some machines; this takes about a second. Same value
+    up to float64 rounding (negative eigenvalues from rounding count as 0, as torch-fidelity's real part does).
+    """
+    f = features.to(device)
+    mu1 = f.float().mean(0).double()
+    fc = f.double() - f.double().mean(0)
+    s1 = fc.T @ fc / (len(f) - 1)
+    mu2 = torch.as_tensor(ref_stats['mu'], device=device).double()
+    s2 = torch.as_tensor(ref_stats['sigma'], device=device).double()
+    w, V = torch.linalg.eigh(s1)
+    r1 = (V * w.clamp_min(0).sqrt()) @ V.T # S1^1/2
+    ev = torch.linalg.eigvalsh(r1 @ s2 @ r1)
+    tr_covmean = ev.clamp_min(0).sqrt().sum()
+    d = mu1 - mu2
+    return float(d @ d + torch.trace(s1) + torch.trace(s2) - 2 * tr_covmean)
 
 def load_ref_stats(path):
     d = np.load(path)
@@ -71,8 +95,9 @@ def precision_recall(real, fake, k=3, chunk=4096):
         return torch.cat(hits).float().mean().item()
 
     real, fake = real.float(), fake.float()
-    precision = coverage(fake, real, kth_radius(real))
-    recall = coverage(real, fake, kth_radius(fake))
+    with stage(f'precision / recall ({len(real)} real x {len(fake)} generated)'):
+        precision = coverage(fake, real, kth_radius(real))
+        recall = coverage(real, fake, kth_radius(fake))
     return precision, recall
 
 if __name__ == '__main__':

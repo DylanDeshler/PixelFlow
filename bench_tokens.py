@@ -82,8 +82,10 @@ def bench(name, overrides, tokens_per_img, split=True):
                     if not (two and split):
                         loss.backward()
                 opt.step(); opt.zero_grad(set_to_none=True)
+            print(f'  {name}: compiling + {warmup} warm-up steps at micro-batch {micro} ...', flush=True)
             for _ in range(warmup):
                 step()
+            print(f'  {name}: timing {iters} steps ...', flush=True)
             if device_type == 'cuda':
                 torch.cuda.synchronize()
             t0 = time.perf_counter()
