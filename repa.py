@@ -190,7 +190,7 @@ def repa_loss(hidden, target, projector):
     target = F.normalize(target.float(), dim=-1)
     return -(z * target).sum(-1).mean()
 
-def dispersive_loss(hidden, tau=0.5, kind='infonce_l2', margin=1.0):
+def dispersive_loss(hidden, tau=0.5, kind='infonce_l2', margin=1.0, pool='none'):
     """
     Dispersive Loss (Wang & He 2025, "Diffuse and Disperse"; official code github.com/raywang4/DispLoss) on one block's
     output, pushing the batch's representations apart without positive pairs. hidden [B, T, C] -> scalar. z_i = image i's
@@ -209,10 +209,17 @@ def dispersive_loss(hidden, tau=0.5, kind='infonce_l2', margin=1.0):
       hinge        mean_{i != j} max(0, margin - D_ij)^2, D as infonce_l2 (positive pairs, i = j, discarded)
       covariance   mean squared off-diagonal correlation between feature dimensions over the batch (features standardized
                    per dimension, so the diagonal is 1), via the B x B Gram matrix: ||R||_F^2 = ||Z Z^T||_F^2 / B^2
+    pool: 'none' (the paper: every token, flattened) or 'mean' (one C-dim vector per image, the tokens averaged, the features the
+    kNN / linear probes read). In pixel-space JiT the flattened form is easy to satisfy without semantics: T C (49k on JiT-B/16
+    at 128px) dimensions per image let 1024 samples become mutually orthogonal by carrying their input's independent noise,
+    and infonce_l2n reached its best value in ~600 steps, then gave no gradient. Pooling raises the bar rather than removing
+    the shortcut: averaging T tokens shrinks independent noise by sqrt(T) (8x) while content that is consistent across tokens
+    survives, so the noise has to grow ~8x relative to coherent content before it wins; but pure noise, pooled and normalized,
+    still scores almost the best value (1024 random 768-d vectors are nearly orthogonal). train_jit.py stops a run that gets there.
     Computed in fp32 with autocast off: squared distances come from norms minus dot products, which bf16 would cancel badly.
     """
     with torch.autocast(device_type=hidden.device.type, enabled=False):
-        z = hidden.float().flatten(1)
+        z = hidden.float().mean(1) if pool == 'mean' else hidden.float().flatten(1)
         B, d = z.shape
         off = 1 - torch.eye(B, device=z.device)
         if kind == 'infonce_l2n':

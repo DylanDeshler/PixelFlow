@@ -209,6 +209,7 @@ disp_temp = 0.5 # its temperature tau (the paper: 0.5; their PyTorch code: 1.0)
 disp_blocks = '' # blocks whose outputs it disperses (1-indexed): '' -> depth // 4 (the paper's default, block 3 of JiT-B's 12), a comma list, or 'all' (averaged)
 disp_kind = 'infonce_l2' # 'infonce_l2' (best in the paper), 'infonce_l2n' (the same on unit-RMS features: scale-invariant, use this for
                           # JiT, see repa.dispersive_loss), 'infonce_cos', 'hinge', 'covariance'
+disp_pool = 'none' # 'none' (the paper: every token flattened) or 'mean' (one vector per image, tokens averaged; see repa.dispersive_loss)
 disp_balance = 0.0 # > 0: instead of the fixed weight, EnCodec's gradient balancer at the block: the dispersive loss gets this share
                    # of the gradient into the blocks below (the diffusion loss gets 1 - share); disp_weight is then ignored (one block only)
 repa_coeff = -1.0 # alignment loss weight; -1 -> the method's published value: 0.5 for mlp (REPA), 0.1 for mta (PixelREPA)
@@ -503,7 +504,7 @@ if disp_weight > 0 or disp_balance > 0:
         disp_weight = 1.0 # the balancer sets the gradient shares; the loss term enters unweighted
     disp_captures = [DispCapture(denoiser.net, b, disp_balancer) for b in disp_idx]
     print(f"dispersive loss ({disp_kind}): " + (f"balanced, share {disp_balance} of the gradient below block {disp_idx[0]}" if disp_balancer
-          else f"weight {disp_weight}") + f", temperature {disp_temp}, block(s) {disp_idx} of {n_blocks}")
+          else f"weight {disp_weight}") + f", temperature {disp_temp}, block(s) {disp_idx} of {n_blocks}, pooling {disp_pool}")
 if repa_encoder:
     assert repa_adapter in ('mlp', 'mta'), f"repa_adapter must be 'mlp' or 'mta', got {repa_adapter}"
     repa_coeff = repa_coeff if repa_coeff >= 0 else (0.5 if repa_adapter == 'mlp' else 0.1)
@@ -1218,7 +1219,7 @@ while True:
                 # two token sizes: each path backpropagates right after its forward (peak memory = the larger path)
                 path_backward = (lambda l: (l / gradient_accumulation_steps).backward()) if token_sizes else None
                 # two token sizes + Dispersive Loss: each forward's term, from that forward's captured blocks
-                path_disp = (lambda: sum(dispersive_loss(c.out, disp_temp, disp_kind) for c in disp_captures) / len(disp_captures)) \
+                path_disp = (lambda: sum(dispersive_loss(c.out, disp_temp, disp_kind, pool=disp_pool) for c in disp_captures) / len(disp_captures)) \
                     if token_sizes and disp_captures else None
                 loss_fm, t_used, y_used = flow_loss(denoiser, X, Y, masker, token_mask, mask_weighting, return_aux=True, parts=loss_parts,
                                                     weighter=loss_weighter, backward=path_backward,
@@ -1234,7 +1235,7 @@ while True:
             if disp_captures and token_sizes: # added (and backpropagated) per path inside flow_loss
                 loss_disp = loss_parts['aux'] / disp_weight
             elif disp_captures:
-                loss_disp = sum(dispersive_loss(c.out, disp_temp, disp_kind) for c in disp_captures) / len(disp_captures)
+                loss_disp = sum(dispersive_loss(c.out, disp_temp, disp_kind, pool=disp_pool) for c in disp_captures) / len(disp_captures)
                 loss = loss + disp_weight * loss_disp
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately fetch the next batch while the GPU works on the forward pass
@@ -1277,15 +1278,21 @@ while True:
             raise RuntimeError(f"loss is {lossf} at iter {iter_num}, stopping")
         imgs_per_sec = effective_batch_size / dt
         repa_str = (f", repa {loss_repa.item():.4f}" if encoder is not None else "") + (f", disp {loss_disp.item():.4f}" if disp_captures else "")
-        if disp_captures and disp_kind in ('infonce_l2', 'infonce_cos'):
+        if disp_captures and disp_kind in ('infonce_l2', 'infonce_l2n'):
             # pinned at the floor log(1/B): every pair looks maximally far apart for tau, so the term gives no gradient (with
             # infonce_l2 the network gets there by growing its features). 10 logged steps in a row there: stop, don't waste the run
             k_fine = round(fine_frac * batch_size) if token_sizes else 0 # two token sizes: the term averages two sub-batches' floors
-            floor = math.log(1.0 / batch_size) if not k_fine else ((batch_size - k_fine) * math.log(1.0 / (batch_size - k_fine)) + k_fine * math.log(1.0 / k_fine)) / batch_size
+            # the best value the form can reach: log(1/B) for infonce_l2 (every pair maximally far); infonce_l2n: every pair orthogonal,
+            # log((1 + (B - 1) e^(-2 / tau)) / B), which features that just carry per-sample noise reach too, pooled or not
+            best = (lambda n: math.log((1 + (n - 1) * math.exp(-2 / disp_temp)) / n)) if disp_kind == 'infonce_l2n' else (lambda n: math.log(1.0 / n))
+            floor = best(batch_size) if not k_fine else ((batch_size - k_fine) * best(batch_size - k_fine) + k_fine * best(k_fine)) / batch_size
             disp_pinned = disp_pinned + 1 if loss_disp.item() < floor + 0.05 else 0
             if disp_pinned >= 10:
-                raise SystemExit(f"dispersive loss pinned at its floor {floor:.2f} for 10 logged steps "
-                                 f"(no gradient): stopping. Use a scale-invariant form (--disp_kind=infonce_l2n)")
+                print(f"dispersive loss pinned at its best possible value {floor:.2f} for 10 logged steps (no gradient): stopping. "
+                                 + ("Use a scale-invariant form (--disp_kind=infonce_l2n)" if disp_kind != 'infonce_l2n' else
+                                    "the features became as spread as per-sample noise: the loss found the noise shortcut" + ("" if disp_pool == 'mean' else " (try --disp_pool=mean)")),
+                      flush=True)
+                sys.exit(3) # (exit code 3: stopped by this guard, a finished negative result rather than a crash)
         grad_str = f", grad norm {math.sqrt(sum(v ** 2 for v in grad_norms.values())):.4f}" if log_opt else ""
         trunk_str = f", trunk-only loss {loss_trunkf:.4f}" if loss_trunkf is not None else ""
         geo_stats = denoiser.net.geometry_stats() if is_gauss else {} # the training batch's token geometry

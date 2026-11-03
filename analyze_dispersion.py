@@ -38,6 +38,7 @@ batch_size = 1024 # one batch; the loss's floor is log(1/B)
 taus = '0.25,0.5,1.0,2.0'
 tau = 0.5 # for the gradient norms
 weight = 0.5 # for the share column (the paper's lambda)
+pool = 'none' # 'mean': one vector per image (see repa.dispersive_loss)
 kind = 'infonce_l2' # repa.dispersive_loss variant (infonce_l2n: on unit-RMS features, scale-invariant)
 seed = 0
 device = 'cuda'
@@ -106,9 +107,9 @@ for spec in ckpts.split(','):
         h_full = outs[i]
         h = h_full[:, n_strip(i):].detach().float()
         g_diff = h_full.grad[:, n_strip(i):].float().flatten(1).norm(dim=1).mean().item()
-        vals = {tv: dispersive_loss(h, tv, kind).item() for tv in tau_list}
+        vals = {tv: dispersive_loss(h, tv, kind, pool=pool).item() for tv in tau_list}
         hg = h.clone().requires_grad_(True)
-        gd, = torch.autograd.grad(dispersive_loss(hg, tau, kind), hg)
+        gd, = torch.autograd.grad(dispersive_loss(hg, tau, kind, pool=pool), hg)
         g_disp = gd.flatten(1).norm(dim=1).mean().item()
         rows.append({'block': i + 1, 'rms': h.pow(2).mean().sqrt().item(), 'disp': vals,
                      'pos': {tv: (v - floor) / (0 - floor) for tv, v in vals.items()},
@@ -116,7 +117,7 @@ for spec in ckpts.split(','):
     run = os.path.basename(os.path.dirname(os.path.abspath(path)))
     it = meta.get('iter_num')
     print(f"\n=== {run} (iter {it}, {'ema' + str(ema) if ema else 'raw'} weights, batch {B}: loss floor log(1/B) = {floor:.2f}; "
-          f"dispersive form {kind}; diffusion gradient from the {objective})")
+          f"dispersive form {kind}, pooling {pool}; diffusion gradient from the {objective})")
     print(f"{'block':>5} {'rms':>7} " + ''.join(f"{'pos@' + str(tv):>9}" for tv in tau_list) + f"  {'|g_disp|':>9} {'|g_diff|':>9} {'share@' + str(weight):>10}")
     for r in rows:
         print(f"{r['block']:>5} {r['rms']:>7.3f} " + ''.join(f"{r['pos'][tv]:>9.3f}" for tv in tau_list)

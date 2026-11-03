@@ -8,15 +8,20 @@
 #              Shares its step with in1k_128_clip.sh (an earlier queue), so a run already done or in progress there is reused
 #   2. arch    --attn_res=full --adaln_single=True together (the in100 wins; the one agreed exception to one change per stage).
 #              The in1k recipe with them trained at 1488 vs 2069 img/s: compare its img/s in the log too
-#   3. disp    Dispersive Loss, InfoNCE-L2 on unit-RMS features (--disp_kind=infonce_l2n; the plain form pinned at its floor by
-#              growing the features and cost ~13 FID, steps stack_disp_*, superseded by stack_disp2_*): analyze_dispersion.py on
-#              the current best (minutes), depth screen at blocks 3 / 6 / 9 / all (lambda 0.5, tau 0.5, 10 epochs each), the screen's best resumed to 20 epochs, and EnCodec's gradient
-#              balancer (share DISP_SHARE, default 0.2) at the best single block for 20 epochs; the better of the two is
-#              adopted if it beats the best
+#   3. disp    Dispersive Loss on mean-pooled, unit-RMS features (--disp_kind=infonce_l2n --disp_pool=mean). Earlier attempts:
+#              stack_disp_* (the paper's form pinned at its floor by growing the features, ~13 FID worse) and stack_disp2_*
+#              (normalized but unpooled: saturated in ~600 steps by carrying input noise). analyze_dispersion.py on the
+#              current best (minutes), then best shot first, 10 epochs
+#              each: DISP_ARMS = block:weight pairs, default block 8 at weight 0.5 then 0.1, stopping at the first that beats
+#              the current best's own 10-epoch FID. That arm resumes to 20 epochs, then EnCodec's gradient balancer (share
+#              DISP_SHARE, default 0.2) at the same block for 20 epochs; the better of the two is adopted if it beats the best. A run stopped by train_jit.py's
+#              dispersive guard (the loss at its best possible value: the noise shortcut) counts as a finished failure
 #   4. tokens  --token_sizes=16,8 --fine_frac=0.25: bench_tokens.py (minutes, with and without selective recompute), the run,
 #              sampling budgets on its checkpoint (FID-10k with fine tokens on 0 / 0.1 / 0.5 / 1.0 of the calls), and, if it
 #              wins per image, the previous best continued to the same GPU-hours (per-hour comparison; its 20-epoch
 #              checkpoint kept as ckpt_20ep.pt). Adoption is per image; the log prints the per-hour numbers next to it
+#   5. block   --attn_res=block (Block AttnRes: 1.14x plain step time vs full's 1.25x), if full AttnRes was adopted; adopted if
+#              FID-10k is within ATTNRES_BLOCK_TOL (default 0.5) of the best: a speed change
 # Ends by writing the final best setup to runs/queue_logs/stack_best.txt. Shares the queues' GPU lock.
 #
 #   nohup bash queues/in1k_128_stack.sh > runs/queue_logs/queue_stack.log 2>&1 &
@@ -25,6 +30,11 @@ set -u
 DATA=${JIT_DATA_ROOT:-/data}/in1k_128
 SHARE=${DISP_SHARE:-0.2}
 DISP_KIND=infonce_l2n # scale-invariant (repa.dispersive_loss): plain infonce_l2 pinned at its floor by growing the features (2026-11-03)
+DISP_POOL=mean # one vector per image: the unpooled normalized form saturated in ~600 steps through the input-noise shortcut (2026-11-03)
+DISP_ARGS="--disp_kind=$DISP_KIND --disp_pool=$DISP_POOL"
+ATTNRES_BLOCK_TOL=${ATTNRES_BLOCK_TOL:-0.5} # stage 5: FID-10k Block AttnRes may lose and still be adopted (about run-to-run noise)
+DISP_ARMS=${DISP_ARMS:-"8:0.5 8:0.1"} # block:weight, in order. Block 8: where probes peak (kNN 3.42 vs 2.24 at block 4, 1.06 at
+                                     # block 12); weight 0.5 (the paper's), then 0.1 in case 0.5 is too strong
 BASE="config/jit_in1k_128.py --optimizer_type=muon --data_dir=$DATA"
 IMPL="--attn_res_chunk=8" # implementation only (same results, not in run names): full AttnRes mixed in chunks of 8, 1.38x -> 1.25x plain
 mkdir -p runs/queue_logs
@@ -42,11 +52,24 @@ step() { # step name command...: skipped if done (also re-checked once the GPU l
     local guarded=(flock "$GPU_LOCK" bash -c '[ -e "$0" ] && exit 0; exec "$@"' "$done" "$@" ${extra[@]+"${extra[@]}"})
     if [ "$mode" = ">>" ]; then "${guarded[@]}" >> "$log" 2>&1; else "${guarded[@]}" > "$log" 2>&1; fi
     local rc=$?
-    [ $rc -eq 0 ] && touch "$done"
+    if [ $rc -eq 0 ] || [ $rc -eq 3 ]; then touch "$done"; fi # 3: train_jit.py's dispersive guard stopped it (a finished negative result)
     echo "=== $(date '+%F %T') end $name (exit $rc)"
 }
 last_fid() { grep -oE 'FID-[0-9.]+k [0-9]+(\.[0-9]+)?' "runs/queue_logs/$1.log" 2>/dev/null | tail -1 | awk '{print $2}'; }
 run_of() { grep -m1 '^run:  ' "runs/queue_logs/$1.log" 2>/dev/null | sed 's/^run:  //'; }
+fid_at_epoch() { # a run's in-loop FID at the eval nearest an epoch (from its diagnostics)
+    python -c "
+import json, glob, sys, os
+run, ep = sys.argv[1], float(sys.argv[2])
+c = json.load(open(os.path.join(run, 'config.json'))); ipe = c.get('derived', {}).get('iters_per_epoch') or c.get('iters_per_epoch')
+d = [(abs(int(f.rsplit('_', 1)[1][:-5]) / ipe - ep), f) for f in glob.glob(os.path.join(run, 'diagnostics', 'diag_*.json'))]
+f = min(d)[1] if d else None
+print(json.load(open(f))['scalars'].get('val/fid', '') if f and min(d)[0] < 0.5 else '')
+" "$1" "$2" 2>/dev/null
+}
+ips() { # a run's median img/s (from its train log)
+    [ -n "$1" ] && python -c "import json,sys; v=sorted(json.loads(l)['imgs_per_sec'] for l in open(sys.argv[1] + '/train_log.jsonl') if 'imgs_per_sec' in l and json.loads(l).get('epoch', 0) > 0.5); print(round(v[len(v) // 2]) if v else '?')" "$1" 2>/dev/null || echo '?'
+}
 hours() { python -c "import json,sys; r=[json.loads(l) for l in open(sys.argv[1] + '/train_log.jsonl')]; print([x['train_hours'] for x in r if 'train_hours' in x][-1])" "$1"; }
 lt() { awk "BEGIN {exit !($1 < $2)}"; }
 
@@ -74,28 +97,30 @@ adopt noclip_warmup1_learned "--grad_clip=0"
 step stack_arch python train_jit.py $BASE $IMPL $BEST_ARGS --epochs=20 --attn_res=full --adaln_single=True
 adopt stack_arch "--attn_res=full --adaln_single=True" && ARCH_ARGS="--attn_res=full --adaln_single=True"
 
-# 3. disp
-step stack_disp2_analysis python analyze_dispersion.py --ckpts=$BEST_RUN --data_dir=$DATA --kind=$DISP_KIND
-for b in 3 6 9 all; do
-    step "stack_disp2_b${b}_10ep" python train_jit.py $BASE $IMPL $BEST_ARGS --epochs=10 --disp_kind=$DISP_KIND --disp_weight=0.5 --disp_blocks=$b
+# 3. disp (pooled, scale-invariant; best shot first: DISP_ARMS in order, the first arm that beats the current best's own
+#    10-epoch FID continues to 20 epochs)
+step stack_disp3_analysis python analyze_dispersion.py --ckpts=$BEST_RUN --data_dir=$DATA --kind=$DISP_KIND --pool=$DISP_POOL
+REF10=$(fid_at_epoch "$BEST_RUN" 10)
+echo "dispersive stage: reference FID-10k at 10 epochs ${REF10:-unknown} ($BEST_RUN)"
+win=""; wlam=""
+for arm in $DISP_ARMS; do
+    b=${arm%%:*}; lam=${arm##*:}
+    step "stack_disp3_b${b}_w${lam}_10ep" python train_jit.py $BASE $IMPL $BEST_ARGS --epochs=10 $DISP_ARGS --disp_weight=$lam --disp_blocks=$b
+    f=$(last_fid "stack_disp3_b${b}_w${lam}_10ep")
+    echo "screen: block $b, weight $lam -> FID-10k ${f:-none (stopped or failed)} at 10 epochs (reference ${REF10:-unknown})"
+    if [ -n "$f" ] && [ -n "$REF10" ] && lt "$f" "$REF10"; then win=$b; wlam=$lam; break; fi
 done
-best=""; best_fid=""; best_single=""; best_single_fid=""
-for b in 3 6 9 all; do
-    f=$(last_fid "stack_disp2_b${b}_10ep"); [ -z "$f" ] && continue
-    echo "screen: block(s) $b -> FID-10k $f at 10 epochs"
-    if [ -z "$best_fid" ] || lt "$f" "$best_fid"; then best=$b; best_fid=$f; fi
-    if [ "$b" != all ] && { [ -z "$best_single_fid" ] || lt "$f" "$best_single_fid"; }; then best_single=$b; best_single_fid=$f; fi
-done
-if [ -n "$best" ]; then
-    echo "screen best: block(s) $best (FID-10k $best_fid); best single block: $best_single"
-    step "stack_disp2_b${best}_20ep" python train_jit.py $BASE $IMPL $BEST_ARGS --epochs=20 --disp_kind=$DISP_KIND --disp_weight=0.5 --disp_blocks=$best --init_from=resume
-    step "stack_disp2_balance${SHARE}_b${best_single}" python train_jit.py $BASE $IMPL $BEST_ARGS --epochs=20 --disp_kind=$DISP_KIND --disp_balance=$SHARE --disp_blocks=$best_single
-    fw=$(last_fid "stack_disp2_b${best}_20ep"); fb=$(last_fid "stack_disp2_balance${SHARE}_b${best_single}")
+if [ -n "$win" ]; then
+    step "stack_disp3_b${win}_w${wlam}_20ep" python train_jit.py $BASE $IMPL $BEST_ARGS --epochs=20 $DISP_ARGS --disp_weight=$wlam --disp_blocks=$win --init_from=resume
+    step "stack_disp3_balance${SHARE}_b${win}" python train_jit.py $BASE $IMPL $BEST_ARGS --epochs=20 $DISP_ARGS --disp_balance=$SHARE --disp_blocks=$win
+    fw=$(last_fid "stack_disp3_b${win}_w${wlam}_20ep"); fb=$(last_fid "stack_disp3_balance${SHARE}_b${win}")
     if [ -n "$fb" ] && { [ -z "$fw" ] || lt "$fb" "$fw"; }; then
-        adopt "stack_disp2_balance${SHARE}_b${best_single}" "--disp_kind=$DISP_KIND --disp_balance=$SHARE --disp_blocks=$best_single"
+        adopt "stack_disp3_balance${SHARE}_b${win}" "$DISP_ARGS --disp_balance=$SHARE --disp_blocks=$win"
     else
-        adopt "stack_disp2_b${best}_20ep" "--disp_kind=$DISP_KIND --disp_weight=0.5 --disp_blocks=$best"
+        adopt "stack_disp3_b${win}_w${wlam}_20ep" "$DISP_ARGS --disp_weight=$wlam --disp_blocks=$win"
     fi
+else
+    echo ">>> dispersive: no arm beat the reference at 10 epochs; not adopted"
 fi
 
 # 4. tokens
@@ -116,6 +141,20 @@ if adopt stack_tokens "--token_sizes=16,8 --fine_frac=0.25"; then
     [ -e "$PREV_RUN/ckpt_20ep.pt" ] || cp "$PREV_RUN/ckpt.pt" "$PREV_RUN/ckpt_20ep.pt"
     step "stack_tokens_matched_${ep}ep" python train_jit.py $BASE $IMPL $PREV_ARGS --epochs=$ep --init_from=resume
     echo ">>> per GPU-hour: 16/8 tokens FID-10k $BEST_FID at 20 epochs vs the previous best continued to $ep epochs (same hours): $(last_fid "stack_tokens_matched_${ep}ep")"
+fi
+
+# 5. Block AttnRes, for speed (only if full AttnRes was adopted): sources are block sums, 1.14x plain step time vs full's 1.25x
+#    (bench_attnres.py). Adopted if its FID is within ATTNRES_BLOCK_TOL of the best (a speed change: equal quality is enough)
+if [[ "$BEST_ARGS" == *"--attn_res=full"* ]]; then
+    step stack_attnres_block python train_jit.py $BASE $IMPL $BEST_ARGS --epochs=20 --attn_res=block
+    fbk=$(last_fid stack_attnres_block)
+    echo "block AttnRes: FID-10k ${fbk:-none} vs best $BEST_FID; img/s $(ips "$(run_of stack_attnres_block)") vs $(ips "$BEST_RUN")"
+    if [ -n "$fbk" ] && awk "BEGIN {exit !($fbk <= $BEST_FID + $ATTNRES_BLOCK_TOL)}"; then
+        echo ">>> stack_attnres_block: FID-10k $fbk within $ATTNRES_BLOCK_TOL of $BEST_FID: adopted for speed (--attn_res=block)"
+        BEST_ARGS="$BEST_ARGS --attn_res=block"; BEST_RUN=$(run_of stack_attnres_block); BEST_FID=$fbk
+    else
+        echo ">>> stack_attnres_block: not adopted (more than $ATTNRES_BLOCK_TOL worse, or failed)"
+    fi
 fi
 
 printf 'FID-10k %s\nrun %s\nargs %s %s\n' "$BEST_FID" "$BEST_RUN" "$BASE" "$BEST_ARGS" > runs/queue_logs/stack_best.txt

@@ -567,7 +567,7 @@ _NAME_TOKENS = {
     'dcae_stem': 'dcaestem', 'dcae_head': 'dcaehead', 'dcae_trunk_head': 'dcaetrunkhead', 'gate_init': 'gateinit-', 'dcae_norm': 'dcaenorm-', 'pixeldit_prediction': 'pred-',
     'skip_decoder': 'skipdec-', 'skip_decoder_dim': 'skipdecdim', 'skip_decoder_blocks': 'skipdecblocks', 'skip_decoder_rank': 'skipdecrank',
     'skip_decoder_conv': 'skipdecconv', 'skip_decoder_attnres': 'skipdecattnres', 'skip_decoder_modulation': 'skipdecmod', 'dcae_width': 'dcaew', 'dcae_kernel2': 'dcaek', 'patch_overlap': 'overlap', 'head_overlap': 'headoverlap', 'layernorm': 'layernorm',
-    'disp_weight': 'disp', 'disp_temp': 'disptemp', 'disp_blocks': 'dispblocks-', 'disp_kind': 'dispkind-', 'disp_balance': 'dispbal', 'repa_encoder': 'repa-', 'repa_adapter': 'adapter-', 'repa_depth': 'repadepth', 'repa_coeff': 'repacoeff', 'repa_proj_dim': 'repaproj',
+    'disp_weight': 'disp', 'disp_temp': 'disptemp', 'disp_blocks': 'dispblocks-', 'disp_kind': 'dispkind-', 'disp_pool': 'disppool-', 'disp_balance': 'dispbal', 'repa_encoder': 'repa-', 'repa_adapter': 'adapter-', 'repa_depth': 'repadepth', 'repa_coeff': 'repacoeff', 'repa_proj_dim': 'repaproj',
     'repa_mask_ratio': 'repamask', 'repa_adapter_depth': 'adapterdepth',
     'mask_ratio': 'mask', 'mask_prob': 'maskprob', 'mask_weighting': 'maskweight-',
     'quad_tokens': 'K', 'quad_levels': 'levels', 'quad_router': 'route-', 'quad_route_dino': 'dino-', 'quad_route_t_min': 'routetmin',
