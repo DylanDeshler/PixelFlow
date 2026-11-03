@@ -107,7 +107,7 @@ def describe_arch(model, arch):
               'skip_decoder_modulation', 'skip_head_blocks', 'skip_inject_block', 'skip_final_layer', 'skip_residual', 'mlp_ratio', 'in_context_len', 'in_context_start',
               'attn_res', 'attn_res_block_size', 'attn_res_adaln', 'adaln_single', 'gate_init', 'token_sizes', 'fine_frac', 'alloc_floor', 'alloc_gain'):
         v = full[k]
-        if k in ('fine_frac', 'alloc_floor', 'alloc_gain') and not full['token_sizes']:
+        if k in ('token_sizes', 'fine_frac', 'alloc_floor', 'alloc_gain') and not full['token_sizes']:
             continue
         if k == 'in_context_start' and full['in_context_len'] == 0:
             continue # unused without in-context tokens
@@ -328,7 +328,7 @@ def ema_weights(model, which=1):
 @torch.no_grad()
 def generate_and_score(model, metrics, ref_stats, num_images, num_classes, device, ctx,
                        cfg=1.0, interval=(0.0, 1.0), steps=50, method='heun', batch_size=256, seed=0, on_batch=None,
-                       fixed_shape=False, eta=1.0):
+                       fixed_shape=False, eta=1.0, desc=None):
     """
     Class-balanced generation (num_images / num_classes per class, as in JiT) and FID/IS against ref_stats.
     A fixed seed gives every evaluation the same noise and labels, so FID differences between runs
@@ -352,7 +352,7 @@ def generate_and_score(model, metrics, ref_stats, num_images, num_classes, devic
     feats, logits = [], []
     with torch.random.fork_rng(devices=[device] if 'cuda' in str(device) else []):
         torch.manual_seed(seed)
-        for start in tqdm(range(0, num_images, batch_size), desc=f'sampling (cfg {cfg})'):
+        for start in tqdm(range(0, num_images, batch_size), desc=desc or f'sampling (cfg {cfg})', mininterval=5.0, position=0):
             batch_labels = labels_all[start:start + batch_size]
             n = len(batch_labels)
             if fixed_shape and n < batch_size: # pad the last batch; the extra samples are discarded below

@@ -2,7 +2,8 @@
 
 Every training experiment so far and every one queued, in order. FIDs are FID-10k (FID-5k on in100), CFG 1.0, Heun 50
 steps, EMA weights: the in-loop eval, comparable within a dataset. Lower is better. Runs live under `runs/{dataset}/{model}/{run}`.
-Status: **done**, **running**, **queued**, **dropped**, **proposed** (designed, not queued).
+Status: **done**, **running**, **queued**, **dropped**, **proposed** (designed, not queued). Compute policy: stack one
+change at a time on the best setup so far (Phase 6); no grids.
 
 Goal (see the README): make end-to-end pixel diffusion (JiT) beat tokenizer + latent-DiT pipelines on sample efficiency,
 speed and FID, with methods that work on a new dataset from scratch. Policy since 2026-11-02: no grids; each new run
@@ -88,29 +89,40 @@ Each run changes one thing from 2.1.
 ## Phase 5: building on the learned weight (from 2026-11-02)
 
 The current best plain-Muon setup is 5.1: `--warmup_epochs=1 --loss_t_weight=learned --loss_weight_normalize=False`, FID 76.1 @20 ep
-(`runs/in1k_128/jit-b16_icl0/muon_losst-learned_no-lossnorm_warmup1`). Runs queued after it build on it.
+(`runs/in1k_128/jit-b16_icl0/muon_losst-learned_no-lossnorm_warmup1`). Everything after it runs in Phase 6's stack.
 
 | # | queue / step | change (vs) | status | question |
 |---|---|---|---|---|
 | 5.1 | `in1k_128_warmup.sh` · `warmup1_learned` | + 1-epoch warm-up (vs 4.3) | **done**: 109.7 / 91.9 / 82.5 / **76.1** @5/10/15/20; linear probe 5.10, recall 0.415 | **new best**. The gains more than add up: on top of warm-up 1, the learned weight gains 2.4 / 2.6 / 1.7 @5/10/15 (vs ~1 with the 5-epoch warm-up). kNN probe slightly lower (2.14 vs 2.32) |
 | 5.2 | `in1k_128_warmup.sh` · `bn768_learned` | + bottleneck 768 (vs 4.6) | **dropped** (stopped by the GPU shutdown, not resumed) | would the learned weight rescue bn768? Can't change a decision: bn768 is 5.2 FID behind (4.6, 4.7), the learned weight is worth ~1–2.5, and the run isn't on the best setup (5-epoch warm-up) |
-| 5.3 | `in1k_128_clip.sh` · `noclip_warmup1_learned` | `--grad_clip=0` on 5.1 | queued | the learned weight clips every step in epochs 1–5 (51% after), the baselines 0% after epoch 1: is 5.1's gain the weight, or the clipping (a per-step gradient normalization)? |
-| 5.4 | `in1k_128_samplers.sh` (inference only) | Heun 50, Heun 50 + shifted grid, ancestral 100 steps at η 0.25 / 0.5 / 1, on 2.1, 4.6 and 4.3 | **running**: Heun 50 on 2.1 = 81.0, matching the in-loop eval | SiT's SDE-beats-ODE finding; do copying models (bn768) gain more from fresh noise? |
-| 5.5 | `in1k_128_disp.sh` · `disp_analysis` | `analyze_dispersion.py` on 5.1 (minutes) | queued | per block: how dispersed features are, and the gradient share λ=0.5 gives |
-| 5.6 | `in1k_128_disp.sh` · `disp_b{3,6,9,all}_10ep` | Dispersive Loss (InfoNCE-L2, λ 0.5, τ 0.5) at block 3 / 6 / 9 / all, 10 epochs (vs 5.1) | queued | best depth; JiT's built-in encoder may push it deeper than the paper's depth // 4 |
-| 5.7 | `in1k_128_disp.sh` · `disp_b{best}_20ep` | the screen's best, resumed to 20 epochs | queued | FID @20 vs 76.1 |
-| 5.8 | `in1k_128_disp.sh` · `disp_balance0.2_b{best single}` | EnCodec gradient balancer (share 0.2) instead of λ (vs 5.7's depth) | queued | is a fixed gradient share better than a fixed loss weight? |
-| 5.9 | `in1k_128_tokens.sh` · `tokens_bench`, `tokens_bench_mem0.5` | `bench_tokens.py`: step time, img/s, peak memory, FLOPs for p16, 16/8 at fine 0.1 / 0.25 / 0.35 / 0.5, p8; with and without selective recompute | queued | cost per step; largest fine share with no accumulation |
-| 5.10 | `in1k_128_tokens.sh` · `tokens_f0.25` | two token sizes 16/8 on one trunk, fine share 0.25, loss-proportional allocation by t (vs 5.1) | queued | how much of p8's gain (65.6) at ~1.75× p16's FLOPs? |
-| 5.11 | `in1k_128_tokens.sh` · `tokens_f0.25_infer{0,0.1,0.5,1.0}` | same checkpoint, sampling budgets (inference only) | queued | FID vs sampling compute from one model |
-| 5.12 | `in1k_128_tokens.sh` · `learned_{N}ep` | 5.1 continued to 5.10's GPU-hours | conditional (if 5.10 < 76.1) | compute-matched comparison |
+| 5.4 | `in1k_128_samplers.sh` (inference only) | Heun 50, Heun 50 + shifted grid, ancestral 100 steps at η 0.25 / 0.5 / 1, on 2.1, 4.6 and 4.3 | **done**: Heun 50 best on all three. Baseline 81.0 vs 86.2 (shift) / 85.3 / 85.0 / 85.3 (η 0.25 / 0.5 / 1); learned 80.4 vs 85.7 / 85.0 / 85.2 / 88.4; bn768 86.2 vs 86.9 / 86.8 / 87.1 / 89.9 | SiT's SDE gain doesn't transfer at CFG 1 / 20 ep / 128px: keep Heun 50. Higher η raises precision, lowers recall. bn768 loses least (0.6–0.9 vs 4–5), weak support for the copying hypothesis |
 | 5.13 | calibrate retry | 4.9 with the GPU lock | deferred | from-scratch noise settings for a new dataset |
+
+## Phase 6: stacking one change at a time (`queues/in1k_128_stack.sh`, from 2026-11-03)
+
+One sequential queue. Every stage runs on the best setup so far (starting from 5.1, FID 76.1). If its FID-10k at 20 epochs
+beats the current best, its change is adopted and the next stage builds on it. Decisions are replayed from the step
+logs on every restart. The final best goes to `runs/queue_logs/stack_best.txt`.
+
+| # | stage · step | change (on the best so far) | status | question / adoption |
+|---|---|---|---|---|
+| 6.1 | clip · `noclip_warmup1_learned` | `--grad_clip=0` | running (started in the earlier `in1k_128_clip.sh`; the stack reuses it) | the learned weight clips every step in epochs 1–5 (51% after), the baselines 0% after epoch 1: is 5.1's gain the weight, or the clipping (a per-step gradient normalization)? Adopted if better |
+| 6.2 | arch · `stack_arch` | `--attn_res=full --adaln_single=True` (the agreed pair) | queued | the in100 wins (145.2 → 115.7 at 25k). The in1k recipe with them trained at 1488 vs 2069 img/s: check the per-hour cost too |
+| 6.3 | tokens · `stack_tokens_bench`, `stack_tokens_bench_mem0.5` | `bench_tokens.py` on the adopted architecture (with and without selective recompute) | queued | step time, img/s, peak memory, FLOPs; largest fine share with no accumulation |
+| 6.4 | tokens · `stack_tokens` | `--token_sizes=16,8 --fine_frac=0.25` (loss-proportional allocation by t) | queued | how much of p8's gain (65.6 vs 81.0) at ~1.75× p16's FLOPs? |
+| 6.5 | tokens · `stack_tokens_infer{0,0.1,0.5,1.0}` | 6.4's checkpoint at other sampling budgets (inference only) | queued | FID vs sampling compute from one model |
+| 6.6 | tokens · `stack_tokens_matched_{N}ep` | the previous best continued to 6.4's GPU-hours | conditional (if 6.4 is adopted) | per-hour comparison (adoption is per image) |
+| 6.7 | disp · `stack_disp_analysis` | `analyze_dispersion.py` on the current best (minutes) | queued | per block: how dispersed features already are, and the gradient share λ = 0.5 gives |
+| 6.8 | disp · `stack_disp_b{3,6,9,all}_10ep` | Dispersive Loss (InfoNCE-L2, λ 0.5, τ 0.5) at block 3 / 6 / 9 / all, 10 epochs | queued | best depth; JiT's built-in encoder may push it later than the paper's depth // 4 |
+| 6.9 | disp · `stack_disp_b{best}_20ep` | the screen's best, resumed to 20 epochs | queued | candidate for adoption |
+| 6.10 | disp · `stack_disp_balance0.2_b{best single}` | EnCodec gradient balancer (share 0.2) instead of λ, at the best single block | queued | fixed gradient share vs fixed loss weight; the better of 6.9 / 6.10 is adopted if it beats the best |
 
 ## Proposed, not queued
 
-- Stack the winners on 5.1: the best dispersive setup (5.7 / 5.8), then the best sampler (5.4). One addition at a
-  time.
-- 16/8 tokens with a budget other than 0.25, chosen from 5.9's memory limit and 5.10's FID-per-t-window plot.
+- (Sampler: Heun 50 stays, 5.4.)
+- If headline numbers move to CFG > 1: one ancestral η 0.25 check there (inference only); SDE gains in the literature
+  appear mostly with guidance.
+- 16/8 tokens with a budget other than 0.25, chosen from 6.3's memory limit and 6.4's FID-per-t-window plot.
 - GaussJiT with a basis below 16, to remove the "shrink every frame" escape (3.5).
 - Early small batch (from 4.5 and the growing critical batch in 4.1): a batch-size ramp. On hold, because the user
   prefers single-phase schedules.

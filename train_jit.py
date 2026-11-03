@@ -41,7 +41,7 @@ from loss_weighting import LossWeighting, image_power_spectrum
 from muon import Muon, CombinedOptimizer
 import diagnostics as diag_lib
 import alloc_eval as alloc_lib
-from util.progress import bar, stage
+from util.progress import bar
 import plot_trends
 from progress_gif import make_progress_gifs
 
@@ -466,7 +466,7 @@ grid = img_size // denoiser.net.patch_size
 
 encoder, projector, capture = None, None, None
 if token_sizes:
-    assert not (repa_encoder or disp_weight > 0 or disp_balance > 0), 'token_sizes: no REPA / dispersive loss yet (two forwards per step)'
+    assert not repa_encoder, 'token_sizes: no REPA yet (two forwards per step)'
     if diag_window_tiles:
         print('token_sizes: the windowed-attention diagnostic is off (it reimplements the single-size forward)')
         diag_window_tiles = ''
@@ -672,7 +672,7 @@ def estimate_loss(images, labels, chunk=256, seed=0, desc='eval loss'):
     total = 0.0
     with torch.random.fork_rng(devices=[device] if device_type == 'cuda' else []):
         torch.manual_seed(seed)
-        for i in bar(range(0, len(images), chunk), f'{desc} ({len(images)} images)'):
+        for i in range(0, len(images), chunk):
             x = to_model_input(images[i:i + chunk], flip=False, device=device)
             y = torch.from_numpy(labels[i:i + chunk]).to(device)
             with ctx:
@@ -756,17 +756,28 @@ def generate(spectrum=None):
     )
 
 class EvalTimer:
-    # wall-clock minutes per eval section (the GPU synchronized at each lap), printed after every eval
-    def __init__(self):
-        self.times, self.t = {}, time.time()
+    # wall-clock minutes per eval section (the GPU synchronized at each lap). Progress is one line, updated in place: sections
+    # done and the last one finished (only the sampling has its own bar). summary(): the sections that took >= 5% of the time
+    def __init__(self, desc=''):
+        self.times, self.t, self.t0 = {}, time.time(), time.time()
+        self.bar = bar(desc=desc, bar_format='{desc}: {n} sections done{postfix} [{elapsed}]') if desc else None
 
     def lap(self, name):
         if device_type == 'cuda':
             torch.cuda.synchronize()
         now = time.time()
         self.times[name] = self.times.get(name, 0.0) + (now - self.t) / 60
-        print(f"eval: {name} done in {now - self.t:.0f}s", flush=True)
         self.t = now
+        if self.bar is not None:
+            self.bar.set_postfix_str(f'last: {name}', refresh=False)
+            self.bar.update()
+
+    def summary(self):
+        if self.bar is not None:
+            self.bar.close()
+        total = (time.time() - self.t0) / 60
+        main = ', '.join(f'{k} {v:.1f}' for k, v in self.times.items() if v >= 0.05 * total)
+        return f"eval took {total:.1f} min ({main})"
 
 eval_timer = EvalTimer()
 
@@ -777,9 +788,7 @@ def evaluate(step):
     """
     t_start = time.time()
     global eval_timer
-    eval_timer = timer = EvalTimer()
-    print(f"eval at iter {step} (epoch {step / iters_per_epoch:.2f}): val loss, FID-{fid_num_images / 1000:g}k"
-          + (", diagnostics" if diag else "") + (", allocation eval" if token_sizes and alloc_eval else "") + " ...", flush=True)
+    eval_timer = timer = EvalTimer(f'eval at iter {step}')
     log, images, record = {}, {}, {}
     for split, (xs, ys) in loss_sets.items():
         log[f'eval/{split}_loss'] = estimate_loss(xs, ys, desc=f'eval loss, {split}')
@@ -1103,7 +1112,7 @@ while True:
                 print(f"warning: trend plots failed ({type(e).__name__}: {e}); training continues")
             eval_timer.lap('trend plots')
         eval_log.update({f"eval_minutes/{k.replace(' / ', '_').replace(' ', '_')}": v for k, v in eval_timer.times.items()})
-        print(f"eval took {sum(eval_timer.times.values()):.1f} min: " + ', '.join(f"{k} {v:.1f}" for k, v in eval_timer.times.items()))
+        print(eval_timer.summary())
         best_fid = min(best_fid, fid)
         extra = ''.join(f", {k.split('/')[-1]} {eval_log[k]:.3f}" for k in ('val/precision', 'val/recall', 'val/fid_raw', 'mem/nn_ratio') if k in eval_log)
         loss_str = ', '.join(f"{k.split('/')[-1].replace('_', ' ')} {eval_log[k]:.4f}" for k in ('eval/train_loss', 'eval/val_loss') if k in eval_log)
@@ -1163,8 +1172,12 @@ while True:
                 token_mask = masker.sample(len(X), mask_ratio, mask_prob, device) if masker is not None else None
                 # two token sizes: each path backpropagates right after its forward (peak memory = the larger path)
                 path_backward = (lambda l: (l / gradient_accumulation_steps).backward()) if token_sizes else None
+                # two token sizes + Dispersive Loss: each forward's term, from that forward's captured blocks
+                path_disp = (lambda: sum(dispersive_loss(c.out, disp_temp, disp_kind) for c in disp_captures) / len(disp_captures)) \
+                    if token_sizes and disp_captures else None
                 loss_fm, t_used, y_used = flow_loss(denoiser, X, Y, masker, token_mask, mask_weighting, return_aux=True, parts=loss_parts,
-                                                    weighter=loss_weighter, backward=path_backward)
+                                                    weighter=loss_weighter, backward=path_backward,
+                                                    path_aux=(lambda: disp_weight * path_disp()) if path_disp else None)
             loss = loss_fm
             if encoder is not None:
                 target = encoder(X, grid)
@@ -1173,7 +1186,9 @@ while True:
                 else:
                     loss_repa = mta_loss(capture.out, target, projector, t_used, y_used)
                 loss = loss + repa_coeff * loss_repa
-            if disp_captures:
+            if disp_captures and token_sizes: # added (and backpropagated) per path inside flow_loss
+                loss_disp = loss_parts['aux'] / disp_weight
+            elif disp_captures:
                 loss_disp = sum(dispersive_loss(c.out, disp_temp, disp_kind) for c in disp_captures) / len(disp_captures)
                 loss = loss + disp_weight * loss_disp
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation

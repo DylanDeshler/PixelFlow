@@ -36,6 +36,8 @@ warmup = 10
 iters = 30
 compile = True
 act_memory_budget = 1.0 # as train_jit.py: < 1 recomputes activations in the backward to save memory
+attn_res = 'none' # the base architecture, as train_jit.py ('full' / 'block')
+adaln_single = False
 single_backward_frac = 0.25 # also time this fine share with one backward over both paths (0 = skip)
 device = 'cuda'
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float32'
@@ -60,7 +62,8 @@ def gflop_fwd(n_tokens, arch):
     return L * (2 * (4 + 2 * r) * d * d * n_tokens + 4 * n_tokens * n_tokens * d) / 1e9
 
 def bench(name, overrides, tokens_per_img, split=True):
-    model_name, arch = resolve_arch('JiT-B/16', in_context_len=0, **overrides)
+    base = dict(attn_res=attn_res if attn_res != 'none' else None, adaln_single=adaln_single or None)
+    model_name, arch = resolve_arch('JiT-B/16', in_context_len=0, **base, **overrides)
     denoiser = build_denoiser(model_name, img_size, 1000, noise_scale=0.5, arch=arch).to(device).train()
     opt = torch.optim.AdamW(denoiser.net.parameters(), lr=1e-4, fused=device_type == 'cuda')
     if compile:
@@ -111,7 +114,7 @@ def bench(name, overrides, tokens_per_img, split=True):
     return row
 
 n16, n8 = (img_size // 16) ** 2, (img_size // 8) ** 2
-print(f"batch {batch_size} at {img_size}px, {dtype}, compile {compile}; {warmup} warm-up + {iters} timed steps")
+print(f"batch {batch_size} at {img_size}px, {dtype}, compile {compile}; {warmup} warm-up + {iters} timed steps; attn_res {attn_res}, adaln_single {adaln_single}")
 print(f"{'config':<22} {'tok/img':>7} {'ms/step':>9} {'img/s':>8} {'peak GB':>8} {'micro':>6} {'GFLOP/img':>10} {'TFLOP/s':>9}")
 rows = [bench('B/16', {}, [(1.0, n16)])]
 for f in (float(v) for v in fine_fracs.split(',') if v):

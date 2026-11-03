@@ -39,7 +39,6 @@ from PIL import Image
 from data_jit import MemmapImages
 from jit_common import load_denoiser, generate_and_score, save_labeled_grid, save_layout_grids
 from fid import InceptionMetrics, load_ref_stats, precision_recall
-from util.progress import stage
 
 from plot_style import SURFACE, INK, INK_2, GRID, BLUE, ORANGE # validated categorical pair on the light surface
 
@@ -209,8 +208,7 @@ def real_features(n):
     if train_feats is None:
         return None
     idx = np.sort(np.random.default_rng(0).choice(len(train_feats), min(n, len(train_feats)), replace=False))
-    with stage(f'loading {len(idx)} training-image Inception features (precision / recall reference)'):
-        return torch.from_numpy(train_feats[idx].astype(np.float32)).to(device)
+    return torch.from_numpy(train_feats[idx].astype(np.float32)).to(device)
 
 def parse_cfgs(spec):
     if ':' in spec:
@@ -332,7 +330,7 @@ torch.manual_seed(seed)
 denoiser.fixed_shape = True
 if is_quadtree:
     denoiser.net.record_layouts(True)
-with torch.no_grad(), ctx, stage(f'sample grid (64 images, cfg {best_cfg:g})'):
+with torch.no_grad(), ctx:
     x = denoiser.generate(torch.cat([labels, labels.new_zeros(grid_batch - 64)]))[:64]
 denoiser.fixed_shape = False
 tag = f"{final_num_images / 1000:g}k_{sampler}" + ('' if time_schedule == 'uniform' else f'_{time_schedule}') \

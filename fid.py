@@ -21,7 +21,6 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from util.progress import stage
 
 
 class InceptionMetrics:
@@ -39,9 +38,8 @@ class InceptionMetrics:
 
     def compute(self, features, logits, ref_stats):
         from torch_fidelity.metric_isc import isc_features_to_metric
-        with stage(f'FID / IS from {len(features)} samples'):
-            fid = frechet_distance(features, ref_stats, self.device)
-            isc = isc_features_to_metric(logits)['inception_score_mean']
+        fid = frechet_distance(features, ref_stats, self.device)
+        isc = isc_features_to_metric(logits)['inception_score_mean']
         return fid, isc
 
 @torch.no_grad()
@@ -95,9 +93,8 @@ def precision_recall(real, fake, k=3, chunk=4096):
         return torch.cat(hits).float().mean().item()
 
     real, fake = real.float(), fake.float()
-    with stage(f'precision / recall ({len(real)} real x {len(fake)} generated)'):
-        precision = coverage(fake, real, kth_radius(real))
-        recall = coverage(real, fake, kth_radius(fake))
+    precision = coverage(fake, real, kth_radius(real))
+    recall = coverage(real, fake, kth_radius(fake))
     return precision, recall
 
 if __name__ == '__main__':

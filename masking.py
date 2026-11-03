@@ -77,7 +77,7 @@ class TokenMasker(nn.Module):
         return m.repeat_interleave(self.patch_size, dim=2).repeat_interleave(self.patch_size, dim=3)
 
 def flow_loss(denoiser, x, labels, masker=None, mask=None, weighting='effective_t', return_aux=False, parts=None, weighter=None,
-              backward=None):
+              backward=None, path_aux=None):
     """
     JiT's training loss (Denoiser.forward: label dropout, logit-normal t, x-prediction, v-loss), with optional token
     masking. With mask=None this is numerically the same computation as denoiser(x, labels).
@@ -89,10 +89,13 @@ def flow_loss(denoiser, x, labels, masker=None, mask=None, weighting='effective_
     backward: two-token-size models only (token_sizes): called on each path's share of the loss right after its forward, so
     that path's activations are freed before the next one runs (peak memory = the larger path, not the sum); the returned
     loss is then detached.
+    path_aux: two-token-size models only: a callable returning an auxiliary loss for the forward that just ran (e.g. the
+    Dispersive Loss on the blocks that forward's hooks captured), added to each path's loss with that path's share of the
+    batch, before its backward; parts['aux'] gets the batch-weighted mean of the callable's values.
     """
     assert weighter is None or mask is None, 'loss weighting is not combined with token masking'
     if getattr(denoiser.net, 'token_sizes', ()) and denoiser.training:
-        return _two_size_loss(denoiser, x, labels, return_aux, parts, weighter, mask, backward)
+        return _two_size_loss(denoiser, x, labels, return_aux, parts, weighter, mask, backward, path_aux)
     labels = denoiser.drop_labels(labels) if denoiser.training else labels
     t = denoiser.sample_t(x.size(0), device=x.device).view(-1, *([1] * (x.ndim - 1)))
     e = torch.randn_like(x) * denoiser.noise_scale
@@ -129,13 +132,13 @@ def flow_loss(denoiser, x, labels, masker=None, mask=None, weighting='effective_
     return loss
 
 
-def _two_size_loss(denoiser, x, labels, return_aux, parts, weighter, mask, backward=None):
+def _two_size_loss(denoiser, x, labels, return_aux, parts, weighter, mask, backward=None, path_aux=None):
     """
     flow_loss for a two-token-size JiT (token_sizes, model_jit.TokenAllocation): a fixed quota of the batch (fine_frac) goes
     through the fine tokens, drawn without replacement in proportion to the allocation's weights (Gumbel top-k: sampling
     proportional to the gain, not greedy), the rest through the coarse tokens; two forwards of fixed sizes. Each path's
     per-sample losses update the allocation's statistics. The loss is the per-sample mean over the whole batch, as usual.
-    backward: see flow_loss (each path backpropagated as soon as its loss exists).
+    backward, path_aux: see flow_loss (each path backpropagated as soon as its loss exists, with its auxiliary loss).
     """
     net = denoiser.net
     assert mask is None and not getattr(net, 'skip_pathway', False), 'token_sizes: no token masking or skip pathway'
@@ -148,7 +151,7 @@ def _two_size_loss(denoiser, x, labels, return_aux, parts, weighter, mask, backw
     gumbel = -torch.log(-torch.log(torch.rand(B, device=x.device).clamp(1e-20, 1.0)))
     fine = torch.zeros(B, dtype=torch.bool, device=x.device)
     fine[torch.topk(torch.log(w.clamp_min(1e-20)) + gumbel, k).indices] = True
-    total = 0.0
+    total, aux_total = 0.0, 0.0
     paths = (((~fine).nonzero().squeeze(1), net.token_sizes[0]), (fine.nonzero().squeeze(1), net.token_sizes[1]))
     for path, (sel, p) in enumerate(paths):
         tp = t[sel]
@@ -157,6 +160,10 @@ def _two_size_loss(denoiser, x, labels, return_aux, parts, weighter, mask, backw
         per = r.float().pow(2).mean(dim=(1, 2, 3))
         net.alloc.update(tp.flatten(), per.detach(), path)
         lp = (weighter(r, tp.flatten()) if weighter is not None else per.mean()) * (len(sel) / B)
+        if path_aux is not None: # from this forward's activations (hooks), before its backward frees them
+            aux = path_aux() * (len(sel) / B)
+            aux_total = aux_total + aux.detach()
+            lp = lp + aux
         if backward is not None:
             backward(lp)
             lp = lp.detach()
@@ -164,6 +171,8 @@ def _two_size_loss(denoiser, x, labels, return_aux, parts, weighter, mask, backw
     loss = total
     if parts is not None:
         parts['skip'] = loss
+        if path_aux is not None:
+            parts['aux'] = aux_total
     if return_aux:
         return loss, t.flatten(), labels
     return loss

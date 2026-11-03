@@ -29,7 +29,6 @@ import torch
 
 from data_jit import to_model_input
 import plot_style as ps
-from util.progress import bar, stage
 
 DEFAULT_CONDITIONS = 'coarse,budget,budget:0.5,fine,window:0-0.25,window:0.25-0.5,window:0.5-0.75,window:0.75-1'
 
@@ -82,7 +81,7 @@ def matched_loss(net, images, labels, ts, noise_scale, t_eps, ctx, device, chunk
     loss = np.zeros((2, len(ts)))
     gain, gain_se = np.zeros(len(ts)), np.zeros(len(ts))
     g = torch.Generator(device=device)
-    for i, t in enumerate(bar(ts, f'allocation eval: matched loss per token size ({len(images)} images x {len(ts)} noise levels)')):
+    for i, t in enumerate(ts):
         g.manual_seed(seed + i)
         per = [[], []]
         for s in range(0, len(images), chunk):
@@ -150,10 +149,9 @@ def fid_by_allocation(denoiser, conditions, generate_and_score, metrics, ref_sta
     # generate_and_score with seed 0 under each allocation: identical labels and noise for every condition
     alloc, rows = denoiser.net.alloc, []
     for i, (name, frac, windows) in enumerate(conditions):
-        print(f'allocation eval: FID-{n_images / 1000:g}k under allocation {name} ({i + 1}/{len(conditions)})', flush=True)
         with allocation(alloc, frac, windows):
             out = generate_and_score(denoiser, metrics, ref_stats, n_images, num_classes, device, ctx, batch_size=batch_size,
-                                     **sampler)
+                                     desc=f'allocation {name} ({i + 1}/{len(conditions)}), FID-{n_images / 1000:g}k', **sampler)
             nc, nf = alloc.calls
         share = nf / max(1, nc + nf)
         rows.append({'name': name, 'fid': out['fid'], 'fine_calls': share, 'cost': (1 - share) + share * cost})
@@ -167,7 +165,7 @@ def samples_by_allocation(denoiser, conditions, labels, sampler, ctx, seed=1234)
     was_training = denoiser.training
     denoiser.eval()
     set_sampler(denoiser, sampler['cfg'], sampler['interval'], sampler['steps'], sampler['method'], sampler['eta'])
-    for name, frac, windows in bar(conditions, f'allocation eval: sample rows ({len(labels)} per allocation)'):
+    for name, frac, windows in conditions:
         with allocation(alloc, frac, windows), torch.random.fork_rng(devices=[labels.device] if labels.is_cuda else []):
             torch.manual_seed(seed)
             with ctx:
@@ -333,7 +331,6 @@ def evaluate_allocation(step, denoiser, raw_net, val_images, val_labels, out_dir
             history = [h for h in history if h['iter'] < r['iter']] + [r] # a resumed run's re-done evals replace the old ones
     ddir = os.path.join(out_dir, 'diagnostics')
     os.makedirs(ddir, exist_ok=True)
-    print('allocation eval: plots', flush=True)
     images = {'allocation': plot_eval(rec, os.path.join(ddir, f'allocation_{step}.png')),
               'allocation_trends': plot_trends(history, os.path.join(ddir, 'allocation_trends.png'))}
     sp = os.path.join(ddir, f'allocation_samples_{step}.png')
