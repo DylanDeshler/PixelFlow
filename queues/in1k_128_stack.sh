@@ -8,14 +8,14 @@
 #              Shares its step with in1k_128_clip.sh (an earlier queue), so a run already done or in progress there is reused
 #   2. arch    --attn_res=full --adaln_single=True together (the in100 wins; the one agreed exception to one change per stage).
 #              The in1k recipe with them trained at 1488 vs 2069 img/s: compare its img/s in the log too
-#   3. tokens  --token_sizes=16,8 --fine_frac=0.25: bench_tokens.py (minutes, with and without selective recompute), the run,
-#              sampling budgets on its checkpoint (FID-10k with fine tokens on 0 / 0.1 / 0.5 / 1.0 of the calls), and, if it
-#              wins per image, the previous best continued to the same GPU-hours (per-hour comparison; its 20-epoch
-#              checkpoint kept as ckpt_20ep.pt). Adoption is per image; the log prints the per-hour numbers next to it
-#   4. disp    Dispersive Loss: analyze_dispersion.py on the current best (minutes), depth screen at blocks 3 / 6 / 9 / all
+#   3. disp    Dispersive Loss: analyze_dispersion.py on the current best (minutes), depth screen at blocks 3 / 6 / 9 / all
 #              (lambda 0.5, tau 0.5, 10 epochs each), the screen's best resumed to 20 epochs, and EnCodec's gradient
 #              balancer (share DISP_SHARE, default 0.2) at the best single block for 20 epochs; the better of the two is
 #              adopted if it beats the best
+#   4. tokens  --token_sizes=16,8 --fine_frac=0.25: bench_tokens.py (minutes, with and without selective recompute), the run,
+#              sampling budgets on its checkpoint (FID-10k with fine tokens on 0 / 0.1 / 0.5 / 1.0 of the calls), and, if it
+#              wins per image, the previous best continued to the same GPU-hours (per-hour comparison; its 20-epoch
+#              checkpoint kept as ckpt_20ep.pt). Adoption is per image; the log prints the per-hour numbers next to it
 # Ends by writing the final best setup to runs/queue_logs/stack_best.txt. Shares the queues' GPU lock.
 #
 #   nohup bash queues/in1k_128_stack.sh > runs/queue_logs/queue_stack.log 2>&1 &
@@ -71,27 +71,7 @@ adopt noclip_warmup1_learned "--grad_clip=0"
 step stack_arch python train_jit.py $BASE $BEST_ARGS --epochs=20 --attn_res=full --adaln_single=True
 adopt stack_arch "--attn_res=full --adaln_single=True" && ARCH_ARGS="--attn_res=full --adaln_single=True"
 
-# 3. tokens
-step stack_tokens_bench python bench_tokens.py $ARCH_ARGS
-step stack_tokens_bench_mem0.5 python bench_tokens.py $ARCH_ARGS --act_memory_budget=0.5
-step stack_tokens python train_jit.py $BASE $BEST_ARGS --epochs=20 --token_sizes=16,8 --fine_frac=0.25
-TOK_RUN=$(run_of stack_tokens)
-if [ -n "$TOK_RUN" ] && [ -e "$TOK_RUN/ckpt.pt" ]; then
-    for f in 0 0.1 0.5 1.0; do
-        step "stack_tokens_infer$f" python eval_jit.py --ckpt=$TOK_RUN/ckpt.pt --data_dir=$DATA --final_num_images=10000 --plot=False \
-            --fine_frac=$f --out_dir=$TOK_RUN/eval_fine$f
-    done
-fi
-PREV_RUN=$BEST_RUN PREV_ARGS=$BEST_ARGS
-if adopt stack_tokens "--token_sizes=16,8 --fine_frac=0.25"; then
-    # per GPU-hour: the previous best continued to the 16/8 run's training time (constant lr after warm-up: resuming = a longer run)
-    ep=$(python -c "import sys; print(max(21, round(20 * float(sys.argv[1]) / float(sys.argv[2]))))" "$(hours "$TOK_RUN")" "$(hours "$PREV_RUN")")
-    [ -e "$PREV_RUN/ckpt_20ep.pt" ] || cp "$PREV_RUN/ckpt.pt" "$PREV_RUN/ckpt_20ep.pt"
-    step "stack_tokens_matched_${ep}ep" python train_jit.py $BASE $PREV_ARGS --epochs=$ep --init_from=resume
-    echo ">>> per GPU-hour: 16/8 tokens FID-10k $BEST_FID at 20 epochs vs the previous best continued to $ep epochs (same hours): $(last_fid "stack_tokens_matched_${ep}ep")"
-fi
-
-# 4. disp
+# 3. disp
 step stack_disp_analysis python analyze_dispersion.py --ckpts=$BEST_RUN --data_dir=$DATA
 for b in 3 6 9 all; do
     step "stack_disp_b${b}_10ep" python train_jit.py $BASE $BEST_ARGS --epochs=10 --disp_weight=0.5 --disp_blocks=$b
@@ -113,6 +93,26 @@ if [ -n "$best" ]; then
     else
         adopt "stack_disp_b${best}_20ep" "--disp_weight=0.5 --disp_blocks=$best"
     fi
+fi
+
+# 4. tokens
+step stack_tokens_bench python bench_tokens.py $ARCH_ARGS
+step stack_tokens_bench_mem0.5 python bench_tokens.py $ARCH_ARGS --act_memory_budget=0.5
+step stack_tokens python train_jit.py $BASE $BEST_ARGS --epochs=20 --token_sizes=16,8 --fine_frac=0.25
+TOK_RUN=$(run_of stack_tokens)
+if [ -n "$TOK_RUN" ] && [ -e "$TOK_RUN/ckpt.pt" ]; then
+    for f in 0 0.1 0.5 1.0; do
+        step "stack_tokens_infer$f" python eval_jit.py --ckpt=$TOK_RUN/ckpt.pt --data_dir=$DATA --final_num_images=10000 --plot=False \
+            --fine_frac=$f --out_dir=$TOK_RUN/eval_fine$f
+    done
+fi
+PREV_RUN=$BEST_RUN PREV_ARGS=$BEST_ARGS
+if adopt stack_tokens "--token_sizes=16,8 --fine_frac=0.25"; then
+    # per GPU-hour: the previous best continued to the 16/8 run's training time (constant lr after warm-up: resuming = a longer run)
+    ep=$(python -c "import sys; print(max(21, round(20 * float(sys.argv[1]) / float(sys.argv[2]))))" "$(hours "$TOK_RUN")" "$(hours "$PREV_RUN")")
+    [ -e "$PREV_RUN/ckpt_20ep.pt" ] || cp "$PREV_RUN/ckpt.pt" "$PREV_RUN/ckpt_20ep.pt"
+    step "stack_tokens_matched_${ep}ep" python train_jit.py $BASE $PREV_ARGS --epochs=$ep --init_from=resume
+    echo ">>> per GPU-hour: 16/8 tokens FID-10k $BEST_FID at 20 epochs vs the previous best continued to $ep epochs (same hours): $(last_fid "stack_tokens_matched_${ep}ep")"
 fi
 
 printf 'FID-10k %s\nrun %s\nargs %s %s\n' "$BEST_FID" "$BEST_RUN" "$BASE" "$BEST_ARGS" > runs/queue_logs/stack_best.txt

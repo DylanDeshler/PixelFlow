@@ -106,23 +106,23 @@ logs on every restart. The final best goes to `runs/queue_logs/stack_best.txt`.
 
 | # | stage · step | change (on the best so far) | status | question / adoption |
 |---|---|---|---|---|
-| 6.1 | clip · `noclip_warmup1_learned` | `--grad_clip=0` | running (started in the earlier `in1k_128_clip.sh`; the stack reuses it) | the learned weight clips every step in epochs 1–5 (51% after), the baselines 0% after epoch 1: is 5.1's gain the weight, or the clipping (a per-step gradient normalization)? Adopted if better |
+| 6.1 | clip · `noclip_warmup1_learned` | `--grad_clip=0` | running: 109.0 @5 (best run 109.7); started in the earlier `in1k_128_clip.sh`, the stack reuses it | the learned weight clips every step in epochs 1–5 (51% after), the baselines 0% after epoch 1: is 5.1's gain the weight, or the clipping (a per-step gradient normalization)? Adopted if better |
 | 6.2 | arch · `stack_arch` | `--attn_res=full --adaln_single=True` (the agreed pair) | queued | the in100 wins (145.2 → 115.7 at 25k). The in1k recipe with them trained at 1488 vs 2069 img/s: check the per-hour cost too |
-| 6.3 | tokens · `stack_tokens_bench`, `stack_tokens_bench_mem0.5` | `bench_tokens.py` on the adopted architecture (with and without selective recompute) | queued | step time, img/s, peak memory, FLOPs; largest fine share with no accumulation |
-| 6.4 | tokens · `stack_tokens` | `--token_sizes=16,8 --fine_frac=0.25` (loss-proportional allocation by t) | queued | how much of p8's gain (65.6 vs 81.0) at ~1.75× p16's FLOPs? |
-| 6.5 | tokens · `stack_tokens_infer{0,0.1,0.5,1.0}` | 6.4's checkpoint at other sampling budgets (inference only) | queued | FID vs sampling compute from one model |
-| 6.6 | tokens · `stack_tokens_matched_{N}ep` | the previous best continued to 6.4's GPU-hours | conditional (if 6.4 is adopted) | per-hour comparison (adoption is per image) |
-| 6.7 | disp · `stack_disp_analysis` | `analyze_dispersion.py` on the current best (minutes) | queued | per block: how dispersed features already are, and the gradient share λ = 0.5 gives |
-| 6.8 | disp · `stack_disp_b{3,6,9,all}_10ep` | Dispersive Loss (InfoNCE-L2, λ 0.5, τ 0.5) at block 3 / 6 / 9 / all, 10 epochs | queued | best depth; JiT's built-in encoder may push it later than the paper's depth // 4 |
-| 6.9 | disp · `stack_disp_b{best}_20ep` | the screen's best, resumed to 20 epochs | queued | candidate for adoption |
-| 6.10 | disp · `stack_disp_balance0.2_b{best single}` | EnCodec gradient balancer (share 0.2) instead of λ, at the best single block | queued | fixed gradient share vs fixed loss weight; the better of 6.9 / 6.10 is adopted if it beats the best |
+| 6.3 | disp · `stack_disp_analysis` | `analyze_dispersion.py` on the current best (minutes) | queued | per block: how dispersed features already are, and the gradient share λ = 0.5 gives |
+| 6.4 | disp · `stack_disp_b{3,6,9,all}_10ep` | Dispersive Loss (InfoNCE-L2, λ 0.5, τ 0.5) at block 3 / 6 / 9 / all, 10 epochs | queued | best depth; JiT's built-in encoder may push it later than the paper's depth // 4 |
+| 6.5 | disp · `stack_disp_b{best}_20ep` | the screen's best, resumed to 20 epochs | queued | candidate for adoption |
+| 6.6 | disp · `stack_disp_balance0.2_b{best single}` | EnCodec gradient balancer (share 0.2) instead of λ, at the best single block | queued | fixed gradient share vs fixed loss weight; the better of 6.5 / 6.6 is adopted if it beats the best |
+| 6.7 | tokens · `stack_tokens_bench`, `stack_tokens_bench_mem0.5` | `bench_tokens.py` on the adopted architecture (with and without selective recompute) | queued | step time, img/s, peak memory, FLOPs; largest fine share with no accumulation |
+| 6.8 | tokens · `stack_tokens` | `--token_sizes=16,8 --fine_frac=0.25` (loss-proportional allocation by t) | queued | how much of p8's gain (65.6 vs 81.0) at ~1.75× p16's FLOPs? |
+| 6.9 | tokens · `stack_tokens_infer{0,0.1,0.5,1.0}` | 6.8's checkpoint at other sampling budgets (inference only) | queued | FID vs sampling compute from one model |
+| 6.10 | tokens · `stack_tokens_matched_{N}ep` | the previous best continued to 6.8's GPU-hours | conditional (if 6.8 is adopted) | per-hour comparison (adoption is per image) |
 
 ## Proposed, not queued
 
 - (Sampler: Heun 50 stays, 5.4.)
 - If headline numbers move to CFG > 1: one ancestral η 0.25 check there (inference only); SDE gains in the literature
   appear mostly with guidance.
-- 16/8 tokens with a budget other than 0.25, chosen from 6.3's memory limit and 6.4's FID-per-t-window plot.
+- 16/8 tokens with a budget other than 0.25, chosen from 6.7's memory limit and 6.8's FID-per-t-window plot.
 - GaussJiT with a basis below 16, to remove the "shrink every frame" escape (3.5).
 - Early small batch (from 4.5 and the growing critical batch in 4.1): a batch-size ramp. On hold, because the user
   prefers single-phase schedules.

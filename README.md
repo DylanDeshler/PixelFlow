@@ -208,7 +208,7 @@ Every eval of a two-size run adds `alloc_eval.py` (`--alloc_eval`, on by default
 - Sample rows: the same labels and noise under every allocation, at every eval.
 
 Plots go to `{run}/diagnostics/allocation_{iter}.png`, `allocation_samples_{iter}.png` and `allocation_trends.png`,
-records to `{run}/allocation.jsonl`, scalars to wandb under `alloc/`. Queue: stage 3 of `queues/in1k_128_stack.sh`.
+records to `{run}/allocation.jsonl`, scalars to wandb under `alloc/`. Queue: stage 4 of `queues/in1k_128_stack.sh`.
 
 ## Muon
 
