@@ -207,7 +207,8 @@ repa_depth = 4 # align the output of this block (1-indexed); JiT-B's in_context_
 disp_weight = 0.0 # Dispersive Loss (Wang & He 2025, repa.dispersive_loss): weight lambda, 0 = off (the paper: 0.5; their PyTorch code: 0.25)
 disp_temp = 0.5 # its temperature tau (the paper: 0.5; their PyTorch code: 1.0)
 disp_blocks = '' # blocks whose outputs it disperses (1-indexed): '' -> depth // 4 (the paper's default, block 3 of JiT-B's 12), a comma list, or 'all' (averaged)
-disp_kind = 'infonce_l2' # 'infonce_l2' (best in the paper), 'infonce_cos', 'hinge', 'covariance' (repa.dispersive_loss)
+disp_kind = 'infonce_l2' # 'infonce_l2' (best in the paper), 'infonce_l2n' (the same on unit-RMS features: scale-invariant, use this for
+                          # JiT, see repa.dispersive_loss), 'infonce_cos', 'hinge', 'covariance'
 disp_balance = 0.0 # > 0: instead of the fixed weight, EnCodec's gradient balancer at the block: the dispersive loss gets this share
                    # of the gradient into the blocks below (the diffusion loss gets 1 - share); disp_weight is then ignored (one block only)
 repa_coeff = -1.0 # alignment loss weight; -1 -> the method's published value: 0.5 for mlp (REPA), 0.1 for mta (PixelREPA)
@@ -487,6 +488,7 @@ if token_sizes:
           f"-> {tokens_per_img:.0f} tokens per training image on average")
 else:
     tokens_per_img = grid ** 2 if getattr(denoiser.net, 'family', 'jit') == 'jit' and not is_gauss else None # (model-specific token counts elsewhere)
+disp_pinned = 0 # logged steps in a row with the dispersive loss at its floor (see the training loop)
 disp_captures = [] # Dispersive Loss: hooks on the chosen blocks, registered here, before compiling, so they're traced in
 disp_balancer = None
 if disp_weight > 0 or disp_balance > 0:
@@ -1275,6 +1277,15 @@ while True:
             raise RuntimeError(f"loss is {lossf} at iter {iter_num}, stopping")
         imgs_per_sec = effective_batch_size / dt
         repa_str = (f", repa {loss_repa.item():.4f}" if encoder is not None else "") + (f", disp {loss_disp.item():.4f}" if disp_captures else "")
+        if disp_captures and disp_kind in ('infonce_l2', 'infonce_cos'):
+            # pinned at the floor log(1/B): every pair looks maximally far apart for tau, so the term gives no gradient (with
+            # infonce_l2 the network gets there by growing its features). 10 logged steps in a row there: stop, don't waste the run
+            k_fine = round(fine_frac * batch_size) if token_sizes else 0 # two token sizes: the term averages two sub-batches' floors
+            floor = math.log(1.0 / batch_size) if not k_fine else ((batch_size - k_fine) * math.log(1.0 / (batch_size - k_fine)) + k_fine * math.log(1.0 / k_fine)) / batch_size
+            disp_pinned = disp_pinned + 1 if loss_disp.item() < floor + 0.05 else 0
+            if disp_pinned >= 10:
+                raise SystemExit(f"dispersive loss pinned at its floor {floor:.2f} for 10 logged steps "
+                                 f"(no gradient): stopping. Use a scale-invariant form (--disp_kind=infonce_l2n)")
         grad_str = f", grad norm {math.sqrt(sum(v ** 2 for v in grad_norms.values())):.4f}" if log_opt else ""
         trunk_str = f", trunk-only loss {loss_trunkf:.4f}" if loss_trunkf is not None else ""
         geo_stats = denoiser.net.geometry_stats() if is_gauss else {} # the training batch's token geometry

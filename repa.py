@@ -198,6 +198,13 @@ def dispersive_loss(hidden, tau=0.5, kind='infonce_l2', margin=1.0):
       infonce_l2   log mean_{i,j} exp(-D_ij / tau), D = squared L2 distance / dim, over the full B x B matrix including i = j,
                    unnormalized z -- identical to the official PyTorch implementation (dividing by the dimension keeps D O(1)
                    at any width; without it every off-diagonal term would underflow)
+      infonce_l2n  infonce_l2 on features normalized to unit RMS per sample. infonce_l2 isn't scale-invariant: the network
+                   can drive it to its floor log(1/B) (no gradient) just by growing the features, which happened in JiT
+                   (block outputs start at RMS ~0.01, where tau = 0.5 sees every pair as identical, and grew until the loss
+                   pinned at the floor, costing ~13 FID at 10 epochs). Normalized, it can only fall by spreading the
+                   directions apart; tau keeps the meaning it has for the O(1)-scale DiT features the paper tuned on. Equals
+                   infonce_cos at tau / 2 (D = 2 - 2 cos for unit-RMS vectors); best value ~log((1 + (B-1) e^(-2/tau)) / B)
+                   with every pair orthogonal (-3.95 at B 1024, tau 0.5)
       infonce_cos  the same with D = -cosine similarity
       hinge        mean_{i != j} max(0, margin - D_ij)^2, D as infonce_l2 (positive pairs, i = j, discarded)
       covariance   mean squared off-diagonal correlation between feature dimensions over the batch (features standardized
@@ -208,7 +215,9 @@ def dispersive_loss(hidden, tau=0.5, kind='infonce_l2', margin=1.0):
         z = hidden.float().flatten(1)
         B, d = z.shape
         off = 1 - torch.eye(B, device=z.device)
-        if kind in ('infonce_l2', 'hinge'):
+        if kind == 'infonce_l2n':
+            z = z * torch.rsqrt(z.pow(2).mean(1, keepdim=True) + 1e-12) # unit RMS per sample
+        if kind in ('infonce_l2', 'infonce_l2n', 'hinge'):
             sq = z.pow(2).sum(1)
             D = (sq[:, None] + sq[None, :] - 2 * z @ z.T).clamp_min(0) / d * off # exactly 0 on the diagonal
             if kind == 'hinge':
@@ -222,7 +231,7 @@ def dispersive_loss(hidden, tau=0.5, kind='infonce_l2', margin=1.0):
             zs = (z - z.mean(0)) / z.std(0).clamp_min(1e-6) # standardized per dimension: correlation matrix R = zs^T zs / B
             fro2 = (zs @ zs.T).pow(2).sum() / B ** 2 # ||R||_F^2 without forming the d x d matrix
             return (fro2 - (zs.pow(2).mean(0)).pow(2).sum()) / (d * (d - 1))
-        raise ValueError(f"kind must be 'infonce_l2', 'infonce_cos', 'hinge' or 'covariance', got {kind}")
+        raise ValueError(f"kind must be 'infonce_l2', 'infonce_l2n', 'infonce_cos', 'hinge' or 'covariance', got {kind}")
 
 class BlockCapture:
     """

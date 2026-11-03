@@ -8,8 +8,9 @@
 #              Shares its step with in1k_128_clip.sh (an earlier queue), so a run already done or in progress there is reused
 #   2. arch    --attn_res=full --adaln_single=True together (the in100 wins; the one agreed exception to one change per stage).
 #              The in1k recipe with them trained at 1488 vs 2069 img/s: compare its img/s in the log too
-#   3. disp    Dispersive Loss: analyze_dispersion.py on the current best (minutes), depth screen at blocks 3 / 6 / 9 / all
-#              (lambda 0.5, tau 0.5, 10 epochs each), the screen's best resumed to 20 epochs, and EnCodec's gradient
+#   3. disp    Dispersive Loss, InfoNCE-L2 on unit-RMS features (--disp_kind=infonce_l2n; the plain form pinned at its floor by
+#              growing the features and cost ~13 FID, steps stack_disp_*, superseded by stack_disp2_*): analyze_dispersion.py on
+#              the current best (minutes), depth screen at blocks 3 / 6 / 9 / all (lambda 0.5, tau 0.5, 10 epochs each), the screen's best resumed to 20 epochs, and EnCodec's gradient
 #              balancer (share DISP_SHARE, default 0.2) at the best single block for 20 epochs; the better of the two is
 #              adopted if it beats the best
 #   4. tokens  --token_sizes=16,8 --fine_frac=0.25: bench_tokens.py (minutes, with and without selective recompute), the run,
@@ -23,6 +24,7 @@
 set -u
 DATA=${JIT_DATA_ROOT:-/data}/in1k_128
 SHARE=${DISP_SHARE:-0.2}
+DISP_KIND=infonce_l2n # scale-invariant (repa.dispersive_loss): plain infonce_l2 pinned at its floor by growing the features (2026-11-03)
 BASE="config/jit_in1k_128.py --optimizer_type=muon --data_dir=$DATA"
 IMPL="--attn_res_chunk=8" # implementation only (same results, not in run names): full AttnRes mixed in chunks of 8, 1.38x -> 1.25x plain
 mkdir -p runs/queue_logs
@@ -73,26 +75,26 @@ step stack_arch python train_jit.py $BASE $IMPL $BEST_ARGS --epochs=20 --attn_re
 adopt stack_arch "--attn_res=full --adaln_single=True" && ARCH_ARGS="--attn_res=full --adaln_single=True"
 
 # 3. disp
-step stack_disp_analysis python analyze_dispersion.py --ckpts=$BEST_RUN --data_dir=$DATA
+step stack_disp2_analysis python analyze_dispersion.py --ckpts=$BEST_RUN --data_dir=$DATA --kind=$DISP_KIND
 for b in 3 6 9 all; do
-    step "stack_disp_b${b}_10ep" python train_jit.py $BASE $IMPL $BEST_ARGS --epochs=10 --disp_weight=0.5 --disp_blocks=$b
+    step "stack_disp2_b${b}_10ep" python train_jit.py $BASE $IMPL $BEST_ARGS --epochs=10 --disp_kind=$DISP_KIND --disp_weight=0.5 --disp_blocks=$b
 done
 best=""; best_fid=""; best_single=""; best_single_fid=""
 for b in 3 6 9 all; do
-    f=$(last_fid "stack_disp_b${b}_10ep"); [ -z "$f" ] && continue
+    f=$(last_fid "stack_disp2_b${b}_10ep"); [ -z "$f" ] && continue
     echo "screen: block(s) $b -> FID-10k $f at 10 epochs"
     if [ -z "$best_fid" ] || lt "$f" "$best_fid"; then best=$b; best_fid=$f; fi
     if [ "$b" != all ] && { [ -z "$best_single_fid" ] || lt "$f" "$best_single_fid"; }; then best_single=$b; best_single_fid=$f; fi
 done
 if [ -n "$best" ]; then
     echo "screen best: block(s) $best (FID-10k $best_fid); best single block: $best_single"
-    step "stack_disp_b${best}_20ep" python train_jit.py $BASE $IMPL $BEST_ARGS --epochs=20 --disp_weight=0.5 --disp_blocks=$best --init_from=resume
-    step "stack_disp_balance${SHARE}_b${best_single}" python train_jit.py $BASE $IMPL $BEST_ARGS --epochs=20 --disp_balance=$SHARE --disp_blocks=$best_single
-    fw=$(last_fid "stack_disp_b${best}_20ep"); fb=$(last_fid "stack_disp_balance${SHARE}_b${best_single}")
+    step "stack_disp2_b${best}_20ep" python train_jit.py $BASE $IMPL $BEST_ARGS --epochs=20 --disp_kind=$DISP_KIND --disp_weight=0.5 --disp_blocks=$best --init_from=resume
+    step "stack_disp2_balance${SHARE}_b${best_single}" python train_jit.py $BASE $IMPL $BEST_ARGS --epochs=20 --disp_kind=$DISP_KIND --disp_balance=$SHARE --disp_blocks=$best_single
+    fw=$(last_fid "stack_disp2_b${best}_20ep"); fb=$(last_fid "stack_disp2_balance${SHARE}_b${best_single}")
     if [ -n "$fb" ] && { [ -z "$fw" ] || lt "$fb" "$fw"; }; then
-        adopt "stack_disp_balance${SHARE}_b${best_single}" "--disp_balance=$SHARE --disp_blocks=$best_single"
+        adopt "stack_disp2_balance${SHARE}_b${best_single}" "--disp_kind=$DISP_KIND --disp_balance=$SHARE --disp_blocks=$best_single"
     else
-        adopt "stack_disp_b${best}_20ep" "--disp_weight=0.5 --disp_blocks=$best"
+        adopt "stack_disp2_b${best}_20ep" "--disp_kind=$DISP_KIND --disp_weight=0.5 --disp_blocks=$best"
     fi
 fi
 
