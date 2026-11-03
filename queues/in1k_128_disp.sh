@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# in1k_128 (2026-11-02): Dispersive Loss (Wang & He 2025) on the best setup so far, the learned per-noise-level weight (EDM2's
-# unnormalized form, as runs/in1k_128/jit-b16_icl0/muon_losst-learned). Depth by successive halving, then the weighting:
-#   0. analyze_dispersion.py on the learned run (minutes): per block, how dispersed the features already are and what share
+# in1k_128 (2026-11-02): Dispersive Loss (Wang & He 2025) on the best setup so far: the learned per-noise-level weight (EDM2's
+# unnormalized form) with a 1-epoch lr warm-up, runs/in1k_128/jit-b16_icl0/muon_losst-learned_no-lossnorm_warmup1
+# (FID-10k 109.7 / 91.9 / 82.5 / 76.1 at 5 / 10 / 15 / 20 epochs). Depth by successive halving, then the weighting:
+#   0. analyze_dispersion.py on the best run (minutes): per block, how dispersed the features already are and what share
 #      of the gradient lambda = 0.5 amounts to -- read it before the screen finishes, it may justify pruning arms
 #   1-4. screen: blocks 3 (the paper's depth // 4), 6, 9 (JiT's built-in encoder / decoder may push the best depth later),
 #      all (averaged; best in the paper's ablation), lambda 0.5, tau 0.5, 10 epochs each
@@ -17,7 +18,7 @@
 set -u
 DATA=${JIT_DATA_ROOT:-/data}/in1k_128
 SHARE=${DISP_SHARE:-0.2}
-BEST="config/jit_in1k_128.py --optimizer_type=muon --data_dir=$DATA --loss_t_weight=learned --loss_weight_normalize=False"
+BEST="config/jit_in1k_128.py --optimizer_type=muon --data_dir=$DATA --warmup_epochs=1 --loss_t_weight=learned --loss_weight_normalize=False"
 mkdir -p runs/queue_logs
 GPU_LOCK=runs/queue_logs/gpu.lock # shared with the other in1k_128 queues: their steps take turns on the GPU
 step() { # step name command... (as in in1k_128_weighting_batch.sh)
@@ -37,7 +38,7 @@ step() { # step name command... (as in in1k_128_weighting_batch.sh)
 }
 last_fid() { grep -oE 'FID-[0-9.]+k [0-9]+(\.[0-9]+)?' "runs/queue_logs/$1.log" 2>/dev/null | tail -1 | awk '{print $2}'; }
 
-step disp_analysis python analyze_dispersion.py --ckpts=runs/in1k_128/jit-b16_icl0/muon_losst-learned --data_dir=$DATA
+step disp_analysis python analyze_dispersion.py --ckpts=runs/in1k_128/jit-b16_icl0/muon_losst-learned_no-lossnorm_warmup1 --data_dir=$DATA
 for b in 3 6 9 all; do
     step "disp_b${b}_10ep" python train_jit.py $BEST --epochs=10 --disp_weight=0.5 --disp_blocks=$b
 done
