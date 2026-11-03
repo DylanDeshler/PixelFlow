@@ -100,7 +100,7 @@ The current best plain-Muon setup is 5.1: `--warmup_epochs=1 --loss_t_weight=lea
 
 ## Phase 6: stacking one change at a time (`queues/in1k_128_stack.sh`, from 2026-11-03)
 
-One sequential queue. Every stage runs on the best setup so far (starting from 5.1, FID 76.1). If its FID-10k at 20 epochs
+One sequential queue (patch allocation last: two forwards per step make it the slowest stage). Every stage runs on the best setup so far (starting from 5.1, FID 76.1). If its FID-10k at 20 epochs
 beats the current best, its change is adopted and the next stage builds on it. Decisions are replayed from the step
 logs on every restart. The final best goes to `runs/queue_logs/stack_best.txt`.
 
@@ -114,11 +114,12 @@ logs on every restart. The final best goes to `runs/queue_logs/stack_best.txt`.
 | 6.4 | disp · `stack_disp3_b8_w0.5_10ep`, then `stack_disp3_b8_w0.1_10ep` | Dispersive Loss on mean-pooled unit-RMS features (τ 0.5) at block 8 (probes peak there: kNN 3.42 vs 2.24 at block 4, 1.06 at block 12), weight 0.5 (the paper's), then 0.1 in case 0.5 is too strong; stops at the first arm that beats 81.12 (the best run's 10-epoch FID) | **first attempt invalid (our setup)**: both arms stopped at ~1.6 epochs by a guard that misread the pooled loss approaching its best value (−3.93 vs −3.95) as the noise shortcut, and the 10-epoch reference read as "unknown" (a config-key bug). Guard now only for the plain form; reference fixed; both arms resume from their epoch-1 checkpoints | does dispersion at the block with the best representations help? Analysis (pooled, against the learned-weighted objective): λ 0.5 is ~10% of the gradient at block 8 (12% at 7) Pooling raises the bar for the noise shortcut (noise must be ~8× stronger relative to coherent content) without removing it; only FID / probes can tell whether a run took it |
 | 6.5 | disp · `stack_disp3_b8_w{λ}_20ep` | the winning arm resumed to 20 epochs | conditional | candidate for adoption (bar 68.17) |
 | 6.6 | disp · `stack_disp3_balance0.2_b8` | EnCodec gradient balancer (share 0.2) instead of λ, at block 8 | conditional | fixed gradient share vs fixed loss weight; the better of 6.5 / 6.6 is adopted if it beats the best |
-| 6.7 | tokens · `stack_tokens_bench`, `stack_tokens_bench_mem0.5` | `bench_tokens.py` on the adopted architecture (with and without selective recompute) | queued | step time, img/s, peak memory, FLOPs; largest fine share with no accumulation |
-| 6.8 | tokens · `stack_tokens` | `--token_sizes=16,8 --fine_frac=0.25` (loss-proportional allocation by t) | queued | how much of p8's gain (65.6 vs 81.0) at ~1.75× p16's FLOPs? |
-| 6.9 | tokens · `stack_tokens_infer{0,0.1,0.5,1.0}` | 6.8's checkpoint at other sampling budgets (inference only) | queued | FID vs sampling compute from one model |
-| 6.10 | tokens · `stack_tokens_matched_{N}ep` | the previous best continued to 6.8's GPU-hours | conditional (if 6.8 is adopted) | per-hour comparison (adoption is per image) |
-| 6.11 | block · `stack_attnres_block` | `--attn_res=block` (Block AttnRes: sources are block sums) instead of full, if full was adopted | queued | speed: 1.14× plain step time vs full's 1.25× (bench_attnres.py, with chunked mixing). Adopted if FID-10k is within 0.5 (`ATTNRES_BLOCK_TOL`) of the best |
+| 6.7 | block · `stack_attnres_block` | `--attn_res=block` (Block AttnRes: sources are block sums) instead of full, if full was adopted | queued | speed: 1.14× plain step time vs full's 1.25× (bench_attnres.py, with chunked mixing). Adopted if FID-10k is within 0.5 (`ATTNRES_BLOCK_TOL`) of the best |
+| — | (hyperparameter / noise tuning) | weight decay, Muon momentum / β2, lr, noise schedule: stages to add here, or after patch allocation if they're better tuned on the final architecture | not yet designed | see the notes below and Proposed |
+| 6.8 | tokens · `stack_tokens_bench`, `stack_tokens_bench_mem0.5` | `bench_tokens.py` on the adopted architecture (re-run as `stack_tokens_bench_block*` if Block AttnRes was adopted) (with and without selective recompute) | queued | step time, img/s, peak memory, FLOPs; largest fine share with no accumulation |
+| 6.9 | tokens · `stack_tokens` | `--token_sizes=16,8 --fine_frac=0.25` (loss-proportional allocation by t) | queued | how much of p8's gain (65.6 vs 81.0) at ~1.75× p16's FLOPs? |
+| 6.10 | tokens · `stack_tokens_infer{0,0.1,0.5,1.0}` | 6.9's checkpoint at other sampling budgets (inference only) | queued | FID vs sampling compute from one model |
+| 6.11 | tokens · `stack_tokens_matched_{N}ep` | the previous best continued to 6.9's GPU-hours | conditional (if 6.9 is adopted) | per-hour comparison (adoption is per image) |
 
 
 ## Notes for later stages
@@ -139,7 +140,7 @@ logs on every restart. The final best goes to `runs/queue_logs/stack_best.txt`.
 - (Sampler: Heun 50 stays, 5.4.)
 - If headline numbers move to CFG > 1: one ancestral η 0.25 check there (inference only); SDE gains in the literature
   appear mostly with guidance.
-- 16/8 tokens with a budget other than 0.25, chosen from 6.7's memory limit and 6.8's FID-per-t-window plot.
+- 16/8 tokens with a budget other than 0.25, chosen from 6.8's memory limit and 6.9's FID-per-t-window plot.
 - GaussJiT with a basis below 16, to remove the "shrink every frame" escape (3.5).
 - Early small batch (from 4.5 and the growing critical batch in 4.1): a batch-size ramp. On hold, because the user
   prefers single-phase schedules.

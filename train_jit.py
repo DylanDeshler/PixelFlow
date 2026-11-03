@@ -266,6 +266,8 @@ alloc_eval_images = 1000 # FID-N per allocation (must be divisible by the number
 alloc_eval_loss_images = 1024 # held-out images for the matched per-size loss
 alloc_eval_ts = 16 # noise levels for it (bin centres of a uniform t grid)
 alloc_eval_show = 8 # sample columns (labels spread over the classes), same noise under every allocation and at every eval
+attn_impl = 'sdpa' # attention kernel: 'sdpa' (torch's fused flash / memory-efficient kernel, memory ~ tokens; default since 2026-11-03)
+                   # or 'jit' (JiT's explicit attention, memory ~ tokens^2, earlier runs); implementation only, see model_jit.JiT.set_attn_impl
 attn_res_chunk = 1 # full AttnRes: mix in chunks of this many sublayers (same result, less memory traffic; implementation only, see
                    # model_jit.AttnResState). 1 = off
 act_memory_budget = 1.0 # < 1: torch.compile recomputes cheap activations in the backward instead of saving them, keeping about this
@@ -657,6 +659,8 @@ if phema_stds:
 
 trainable_params = [p for _, p in trainable if p.requires_grad]
 denoiser.net.attn_res_chunk = attn_res_chunk # (AttnRes models only; implementation, not architecture)
+if hasattr(denoiser.net, 'set_attn_impl'):
+    denoiser.net.set_attn_impl(attn_impl)
 if compile:
     # whole network, after every hook (REPA capture, token masking) is registered so they're traced in;
     # Module.compile keeps the parameter names, so checkpoints and EMA are unaffected

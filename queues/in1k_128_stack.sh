@@ -16,12 +16,13 @@
 #              the current best's own 10-epoch FID. That arm resumes to 20 epochs, then EnCodec's gradient balancer (share
 #              DISP_SHARE, default 0.2) at the same block for 20 epochs; the better of the two is adopted if it beats the best. A run stopped by train_jit.py's
 #              dispersive guard (the loss at its best possible value: the noise shortcut) counts as a finished failure
-#   4. tokens  --token_sizes=16,8 --fine_frac=0.25: bench_tokens.py (minutes, with and without selective recompute), the run,
+#   4. block   --attn_res=block (Block AttnRes: 1.14x plain step time vs full's 1.25x), if full AttnRes was adopted; adopted if
+#              FID-10k is within ATTNRES_BLOCK_TOL (default 0.5) of the best: a speed change
+#   (hyperparameter / noise tuning stages slot in here when added; patch allocation stays last: it slows every step)
+#   5. tokens  --token_sizes=16,8 --fine_frac=0.25: bench_tokens.py (minutes, with and without selective recompute), the run,
 #              sampling budgets on its checkpoint (FID-10k with fine tokens on 0 / 0.1 / 0.5 / 1.0 of the calls), and, if it
 #              wins per image, the previous best continued to the same GPU-hours (per-hour comparison; its 20-epoch
 #              checkpoint kept as ckpt_20ep.pt). Adoption is per image; the log prints the per-hour numbers next to it
-#   5. block   --attn_res=block (Block AttnRes: 1.14x plain step time vs full's 1.25x), if full AttnRes was adopted; adopted if
-#              FID-10k is within ATTNRES_BLOCK_TOL (default 0.5) of the best: a speed change
 # Ends by writing the final best setup to runs/queue_logs/stack_best.txt. Shares the queues' GPU lock.
 #
 #   nohup bash queues/in1k_128_stack.sh > runs/queue_logs/queue_stack.log 2>&1 &
@@ -77,6 +78,7 @@ BEST_ARGS="--warmup_epochs=1 --loss_t_weight=learned --loss_weight_normalize=Fal
 BEST_RUN=runs/in1k_128/jit-b16_icl0/muon_losst-learned_no-lossnorm_warmup1
 BEST_FID=$(last_fid warmup1_learned); BEST_FID=${BEST_FID:-76.1}
 ARCH_ARGS="" # the architecture flags adopted so far (for bench_tokens.py)
+BENCH_TAG="" # _block once Block AttnRes is adopted: the token benchmark then measures that architecture
 adopt() { # adopt step-name "args": the step's change becomes part of the best setup if its 20-epoch FID beats the best
     local f; f=$(last_fid "$1")
     if [ -z "$f" ]; then echo ">>> $1: no FID (failed or unfinished); best stays $BEST_FID"; return 1; fi
@@ -123,9 +125,27 @@ else
     echo ">>> dispersive: no arm beat the reference at 10 epochs; not adopted"
 fi
 
-# 4. tokens
-step stack_tokens_bench python bench_tokens.py $ARCH_ARGS $IMPL
-step stack_tokens_bench_mem0.5 python bench_tokens.py $ARCH_ARGS $IMPL --act_memory_budget=0.5
+# 4. Block AttnRes, for speed (only if full AttnRes was adopted): sources are block sums, 1.14x plain step time vs full's 1.25x
+#    (bench_attnres.py). Adopted if its FID is within ATTNRES_BLOCK_TOL of the best (a speed change: equal quality is enough)
+if [[ "$BEST_ARGS" == *"--attn_res=full"* ]]; then
+    step stack_attnres_block python train_jit.py $BASE $IMPL $BEST_ARGS --epochs=20 --attn_res=block
+    fbk=$(last_fid stack_attnres_block)
+    echo "block AttnRes: FID-10k ${fbk:-none} vs best $BEST_FID; img/s $(ips "$(run_of stack_attnres_block)") vs $(ips "$BEST_RUN")"
+    if [ -n "$fbk" ] && awk "BEGIN {exit !($fbk <= $BEST_FID + $ATTNRES_BLOCK_TOL)}"; then
+        echo ">>> stack_attnres_block: FID-10k $fbk within $ATTNRES_BLOCK_TOL of $BEST_FID: adopted for speed (--attn_res=block)"
+        BEST_ARGS="$BEST_ARGS --attn_res=block"; BEST_RUN=$(run_of stack_attnres_block); BEST_FID=$fbk
+        ARCH_ARGS="--attn_res=block --adaln_single=True"; BENCH_TAG=_block
+    else
+        echo ">>> stack_attnres_block: not adopted (more than $ATTNRES_BLOCK_TOL worse, or failed)"
+    fi
+fi
+
+# (hyperparameter and noise tuning go here when added: weight decay, Muon momentum / beta2, lr, noise schedule; patch
+#  allocation stays last because it slows every step, unless the tuning is better done on the final architecture)
+
+# 5. tokens (last: two forwards per step make it the slowest stage)
+step stack_tokens_bench$BENCH_TAG python bench_tokens.py $ARCH_ARGS $IMPL
+step stack_tokens_bench${BENCH_TAG}_mem0.5 python bench_tokens.py $ARCH_ARGS $IMPL --act_memory_budget=0.5
 step stack_tokens python train_jit.py $BASE $IMPL $BEST_ARGS --epochs=20 --token_sizes=16,8 --fine_frac=0.25
 TOK_RUN=$(run_of stack_tokens)
 if [ -n "$TOK_RUN" ] && [ -e "$TOK_RUN/ckpt.pt" ]; then
@@ -141,20 +161,6 @@ if adopt stack_tokens "--token_sizes=16,8 --fine_frac=0.25"; then
     [ -e "$PREV_RUN/ckpt_20ep.pt" ] || cp "$PREV_RUN/ckpt.pt" "$PREV_RUN/ckpt_20ep.pt"
     step "stack_tokens_matched_${ep}ep" python train_jit.py $BASE $IMPL $PREV_ARGS --epochs=$ep --init_from=resume
     echo ">>> per GPU-hour: 16/8 tokens FID-10k $BEST_FID at 20 epochs vs the previous best continued to $ep epochs (same hours): $(last_fid "stack_tokens_matched_${ep}ep")"
-fi
-
-# 5. Block AttnRes, for speed (only if full AttnRes was adopted): sources are block sums, 1.14x plain step time vs full's 1.25x
-#    (bench_attnres.py). Adopted if its FID is within ATTNRES_BLOCK_TOL of the best (a speed change: equal quality is enough)
-if [[ "$BEST_ARGS" == *"--attn_res=full"* ]]; then
-    step stack_attnres_block python train_jit.py $BASE $IMPL $BEST_ARGS --epochs=20 --attn_res=block
-    fbk=$(last_fid stack_attnres_block)
-    echo "block AttnRes: FID-10k ${fbk:-none} vs best $BEST_FID; img/s $(ips "$(run_of stack_attnres_block)") vs $(ips "$BEST_RUN")"
-    if [ -n "$fbk" ] && awk "BEGIN {exit !($fbk <= $BEST_FID + $ATTNRES_BLOCK_TOL)}"; then
-        echo ">>> stack_attnres_block: FID-10k $fbk within $ATTNRES_BLOCK_TOL of $BEST_FID: adopted for speed (--attn_res=block)"
-        BEST_ARGS="$BEST_ARGS --attn_res=block"; BEST_RUN=$(run_of stack_attnres_block); BEST_FID=$fbk
-    else
-        echo ">>> stack_attnres_block: not adopted (more than $ATTNRES_BLOCK_TOL worse, or failed)"
-    fi
 fi
 
 printf 'FID-10k %s\nrun %s\nargs %s %s\n' "$BEST_FID" "$BEST_RUN" "$BASE" "$BEST_ARGS" > runs/queue_logs/stack_best.txt

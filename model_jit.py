@@ -366,6 +366,7 @@ class Attention(nn.Module):
         self.k_norm = make_norm(head_dim, layernorm) if qk_norm else nn.Identity()
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.impl = 'sdpa' # implementation only (no parameters): 'sdpa' (fused, default) or 'jit', set by JiT.set_attn_impl
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
@@ -381,7 +382,10 @@ class Attention(nn.Module):
         q = rope(q)
         k = rope(k)
 
-        x = scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.)
+        if self.impl == 'sdpa': # PyTorch's fused kernel (flash / memory-efficient): never stores the N x N weights
+            x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.)
+        else: # JiT's own: the full attention matrix in float32 (memory grows with N^2, saved for backward)
+            x = scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.)
 
         x = x.transpose(1, 2).reshape(B, N, C)
 
@@ -1276,6 +1280,19 @@ class JiT(nn.Module):
         out[m] = self.forward(x[m], t[m], y[m], patch=self.fine_patch)
         out[~m] = self.forward(x[~m], t[~m], y[~m], patch=self.patch_size)
         return out
+
+    def set_attn_impl(self, impl):
+        """
+        Attention kernel, implementation only (no parameters, same checkpoints and run names): 'sdpa' (the default since
+        2026-11-03: torch's fused flash / memory-efficient kernel, memory ~N, what lets 256-token sequences fit, e.g. two token
+        sizes at batch 1024) or 'jit' (JiT's explicit attention: the N x N weights in float32, kept for backward, memory ~N^2;
+        every run before that date). The same math; the scores accumulate in float32
+        either way and the weights @ values product runs in bfloat16 under autocast in both.
+        """
+        assert impl in ('jit', 'sdpa'), f"attn_impl must be 'jit' or 'sdpa', got {impl}"
+        for m in self.modules():
+            if isinstance(m, Attention):
+                m.impl = impl
 
     def embed(self, x, c, fine=False):
         # (DC-AE stem) -> patch embedding (gated bottleneck) -> + position embedding

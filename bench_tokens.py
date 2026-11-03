@@ -20,6 +20,7 @@ $ python bench_tokens.py --act_memory_budget=0.5       # with Inductor's selecti
 """
 
 import os
+import gc
 import time
 from contextlib import nullcontext
 
@@ -38,6 +39,7 @@ compile = True
 act_memory_budget = 1.0 # as train_jit.py: < 1 recomputes activations in the backward to save memory
 attn_res = 'none' # the base architecture, as train_jit.py ('full' / 'block')
 adaln_single = False
+attn_impl = 'sdpa' # as train_jit.py: 'sdpa' (fused attention, memory ~ tokens, default) or 'jit'
 attn_res_chunk = 1 # as train_jit.py (full AttnRes: chunked mixing, same result, faster)
 single_backward_frac = 0.25 # also time this fine share with one backward over both paths (0 = skip)
 device = 'cuda'
@@ -67,44 +69,54 @@ def bench(name, overrides, tokens_per_img, split=True):
     model_name, arch = resolve_arch('JiT-B/16', in_context_len=0, **base, **overrides)
     denoiser = build_denoiser(model_name, img_size, 1000, noise_scale=0.5, arch=arch).to(device).train()
     denoiser.net.attn_res_chunk = attn_res_chunk
+    denoiser.net.set_attn_impl(attn_impl)
     opt = torch.optim.AdamW(denoiser.net.parameters(), lr=1e-4, fused=device_type == 'cuda')
     if compile:
         denoiser.net.compile()
     gfl = 3 * sum(f * gflop_fwd(n, arch) for f, n in tokens_per_img)
     micro = batch_size
-    while True:
+    two = 'token_sizes' in overrides
+    def step(x, y, accum):
+        for _ in range(accum):
+            with ctx: # two sizes: each path's backward right after its forward (as train_jit.py), unless split=False
+                loss = flow_loss(denoiser, x, y, backward=(lambda l: (l / accum).backward()) if two and split else None) / accum
+            if not (two and split):
+                loss.backward()
+        opt.step(); opt.zero_grad(set_to_none=True)
+    def attempt(micro):
+        # in its own frame, so an out-of-memory error leaves nothing of the failed step alive once it returns
         try:
-            if device_type == 'cuda':
-                torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
             x = torch.randn(micro, 3, img_size, img_size, device=device)
             y = torch.randint(0, 1000, (micro,), device=device)
             accum = batch_size // micro
-            def step():
-                two = 'token_sizes' in overrides
-                for _ in range(accum):
-                    with ctx: # two sizes: each path's backward right after its forward (as train_jit.py), unless split=False
-                        loss = flow_loss(denoiser, x, y, backward=(lambda l: (l / accum).backward()) if two and split else None) / accum
-                    if not (two and split):
-                        loss.backward()
-                opt.step(); opt.zero_grad(set_to_none=True)
-            print(f'  {name}: compiling + {warmup} warm-up steps at micro-batch {micro} ...', flush=True)
+            print(f'  {name}: compiling + {warmup} warm-up steps at micro-batch {micro} x {accum} ...', flush=True)
             for _ in range(warmup):
-                step()
+                step(x, y, accum)
             print(f'  {name}: timing {iters} steps ...', flush=True)
             if device_type == 'cuda':
                 torch.cuda.synchronize()
             t0 = time.perf_counter()
             for _ in range(iters):
-                step()
+                step(x, y, accum)
             if device_type == 'cuda':
                 torch.cuda.synchronize()
-            break
+            return time.perf_counter() - t0
         except torch.OutOfMemoryError:
-            opt.zero_grad(set_to_none=True)
-            assert micro > 1, 'out of memory at micro-batch 1'
-            micro //= 2
-            print(f'  {name}: out of memory, micro-batch {micro} x {batch_size // micro}')
-    ms = (time.perf_counter() - t0) / iters * 1e3
+            return None
+    while True:
+        if device_type == 'cuda':
+            torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
+        elapsed = attempt(micro)
+        if elapsed is not None:
+            break
+        opt.zero_grad(set_to_none=True)
+        gc.collect()
+        if device_type == 'cuda':
+            torch.cuda.empty_cache()
+        assert micro > 1, 'out of memory at micro-batch 1'
+        micro //= 2
+        print(f'  {name}: out of memory, micro-batch {micro} x {batch_size // micro}', flush=True)
+    ms = elapsed / iters * 1e3
     ips = batch_size / ms * 1e3
     peak = torch.cuda.max_memory_allocated() / 1e9 if device_type == 'cuda' else float('nan')
     tok = sum(f * n for f, n in tokens_per_img)
@@ -129,13 +141,26 @@ base = rows[0]
 print("\nrelative to B/16 (wall-clock per image; FLOPs per image):")
 for r in rows[1:]:
     print(f"  {r['name']:<22} time x{base['ips'] / r['ips']:.2f}, FLOPs x{r['gflop'] / base['gflop']:.2f}")
-# largest fine share without accumulation: the split step's peak is the fine path's once f B n8 > (1 - f) B n16
-two = [(float(r['name'].split()[-1]), r['peak']) for r in rows if r['name'].startswith('B/16+8') and r['micro'] == batch_size]
-two = [(f, p) for f, p in two if f * n8 >= (1 - f) * n16]
-if device_type == 'cuda' and len(two) >= 2:
-    (f1, p1), (f2, p2) = two[0], two[-1]
-    slope = (p2 - p1) / (f2 - f1)
+# largest fine share without accumulation: fit peak memory against the step's largest path (tokens in one micro-batch: the
+# per-path backward holds one path's activations at a time) over every split row, then solve for the fine path's token count
+# that fills the GPU at the full batch
+pts = []
+for r in rows:
+    if 'peak' not in r or r['peak'] != r['peak'] or r['name'].strip().startswith('one backward'):
+        continue
+    if r['name'].startswith('B/16+8'):
+        f = float(r['name'].split()[-1])
+        pts.append((max((1 - f) * n16, f * n8) * r['micro'], r['peak']))
+    elif r['name'] == 'B/16':
+        pts.append((n16 * r['micro'], r['peak']))
+    elif r['name'] == 'B/8':
+        pts.append((n8 * r['micro'], r['peak']))
+if device_type == 'cuda' and len({p[0] for p in pts}) >= 2:
+    import numpy as np
+    slope, base_gb = np.polyfit([p[0] for p in pts], [p[1] for p in pts], 1)
     cap = torch.cuda.get_device_properties(0).total_memory / 1e9 * 0.95
-    f_max = f2 + (cap - p2) / slope if slope > 0 else float('inf')
-    print(f"\nmemory: {slope:.1f} GB per unit fine share at batch {batch_size}; {cap:.0f} GB usable -> fine share up to ~{min(f_max, 1):.2f} "
-          f"fits without gradient accumulation (act_memory_budget {act_memory_budget:g})")
+    tok_max = (cap - base_gb) / slope
+    f_max = min(1.0, tok_max / (batch_size * n8))
+    print(f"\nmemory: {base_gb:.1f} GB + {slope * 1e6:.1f} GB per million tokens in the largest path; {cap:.0f} GB usable -> "
+          f"~{tok_max / 1e3:.0f}k tokens fit, so the fine path fits batch {batch_size} without accumulation up to a fine share of "
+          f"~{f_max:.2f} (act_memory_budget {act_memory_budget:g})")
