@@ -45,6 +45,7 @@ save_best = True # write the best EMA as a checkpoint for eval_jit.py
 device = 'cuda'
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float32'
 compile = True
+attn_res_chunk = 1 # full AttnRes models: chunked mixing (same samples up to rounding, faster)
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'configurator.py')).read())
@@ -95,6 +96,7 @@ device_type = 'cuda' if 'cuda' in device else 'cpu'
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16}[dtype]
 ctx = nullcontext() if (device_type == 'cpu' or dtype == 'float32') else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 denoiser = build_denoiser(**meta['denoiser_args']).to(device).eval()
+denoiser.net.attn_res_chunk = attn_res_chunk
 if compile:
     denoiser.net.compile()
 denoiser.time_schedule = 'uniform'

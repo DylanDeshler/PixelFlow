@@ -38,6 +38,7 @@ compile = True
 act_memory_budget = 1.0 # as train_jit.py: < 1 recomputes activations in the backward to save memory
 attn_res = 'none' # the base architecture, as train_jit.py ('full' / 'block')
 adaln_single = False
+attn_res_chunk = 1 # as train_jit.py (full AttnRes: chunked mixing, same result, faster)
 single_backward_frac = 0.25 # also time this fine share with one backward over both paths (0 = skip)
 device = 'cuda'
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float32'
@@ -65,6 +66,7 @@ def bench(name, overrides, tokens_per_img, split=True):
     base = dict(attn_res=attn_res if attn_res != 'none' else None, adaln_single=adaln_single or None)
     model_name, arch = resolve_arch('JiT-B/16', in_context_len=0, **base, **overrides)
     denoiser = build_denoiser(model_name, img_size, 1000, noise_scale=0.5, arch=arch).to(device).train()
+    denoiser.net.attn_res_chunk = attn_res_chunk
     opt = torch.optim.AdamW(denoiser.net.parameters(), lr=1e-4, fused=device_type == 'cuda')
     if compile:
         denoiser.net.compile()
