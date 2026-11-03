@@ -61,7 +61,7 @@ fid_at_epoch() { # a run's in-loop FID at the eval nearest an epoch (from its di
     python -c "
 import json, glob, sys, os
 run, ep = sys.argv[1], float(sys.argv[2])
-c = json.load(open(os.path.join(run, 'config.json'))); ipe = c.get('derived', {}).get('iters_per_epoch') or c.get('iters_per_epoch')
+c = json.load(open(os.path.join(run, 'config.json'))); ipe = c.get('resolved', {}).get('iters_per_epoch') or c.get('derived', {}).get('iters_per_epoch')
 d = [(abs(int(f.rsplit('_', 1)[1][:-5]) / ipe - ep), f) for f in glob.glob(os.path.join(run, 'diagnostics', 'diag_*.json'))]
 f = min(d)[1] if d else None
 print(json.load(open(f))['scalars'].get('val/fid', '') if f and min(d)[0] < 0.5 else '')

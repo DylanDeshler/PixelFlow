@@ -1278,20 +1278,18 @@ while True:
             raise RuntimeError(f"loss is {lossf} at iter {iter_num}, stopping")
         imgs_per_sec = effective_batch_size / dt
         repa_str = (f", repa {loss_repa.item():.4f}" if encoder is not None else "") + (f", disp {loss_disp.item():.4f}" if disp_captures else "")
-        if disp_captures and disp_kind in ('infonce_l2', 'infonce_l2n'):
-            # pinned at the floor log(1/B): every pair looks maximally far apart for tau, so the term gives no gradient (with
-            # infonce_l2 the network gets there by growing its features). 10 logged steps in a row there: stop, don't waste the run
+        if disp_captures and disp_kind == 'infonce_l2':
+            # pinned at the floor log(1/B): every pair looks maximally far apart for tau, so the term gives no gradient, and the
+            # network got there by growing its features (the plain form isn't scale-invariant). 10 logged steps in a row there: stop.
+            # Not applied to infonce_l2n: its best value (all pairs orthogonal) is the loss's goal, reached by spreading content or
+            # by carrying noise alike, so only FID / the probes can tell; a 2026-11-03 guard on it stopped pooled runs at ~1.6 epochs
             k_fine = round(fine_frac * batch_size) if token_sizes else 0 # two token sizes: the term averages two sub-batches' floors
-            # the best value the form can reach: log(1/B) for infonce_l2 (every pair maximally far); infonce_l2n: every pair orthogonal,
-            # log((1 + (B - 1) e^(-2 / tau)) / B), which features that just carry per-sample noise reach too, pooled or not
-            best = (lambda n: math.log((1 + (n - 1) * math.exp(-2 / disp_temp)) / n)) if disp_kind == 'infonce_l2n' else (lambda n: math.log(1.0 / n))
+            best = lambda n: math.log(1.0 / n) # every pair maximally far
             floor = best(batch_size) if not k_fine else ((batch_size - k_fine) * best(batch_size - k_fine) + k_fine * best(k_fine)) / batch_size
             disp_pinned = disp_pinned + 1 if loss_disp.item() < floor + 0.05 else 0
             if disp_pinned >= 10:
                 print(f"dispersive loss pinned at its best possible value {floor:.2f} for 10 logged steps (no gradient): stopping. "
-                                 + ("Use a scale-invariant form (--disp_kind=infonce_l2n)" if disp_kind != 'infonce_l2n' else
-                                    "the features became as spread as per-sample noise: the loss found the noise shortcut" + ("" if disp_pool == 'mean' else " (try --disp_pool=mean)")),
-                      flush=True)
+                  + "Use a scale-invariant form (--disp_kind=infonce_l2n)", flush=True)
                 sys.exit(3) # (exit code 3: stopped by this guard, a finished negative result rather than a crash)
         grad_str = f", grad norm {math.sqrt(sum(v ** 2 for v in grad_norms.values())):.4f}" if log_opt else ""
         trunk_str = f", trunk-only loss {loss_trunkf:.4f}" if loss_trunkf is not None else ""
