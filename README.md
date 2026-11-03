@@ -210,6 +210,22 @@ Every eval of a two-size run adds `alloc_eval.py` (`--alloc_eval`, on by default
 Plots go to `{run}/diagnostics/allocation_{iter}.png`, `allocation_samples_{iter}.png` and `allocation_trends.png`,
 records to `{run}/allocation.jsonl`, scalars to wandb under `alloc/`. Queue: stage 4 of `queues/in1k_128_stack.sh`.
 
+## Post-hoc EMA (EDM2)
+
+JiT's EMA has a fixed decay (0.9999: a window of ~10k steps), so its window relative to training changes with run length:
+σ_rel ≈ 0.4 (40% of training) at 20 epochs on in1k_128, ≈ 0.013 at 600. EDM2 (Karras et al. 2024) instead tracks
+power-function EMAs, whose window is a fixed fraction of training so far (σ_rel), and chooses the EMA after training.
+`--phema_stds=0.05,0.10` keeps two of them alongside EMA1 / EMA2 (which stay as they are, so in-loop FIDs remain
+comparable) and saves snapshots of both every `--phema_every_epochs` (`{run}/phema/`, ~0.5 GB per EMA for JiT-B in float32;
+every ~10 epochs for a 600-epoch run). Any σ_rel at any snapshot step is a least-squares combination of the snapshots
+(`phema.py`): checked against directly tracked EMAs, the error is < 0.4% for σ_rel 0.035–0.25 and grows below the
+smaller tracked value. The power EMAs are in the checkpoint, so resuming continues them; they can't be added to a run
+that started without them.
+
+`posthoc_ema.py --run=<run> --data_dir=<data>` builds a list of σ_rel at the latest (or `--at_iter`) snapshot step, scores
+each with FID-10k at the in-loop settings (same seed, so differences aren't sampling noise), prints them next to the σ_rel
+JiT's fixed EMAs amount to there, and saves the best as a checkpoint `eval_jit.py` loads directly (e.g. for a CFG sweep).
+
 ## Muon
 
 `--optimizer_type=muon` (`muon.py`) uses Muon for the 2D weight matrices inside the transformer blocks and AdamW for the
@@ -249,6 +265,15 @@ w_l(c) = w_l * (1 + scale(c)) + shift(c). One zero-initialized projection is sha
 parameters on JiT-B, and it starts as plain AttnRes. The shift goes on the query side because on the keys it would
 cancel in the softmax over sources. The motivation: the best mixing should depend on the noise level, leaning on the
 embedding near t=1 (keep and edit the input) and on deep outputs at high noise.
+
+Cost: full AttnRes is memory-bound. Each sublayer reads every earlier sublayer output, so a forward pass reads about
+(2·depth)²/2 activation tensors for the mixing (~325 on JiT-B) against ~24 for the plain residual: about 1.3× the step
+time of plain JiT-B on in1k_128 (1600 vs 2070 img/s with adaLN-single). `--attn_res_chunk=k` (train_jit.py and
+eval_jit.py) mixes k consecutive sublayers at a time: one pass over the older sources computes all k mixes as partial
+softmax sums, and each sublayer folds in only its chunk's newer sources. That's exact to float32 rounding (checked
+against the plain mix, outputs and gradients) with about k× less traffic on the older sources. It changes no
+parameters, checkpoints or run names, so a run can resume with it on. `bench_attnres.py` times plain, adaLN-single, full
+AttnRes, both, both with chunking, and Block AttnRes in one session.
 
 ## Gated bottleneck
 

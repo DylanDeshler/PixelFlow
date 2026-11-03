@@ -151,6 +151,7 @@ save_samples = '' # '', 'png' or 'npz'
 device = 'cuda'
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float32'
 compile = True
+attn_res_chunk = 1 # full AttnRes models: mix in chunks of this many sublayers (same samples up to rounding, faster); 1 = off
 fine_frac = -1.0 # two-token-size models (token_sizes): share of sampling calls on fine tokens, a compute knob; < 0 = the model's training share
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
@@ -178,6 +179,7 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16}[dtype]
 ctx = nullcontext() if (device_type == 'cpu' or dtype == 'float32') else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 denoiser, meta = load_denoiser(ckpt, ema, device) # eval mode: inference only (also keeps the compiled graph from being rebuilt for a train-mode call)
+denoiser.net.attn_res_chunk = attn_res_chunk
 if compile:
     # every sampling call has the same batch (fixed_shape below), so one static graph serves the whole evaluation
     denoiser.net.compile()

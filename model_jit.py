@@ -545,6 +545,12 @@ class AttnResState:
     logits for every sublayer are one matmul against all the (g_l * w_l) at once, and a mix only gathers them (as the
     paper's two-phase computation does). The weighted sum is accumulated in place in eager mode (_DepthMix) and left to
     the compiler's fusion under whole-model compile. Nothing [S, B, T, D]-sized is saved for backward.
+
+    Chunked mixing (full only, net.attn_res_chunk = k > 1): the mixes are memory-bound (sublayer l reads all l sources, so
+    a forward reads ~(2 depth)^2 / 2 activation tensors). With chunks of k consecutive sublayers, the k mixes over the
+    sources that exist at the chunk's start are computed in one pass (each source read once, k unnormalized partial sums
+    with their max and sum of exponentials, as in an online softmax); each sublayer then folds in only the sources created
+    inside its chunk. The same result up to rounding, with ~k x less traffic on the older sources. Changes no parameters.
     """
     def __init__(self, net, emb, c=None):
         """
@@ -561,6 +567,8 @@ class AttnResState:
         self.partial = None
         self.count = 0
         self.weights = None # {sublayer: mean mixing weight per source [S]} when recording (diagnostics only)
+        self.chunk = getattr(net, 'attn_res_chunk', 1) if self.group == 1 else 1
+        self._pre = None # chunked mixing: the current chunk's partial mixes over the sources that existed at its start
         self._append(emb)
 
     def make_keys(self, net, c):
@@ -583,6 +591,7 @@ class AttnResState:
         new.logits = [new._logits(s, new.keys) for s in new.sources]
         new.partial = self.partial.detach() if self.partial is not None else None
         new.weights = None
+        new._pre = None
         return new
 
     def _logits(self, v, keys):
@@ -609,7 +618,31 @@ class AttnResState:
             self._append(self.partial)
             self.partial, self.count = None, 0
 
+    def _mix_chunked(self, l):
+        # see the class docstring: one pass over the older sources per chunk of sublayers, then the chunk's own sources
+        pre, dt = self._pre, self.sources[0].dtype
+        if pre is None or not (pre['start'] <= l < pre['start'] + len(pre['A'])):
+            cols = list(range(l, min(l + self.chunk, self.logits[0].shape[-1])))
+            z = torch.stack([c[..., cols] for c in self.logits]) # [S, B, T, k] fp32
+            m = z.amax(0)
+            w = (z - m).exp()
+            A = [sum(w[i, ..., j].unsqueeze(-1).to(dt) * v for i, v in enumerate(self.sources)) for j in range(len(cols))]
+            pre = self._pre = dict(start=l, n0=len(self.sources), A=A, s=w.sum(0), m=m)
+        j = l - pre['start']
+        new = self.sources[pre['n0']:]
+        if not new:
+            return pre['A'][j] / pre['s'][..., j:j + 1].to(dt)
+        zn = torch.stack([self.logits[i][..., l] for i in range(pre['n0'], len(self.sources))]) # [r, B, T]
+        m = torch.maximum(pre['m'][..., j], zn.amax(0))
+        old = (pre['m'][..., j] - m).exp()
+        wn = (zn - m).exp()
+        s = pre['s'][..., j] * old + wn.sum(0)
+        h = pre['A'][j] * old.unsqueeze(-1).to(dt) + sum(wn[i].unsqueeze(-1).to(dt) * v for i, v in enumerate(new))
+        return h / s.unsqueeze(-1).to(dt)
+
     def mix(self, l):
+        if self.chunk > 1 and self.weights is None and self.partial is None and len(self.sources) > 1:
+            return self._mix_chunked(l)
         sources, logits = self.sources, [c[..., l] for c in self.logits]
         if self.partial is not None:
             sources = sources + [self.partial]
@@ -645,6 +678,7 @@ class AttnResState:
     def prepend(self, prefix):
         # in-context tokens: the embedding source gets them, every other source zeros at those positions
         zeros = torch.zeros_like(prefix)
+        self._pre = None
         sources, self.sources, self.logits = self.sources, [], []
         for i, v in enumerate(sources):
             self._append(torch.cat([prefix if i == 0 else zeros, v], dim=1))
@@ -840,6 +874,7 @@ class JiT(nn.Module):
         self.attn_res = attn_res
         # JiT blocks per Block AttnRes block; 0 -> about 8 blocks, the paper's default
         self.attn_res_block_size = attn_res_block_size or max(1, round(depth / 8))
+        self.attn_res_chunk = 1 # implementation only (AttnResState): > 1 mixes full AttnRes in chunks of sublayers; no parameters
         self.adaln_single = adaln_single
         assert not attn_res_adaln or attn_res != 'none', 'attn_res_adaln needs attn_res'
         self.attn_res_adaln = attn_res_adaln

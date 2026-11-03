@@ -42,6 +42,7 @@ from muon import Muon, CombinedOptimizer
 import diagnostics as diag_lib
 import alloc_eval as alloc_lib
 from util.progress import bar
+from phema import PowerEMA
 import plot_trends
 from progress_gif import make_progress_gifs
 
@@ -167,7 +168,7 @@ loss_freq_weight = 'none' # 'wiener': weight the residual's frequencies by their
                           # 'table': by the share a trained model recovers instead (--loss_freq_table, from build_freq_table.py)
 loss_freq_table = '' # JSON from build_freq_table.py, for loss_freq_weight='table'
 loss_t_weight = 'none' # 'learned': EDM2-style learned per-noise-level weight (loss L / e^u(t) + u(t)); the logged loss then includes u
-loss_weight_normalize = True # learned weight: divide by the batch mean so the gradient keeps the plain loss's scale; False = EDM2's form (as the first in1k run)
+loss_weight_normalize = False # learned weight: divide by the batch mean so the gradient keeps the plain loss's scale; False = EDM2's form (as the first in1k run)
 loss_weight_lr_mult = 50.0 # the learned weight's lr / lr: u(t) must travel to log E[L | t] (~-3..1), too slow at the model's lr
 label_drop_prob = 0.1
 # optimizer
@@ -191,6 +192,13 @@ muon_adaln = True # adaLN modulation projections on Muon (2D hidden weights) or,
 grad_clip = 1.0
 ema_decay1 = 0.9999
 ema_decay2 = 0.9996
+phema_stds = '' # post-hoc EMA (EDM2, phema.py): power-function EMAs to track, e.g. '0.05,0.10' (sigma_rel: window as a fraction of
+                # training so far); '' = off. Alongside JiT's EMA1 / EMA2, which stay as they are. posthoc_ema.py then builds
+                # any sigma_rel from the snapshots and scores it
+phema_every_epochs = 1 # snapshot interval: {out_dir}/phema/phema-{iter}-{sigma}.pt, ~0.5 GB each for JiT-B in float32 (every
+                       # ~10 epochs for a 600-epoch run)
+phema_dtype = 'float32' # snapshot storage: 'float32' or 'bfloat16' (half the disk; reconstruction coefficients can be large and of
+                        # both signs, so float32 is the safe default)
 ema_warmup = True # decay = min(decay, (1+step)/(10+step)); False is JiT's update (full decay from step 0)
 # representation alignment ('' disables). see repa.py for the encoders and the two adapters
 repa_encoder = '' # e.g. timm:vit_base_patch14_dinov2.lvd142m (PixelREPA's DINOv2 setup), dinov2_vitb14, dino_vitb16
@@ -256,12 +264,15 @@ alloc_eval_images = 1000 # FID-N per allocation (must be divisible by the number
 alloc_eval_loss_images = 1024 # held-out images for the matched per-size loss
 alloc_eval_ts = 16 # noise levels for it (bin centres of a uniform t grid)
 alloc_eval_show = 8 # sample columns (labels spread over the classes), same noise under every allocation and at every eval
+attn_res_chunk = 1 # full AttnRes: mix in chunks of this many sublayers (same result, less memory traffic; implementation only, see
+                   # model_jit.AttnResState). 1 = off
 act_memory_budget = 1.0 # < 1: torch.compile recomputes cheap activations in the backward instead of saving them, keeping about this
                         # fraction of the saved-activation memory (Inductor's activation_memory_budget): fits larger batches /
                         # fine shares without gradient accumulation, for some recompute. 1.0 = off. Needs compile
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 _defaults = {k: globals()[k] for k in config_keys} # to name the run by what changed
+_defaults['loss_weight_normalize'] = True # its default changed to False (2026-11-03); naming keeps the old one, so existing run names stay valid
 exec(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'configurator.py')).read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
@@ -610,6 +621,7 @@ if init_from == 'resume':
     denoiser.load_state_dict(checkpoint['model'])
     denoiser.ema_params1 = [checkpoint['model_ema1'][name].to(device) for name, _ in denoiser.named_parameters()]
     denoiser.ema_params2 = [checkpoint['model_ema2'][name].to(device) for name, _ in denoiser.named_parameters()]
+    phema_state = checkpoint.get('phema')
     if projector is not None:
         projector.load_state_dict(checkpoint['projector'])
     if masker is not None:
@@ -628,8 +640,20 @@ if init_from == 'resume':
 else:
     denoiser.ema_params1 = [p.detach().clone() for p in denoiser.parameters()]
     denoiser.ema_params2 = [p.detach().clone() for p in denoiser.parameters()]
+    phema_state = None
+phema = None # post-hoc EMA: power-function EMAs of every denoiser parameter (phema.py), snapshotted for posthoc_ema.py
+if phema_stds:
+    phema = PowerEMA(denoiser.parameters(), [float(v) for v in phema_stds.split(',') if v])
+    if phema_state is not None:
+        phema.load_state(phema_state, device)
+    elif iter_num > 0: # a power EMA has to integrate from step 1: starting it mid-run would misdescribe every snapshot
+        raise SystemExit(f"--phema_stds on a resumed run without power EMAs in its checkpoint (iter {iter_num}): they must start at step 1")
+    phema_iters = max(1, phema_every_epochs * iters_per_epoch)
+    print(f"post-hoc EMA: power-function EMAs at sigma_rel {phema.stds}, snapshots every {phema_every_epochs} epoch(s) in {out_dir}/phema "
+          f"(~{sum(p.numel() for p in denoiser.parameters()) * (2 if phema_dtype == 'bfloat16' else 4) * len(phema.stds) / 1e9:.1f} GB per snapshot step)")
 
 trainable_params = [p for _, p in trainable if p.requires_grad]
+denoiser.net.attn_res_chunk = attn_res_chunk # (AttnRes models only; implementation, not architecture)
 if compile:
     # whole network, after every hook (REPA capture, token masking) is registered so they're traced in;
     # Module.compile keeps the parameter names, so checkpoints and EMA are unaffected
@@ -1036,6 +1060,22 @@ def save_samples(step):
                 save_geometry_grid(denoiser.net, x, names, os.path.join(samples_dir, f'samples_{step}{suffix}_geometry.png'))
         denoiser.train()
 
+def save_phema_snapshots():
+    # one file per power EMA at this step: a full denoiser state dict (parameters = that EMA, buffers = the live model's)
+    # plus what posthoc_ema.py needs to weight and rebuild it
+    d = os.path.join(out_dir, 'phema')
+    os.makedirs(d, exist_ok=True)
+    store = torch.bfloat16 if phema_dtype == 'bfloat16' else torch.float32
+    base = denoiser.state_dict()
+    names = [n for n, _ in denoiser.named_parameters()]
+    for std, ema in zip(phema.stds, phema.emas):
+        sd = dict(base)
+        sd.update({n: e.detach().to('cpu', store) for n, e in zip(names, ema)})
+        path = os.path.join(d, f'phema-{iter_num:08d}-{std:.3f}.pt')
+        torch.save({'t': iter_num, 'std': std, 'model': sd, 'params': names, 'denoiser_args': denoiser_args, 'epoch': iter_num / iters_per_epoch},
+                   path + '.tmp')
+        os.replace(path + '.tmp', path)
+
 def save_checkpoint():
     ema1, ema2 = ema_state_dicts(denoiser)
     checkpoint = {
@@ -1054,6 +1094,7 @@ def save_checkpoint():
         'config': config,
         'wandb_run_id': wandb_run_id,
         'train_seconds': train_seconds,
+        'phema': phema.state() if phema is not None else None,
     }
     # write then rename, so a preemption mid-save can't corrupt the only checkpoint
     t_save = time.time()
@@ -1150,6 +1191,8 @@ while True:
     if eval_only:
         break
 
+    if phema is not None and iter_num > 0 and local_iter_num > 0 and (iter_num % phema_iters == 0 or iter_num == max_iters):
+        save_phema_snapshots()
     if iter_num > 0 and local_iter_num > 0 and (iter_num % save_iters == 0 or iter_num == max_iters or (keep_iters and iter_num % keep_iters == 0)):
         save_checkpoint()
         t0 = time.time() # don't count the save in the next iteration's timing
@@ -1215,6 +1258,8 @@ while True:
     # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
     denoiser.update_ema(iter_num)
+    if phema is not None:
+        phema.update(denoiser.parameters(), iter_num + 1) # t = optimizer steps taken, counting this one
 
     # timing and logging
     t1 = time.time()

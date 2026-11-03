@@ -106,8 +106,8 @@ logs on every restart. The final best goes to `runs/queue_logs/stack_best.txt`.
 
 | # | stage · step | change (on the best so far) | status | question / adoption |
 |---|---|---|---|---|
-| 6.1 | clip · `noclip_warmup1_learned` | `--grad_clip=0` | running: 109.0 @5 (best run 109.7); started in the earlier `in1k_128_clip.sh`, the stack reuses it | the learned weight clips every step in epochs 1–5 (51% after), the baselines 0% after epoch 1: is 5.1's gain the weight, or the clipping (a per-step gradient normalization)? Adopted if better |
-| 6.2 | arch · `stack_arch` | `--attn_res=full --adaln_single=True` (the agreed pair) | queued | the in100 wins (145.2 → 115.7 at 25k). The in1k recipe with them trained at 1488 vs 2069 img/s: check the per-hour cost too |
+| 6.1 | clip · `noclip_warmup1_learned` | `--grad_clip=0` | **done, adopted**: 109.00 / 91.55 / 81.93 / **75.90** @5/10/15/20 (vs 109.68 / 91.94 / 82.50 / 76.11 clipped); linear probe 4.82 (5.10), recall 0.405 (0.415); stable, no grad spikes | effectively a tie (0.2–0.7, within run-to-run noise): the learned weight's gain is real, not from clipping. Adopted: one knob fewer. Base for 6.2 on: warm-up 1 + learned + no clipping, bar 75.90 |
+| 6.2 | arch · `stack_arch` | `--attn_res=full --adaln_single=True` (the agreed pair) | **running** (started 2026-11-03 07:15) | the in100 wins (145.2 → 115.7 at 25k). The in1k recipe with them trained at 1488 vs 2069 img/s: check the per-hour cost too |
 | 6.3 | disp · `stack_disp_analysis` | `analyze_dispersion.py` on the current best (minutes) | queued | per block: how dispersed features already are, and the gradient share λ = 0.5 gives |
 | 6.4 | disp · `stack_disp_b{3,6,9,all}_10ep` | Dispersive Loss (InfoNCE-L2, λ 0.5, τ 0.5) at block 3 / 6 / 9 / all, 10 epochs | queued | best depth; JiT's built-in encoder may push it later than the paper's depth // 4 |
 | 6.5 | disp · `stack_disp_b{best}_20ep` | the screen's best, resumed to 20 epochs | queued | candidate for adoption |
