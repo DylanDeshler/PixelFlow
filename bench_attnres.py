@@ -93,8 +93,18 @@ configs = [('plain', {}, 1), ('adaln_single', dict(adaln_single=True), 1), ('att
 configs += [(f'full + adaln, chunk {k}', dict(attn_res='full', adaln_single=True), int(k)) for k in chunks.split(',') if k]
 configs += [('block + adaln', dict(attn_res='block', adaln_single=True), 1)]
 print(f"batch {batch_size} at {img_size}px, {dtype}, compile {compile}; {warmup} warm-up + {iters} timed steps")
-rows = [bench(*c) for c in configs]
-base = rows[0]
+fmt = lambda r, base: (f"{r['name']:<26} {r['ms']:>9.1f} {r['ips']:>8.0f} {r['ms'] / base['ms']:>8.2f}x {r['peak']:>8.1f} {r['micro']:>6}"
+                       if 'ms' in r else f"{r['name']:<26} failed: {r['error']}")
+rows = []
+for c in configs: # a config that fails (e.g. a compiler error) is reported and skipped; each result prints as it completes
+    try:
+        rows.append(bench(*c))
+    except Exception as e:
+        rows.append(dict(name=c[0], error=f'{type(e).__name__}: {str(e).splitlines()[0][:150] if str(e) else ""}'))
+        if device_type == 'cuda':
+            torch.cuda.empty_cache(); torch._dynamo.reset()
+    print('  -> ' + fmt(rows[-1], rows[0] if 'ms' in rows[0] else rows[-1]), flush=True)
+base = next(r for r in rows if 'ms' in r)
 print(f"\n{'config':<26} {'ms/step':>9} {'img/s':>8} {'vs plain':>9} {'peak GB':>8} {'micro':>6}")
 for r in rows:
-    print(f"{r['name']:<26} {r['ms']:>9.1f} {r['ips']:>8.0f} {r['ms'] / base['ms']:>8.2f}x {r['peak']:>8.1f} {r['micro']:>6}")
+    print(fmt(r, base))

@@ -619,26 +619,22 @@ class AttnResState:
             self.partial, self.count = None, 0
 
     def _mix_chunked(self, l):
-        # see the class docstring: one pass over the older sources per chunk of sublayers, then the chunk's own sources
+        # see the class docstring: one pass over the older sources per chunk of sublayers, then the chunk's own sources.
+        # Each partial mix is normalized over its own sources (softmax) and carries their logsumexp, so merging is
+        # h = (e^lse_old A + sum_new e^z v) / (e^lse_old + sum_new e^z), done as a softmax over [lse_old, z_new]
         pre, dt = self._pre, self.sources[0].dtype
         if pre is None or not (pre['start'] <= l < pre['start'] + len(pre['A'])):
             cols = list(range(l, min(l + self.chunk, self.logits[0].shape[-1])))
             z = torch.stack([c[..., cols] for c in self.logits]) # [S, B, T, k] fp32
-            m = z.amax(0)
-            w = (z - m).exp()
-            A = [sum(w[i, ..., j].unsqueeze(-1).to(dt) * v for i, v in enumerate(self.sources)) for j in range(len(cols))]
-            pre = self._pre = dict(start=l, n0=len(self.sources), A=A, s=w.sum(0), m=m)
+            alpha = z.softmax(0)
+            A = [sum(alpha[i, ..., j].unsqueeze(-1).to(dt) * v for i, v in enumerate(self.sources)) for j in range(len(cols))]
+            pre = self._pre = dict(start=l, n0=len(self.sources), A=A, lse=torch.logsumexp(z, 0))
         j = l - pre['start']
         new = self.sources[pre['n0']:]
         if not new:
-            return pre['A'][j] / pre['s'][..., j:j + 1].to(dt)
-        zn = torch.stack([self.logits[i][..., l] for i in range(pre['n0'], len(self.sources))]) # [r, B, T]
-        m = torch.maximum(pre['m'][..., j], zn.amax(0))
-        old = (pre['m'][..., j] - m).exp()
-        wn = (zn - m).exp()
-        s = pre['s'][..., j] * old + wn.sum(0)
-        h = pre['A'][j] * old.unsqueeze(-1).to(dt) + sum(wn[i].unsqueeze(-1).to(dt) * v for i, v in enumerate(new))
-        return h / s.unsqueeze(-1).to(dt)
+            return pre['A'][j]
+        w = torch.stack([pre['lse'][..., j]] + [self.logits[i][..., l] for i in range(pre['n0'], len(self.sources))]).softmax(0)
+        return w[0].unsqueeze(-1).to(dt) * pre['A'][j] + sum(w[i + 1].unsqueeze(-1).to(dt) * v for i, v in enumerate(new))
 
     def mix(self, l):
         if self.chunk > 1 and self.weights is None and self.partial is None and len(self.sources) > 1:
