@@ -36,10 +36,12 @@ DISP_KIND=infonce_l2n # scale-invariant (repa.dispersive_loss): plain infonce_l2
 DISP_POOL=mean # one vector per image: the unpooled normalized form saturated in ~600 steps through the input-noise shortcut (2026-11-03)
 DISP_ARGS="--disp_kind=$DISP_KIND --disp_pool=$DISP_POOL"
 ATTNRES_BLOCK_TOL=${ATTNRES_BLOCK_TOL:-0.5} # stage 5: FID-10k Block AttnRes may lose and still be adopted (about run-to-run noise)
-DISP_ARMS=${DISP_ARMS:-"8:0.5 8:0.1 8:0.1:32:l2s 8:0.5:32:l2s 8:0.05 8:0.01"} # block:weight[:group[:form]], in order (form: l2n, the
+DISP_ARMS=${DISP_ARMS:-"8:0.5 8:0.1 8:0.1:32:l2s all:0.1:32:l2s 8:0.05 8:0.01"} # block:weight[:group[:form]], in order (form: l2n, the
     # default, or l2s). Block 8: where probes peak (kNN 3.42 vs 2.24 at block 4, 1.06 at block 12). Weight 0.5 (the paper's) failed
     # (FID 90.87 @10, linear probe 5.68 -> 1.24), then 0.1. Then the paper's setting made scale-safe: batch-standardized InfoNCE-L2
-    # (scale- and translation-invariant) within groups of 32 (the paper's per-GPU batch), weight 0.1, then 0.5; then weaker
+    # (scale- and translation-invariant) within groups of 32 (the paper's per-GPU batch), weight 0.1 (FID 81.57 @10: re-routed,
+    # the dispersed mix leaned on block 6's attention output, 0.50, a dead end the other mixes ignore); then the same on all
+    # blocks (averaged: every mix must disperse, so the loss can't be routed around; the paper's best placement); then weaker
     # weights 0.05, 0.01 of the per-sample-normalized form on the whole batch
 BASE="config/jit_in1k_128.py --optimizer_type=muon --data_dir=$DATA"
 IMPL="--attn_res_chunk=8" # implementation only (same results, not in run names): full AttnRes mixed in chunks of 8, 1.38x -> 1.25x plain
@@ -121,7 +123,7 @@ for arm in $DISP_ARMS; do
 done
 if [ -n "$win" ]; then
     step "stack_disp3_b${win}_w${wlam}${wtag}_20ep" python train_jit.py $BASE $IMPL $BEST_ARGS --epochs=20 $DISP_ARGS $wargs --disp_weight=$wlam --disp_blocks=$win --init_from=resume
-    step "stack_disp3_balance${SHARE}_b${win}${wtag}" python train_jit.py $BASE $IMPL $BEST_ARGS --epochs=20 $DISP_ARGS $wargs --disp_balance=$SHARE --disp_blocks=$win
+    [ "$win" != all ] && step "stack_disp3_balance${SHARE}_b${win}${wtag}" python train_jit.py $BASE $IMPL $BEST_ARGS --epochs=20 $DISP_ARGS $wargs --disp_balance=$SHARE --disp_blocks=$win # (the balancer needs a single block)
     fw=$(last_fid "stack_disp3_b${win}_w${wlam}${wtag}_20ep"); fb=$(last_fid "stack_disp3_balance${SHARE}_b${win}${wtag}")
     if [ -n "$fb" ] && { [ -z "$fw" ] || lt "$fb" "$fw"; }; then
         adopt "stack_disp3_balance${SHARE}_b${win}${wtag}" "$DISP_ARGS $wargs --disp_balance=$SHARE --disp_blocks=$win"
