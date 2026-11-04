@@ -29,7 +29,9 @@ from contextlib import nullcontext
 from torchinfo import summary
 
 import numpy as np
+import warnings
 import torch
+warnings.filterwarnings('ignore', message=r'\s*Online softmax is disabled') # torch.compile's note that it skipped one softmax fusion: harmless, and printed for every compiled graph
 
 from data_jit import MemmapImages, EpochSampler, Prefetcher, to_model_input
 from jit_common import build_denoiser, resolve_arch, describe_arch, run_dir, legacy_run_dir, ema_state_dicts, ema_weights, generate_and_score, save_labeled_grid, save_layout_grids, save_geometry_grid, save_geometry_live, plot_geometry_vs_t, GAUSS_DEFAULTS
@@ -660,6 +662,8 @@ if phema_stds:
 
 trainable_params = [p for _, p in trainable if p.requires_grad]
 denoiser.net.attn_res_chunk = attn_res_chunk # (AttnRes models only; implementation, not architecture)
+if token_sizes:
+    denoiser.net.alloc.t_dist = (denoiser.P_mean, denoiser.P_std)
 if hasattr(denoiser.net, 'set_attn_impl'):
     denoiser.net.set_attn_impl(attn_impl)
 if compile:
@@ -861,6 +865,20 @@ def evaluate(step):
             probes = diag_lib.run_probes(tr, probe_train_y, va, probe_val_y, num_classes)
             timer.lap('probe fits')
     log['val/fid'], log['val/is'] = out['fid'], out['is']
+    if token_sizes and denoiser.net.alloc.ready():
+        # the same FID-10k with the allocation's other inference mode: each call fine with the training probability at its t (in
+        # distribution) instead of the top infer_frac of a uniform grid by gain (the in-loop default). Same noise and labels
+        alloc = denoiser.net.alloc
+        alloc.infer_mode, alloc.calls = 'train', [0, 0]
+        alloc.reset_rng(0)
+        with ema_weights(denoiser, 1):
+            out_tr = generate()
+        share = alloc.calls[1] / max(1, sum(alloc.calls))
+        alloc.infer_mode = 'rank'
+        log['alloc/fid10k_trainmatched'], log['alloc/fine_calls_trainmatched'] = out_tr['fid'], share
+        print(f"two token sizes, FID-{fid_num_images / 1000:g}k by inference mode: ranked (fine on the top {alloc.infer_frac:g} of t by gain) "
+              f"{out['fid']:.2f}; training-matched (fine with the training probability at each t, {share:.2f} of calls) {out_tr['fid']:.2f}", flush=True)
+        timer.lap('FID, training-matched allocation')
     if token_sizes and alloc_eval:
         # the allocation: matched per-size held-out loss, FID-N under fixed allocations (same noise and labels), sample rows
         a_log, a_images, _ = alloc_lib.evaluate_allocation(

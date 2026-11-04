@@ -33,7 +33,9 @@ import json
 from contextlib import nullcontext
 
 import numpy as np
+import warnings
 import torch
+warnings.filterwarnings('ignore', message=r'\s*Online softmax is disabled') # torch.compile's note that it skipped one softmax fusion: harmless, and printed for every compiled graph
 from PIL import Image
 
 from data_jit import MemmapImages
@@ -153,6 +155,8 @@ dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported
 compile = True
 attn_impl = 'sdpa' # attention kernel: 'sdpa' (torch's fused kernel, default) or 'jit' (JiT's explicit attention); see model_jit.JiT.set_attn_impl
 attn_res_chunk = 1 # full AttnRes models: mix in chunks of this many sublayers (same samples up to rounding, faster); 1 = off
+alloc_infer = 'rank' # two token sizes: 'rank' (fine on the top fine_frac of t by gain) or 'train' (each call fine with the training
+                    # probability at its t; fine_frac doesn't apply)
 fine_frac = -1.0 # two-token-size models (token_sizes): share of sampling calls on fine tokens, a compute knob; < 0 = the model's training share
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
@@ -187,6 +191,10 @@ if compile:
     # every sampling call has the same batch (fixed_shape below), so one static graph serves the whole evaluation
     denoiser.net.compile()
 denoiser.time_schedule = time_schedule
+if getattr(denoiser.net, 'token_sizes', ()):
+    denoiser.net.alloc.t_dist = (denoiser.P_mean, denoiser.P_std)
+    denoiser.net.alloc.infer_mode = alloc_infer
+    denoiser.net.alloc.reset_rng(0)
 if getattr(denoiser.net, 'token_sizes', ()) and fine_frac >= 0: # two-size model: the fine-token share of sampling calls
     denoiser.net.alloc.infer_frac = fine_frac
     print(f"fine tokens on ~{fine_frac:.2f} of sampling calls (training share {denoiser.net.alloc.fine_frac})")
@@ -339,7 +347,8 @@ with torch.no_grad(), ctx:
     x = denoiser.generate(torch.cat([labels, labels.new_zeros(grid_batch - 64)]))[:64]
 denoiser.fixed_shape = False
 tag = f"{final_num_images / 1000:g}k_{sampler}" + ('' if time_schedule == 'uniform' else f'_{time_schedule}') \
-      + ('' if ema == 1 else '_raw' if ema == 0 else f'_ema{ema}')
+      + ('' if ema == 1 else '_raw' if ema == 0 else f'_ema{ema}') \
+      + ('_alloctrain' if getattr(denoiser.net, 'token_sizes', ()) and alloc_infer == 'train' else '')
 save_labeled_grid(x, [class_names[i] for i in labels.tolist()], os.path.join(samples_dir, f'eval_samples_{tag}.png'))
 if is_quadtree: # the same grid with the token layouts drawn on
     save_layout_grids(denoiser.net, x, [class_names[i] for i in labels.tolist()], os.path.join(samples_dir, f'eval_samples_{tag}'), denoiser.net.router.history)

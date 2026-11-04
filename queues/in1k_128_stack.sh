@@ -156,7 +156,7 @@ fi
 #    per block on average, x1.34 FLOPs at 128px; the paper's count, though at 256px it was only +8% tokens) against two token
 #    sizes at the FLOP-matched fine share 0.11. The better is adopted if it beats the best (the per-image comparison between
 #    the two is the result; both logs print img/s)
-step stack_icl32 python train_jit.py $BASE $IMPL $BEST_ARGS --epochs=20 --in_context_len=32
+step stack_icl32 python train_jit.py $BASE $IMPL $BEST_ARGS --epochs=20 --in_context_len=32 --batch_size=512 --gradient_accumulation_steps=2 # (two halves per step: whole-batch 96-token activations exceed the GPU; the two-size arm splits its step in two by token size the same way)
 step stack_fine0.11 python train_jit.py $BASE $IMPL $BEST_ARGS --epochs=20 --token_sizes=16,8 --fine_frac=0.11
 fi=$(last_fid stack_icl32); ff=$(last_fid stack_fine0.11)
 echo "extra tokens at x1.34 FLOPs: in-context 32 -> FID-10k ${fi:-none} ($(ips "$(run_of stack_icl32)") img/s), fine 0.11 -> ${ff:-none} ($(ips "$(run_of stack_fine0.11)") img/s); best $BEST_FID"

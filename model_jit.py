@@ -737,15 +737,25 @@ class TokenAllocation(nn.Module):
         self.infer_frac = fine_frac
         self.fine_windows = None
         self.calls = [0, 0]
-        self.register_buffer('ema', torch.zeros(2, bins)) # running mean per-sample loss: [coarse, fine] x bins
-        self.register_buffer('count', torch.zeros(2, bins)) # samples seen per path and bin
+        # inference mode: 'rank' (fine on the top infer_frac of a uniform t grid by gain) or 'train' (each call fine with the
+        # probability a training sample at its t gets fine tokens: in distribution, the budget whatever that implies)
+        self.infer_mode = 'rank'
+        self.t_dist = (-0.8, 0.8) # the training t sampler's logit-normal (P_mean, P_std), set from the denoiser
+        self.gen = torch.Generator().manual_seed(0) # the 'train' mode's coins, apart from the sampling noise
+        self.register_buffer('ema', torch.zeros(2, bins)) # running mean per-sample loss: [coarse, fine] x bins (= wsum / wcount)
+        self.register_buffer('count', torch.zeros(2, bins)) # samples seen per path and bin, cumulative (coverage)
+        # decayed sums: every bin of a path decays on every update of that path, so a rarely visited bin's mean is of recent
+        # samples (a per-bin moving average that only moved when the bin got samples kept early training's losses in the
+        # sparse tails of the t sampler: gains of -26 and -212 at t ~ 0.84 / 0.89, fine_frac 0.11 at 5 epochs)
+        self.register_buffer('wsum', torch.zeros(2, bins))
+        self.register_buffer('wcount', torch.zeros(2, bins))
 
     def bin(self, t):
         lt = torch.logit(t.float().flatten().clamp(1e-6, 1 - 1e-6)).clamp(-self.logit_range, self.logit_range - 1e-6)
         return ((lt + self.logit_range) / (2 * self.logit_range) * self.bins).long()
 
     def valid(self):
-        return (self.count >= self.min_count).all(0) # [bins] both paths seen enough
+        return (self.wcount >= self.min_count).all(0) # [bins] both paths have enough recent samples
 
     def ready(self):
         # statistics cover the noise levels training visits: >= 99% of the samples fell in bins where both paths have
@@ -780,14 +790,50 @@ class TokenAllocation(nn.Module):
         b = self.bin(t)
         n = torch.zeros(self.bins, device=t.device).scatter_add_(0, b, torch.ones_like(loss, dtype=torch.float32))
         m = torch.zeros(self.bins, device=t.device).scatter_add_(0, b, loss.float()) / n.clamp_min(1)
-        new = self.count[path] == 0
-        self.ema[path] = torch.where(n > 0, torch.where(new, m, self.decay * self.ema[path] + (1 - self.decay) * m), self.ema[path])
+        self.wsum[path] = self.decay * self.wsum[path] + m * n
+        self.wcount[path] = self.decay * self.wcount[path] + n
+        self.ema[path] = torch.where(self.wcount[path] > 0, self.wsum[path] / self.wcount[path].clamp_min(1e-12), self.ema[path])
         self.count[path] += n
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        # checkpoints from before the decayed sums: start them from the old means, weighted as at most ~one window of samples
+        if prefix + 'ema' in state_dict and prefix + 'wsum' not in state_dict:
+            w = state_dict[prefix + 'count'].clamp(max=self.min_count / (1 - self.decay))
+            state_dict[prefix + 'wcount'] = w
+            state_dict[prefix + 'wsum'] = state_dict[prefix + 'ema'] * w
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
+    @torch.no_grad()
+    def train_share(self, t):
+        # P(fine | t) in training: the fixed quota k = fine_frac B drawn without replacement in proportion to the weights. With the
+        # Poisson approximation of that draw, a sample of weight w is in it with probability 1 - exp(-c w), c set so the expected
+        # share over the training t sampler is fine_frac (checked against a Monte Carlo of the draw in tests)
+        n = 2001
+        lt = torch.linspace(-self.logit_range, self.logit_range, n, device=self.ema.device)
+        pm, ps = self.t_dist
+        dens = torch.exp(-0.5 * ((lt - pm) / ps) ** 2); dens = dens / dens.sum() # logit-normal, on its logit grid
+        w = self.weights(torch.sigmoid(lt))
+        lo, hi = 0.0, 1e6 / float(w.mean().clamp_min(1e-12))
+        for _ in range(60): # bisection on c
+            c = (lo + hi) / 2
+            lo, hi = (c, hi) if float((dens * (1 - torch.exp(-c * w))).sum()) < self.fine_frac else (lo, c)
+        return 1 - torch.exp(-c * self.weights(t.flatten().float()))
+
+    def reset_rng(self, seed=0):
+        self.gen.manual_seed(seed)
 
     @torch.compiler.disable
     def fine_mask(self, t):
         # inference: which samples get fine tokens, from their t ([B] bool)
         t = t.flatten().float()
+        if self.infer_mode == 'train' and self.fine_windows is None and self.ready():
+            # one coin per distinct t (a sampling call: every sample shares it), with the training probability at that t
+            p = self.train_share(t).cpu()
+            u = torch.rand(len(t), generator=self.gen) if bool((t != t[0]).any()) else torch.rand(1, generator=self.gen).expand(len(t))
+            m = (u < p).to(t.device)
+            k = int(m.sum())
+            self.calls[0] += len(m) - k; self.calls[1] += k
+            return m
         if self.fine_windows is not None:
             m = torch.zeros_like(t, dtype=torch.bool)
             for lo, hi in self.fine_windows:

@@ -18,7 +18,9 @@ import os
 import time
 from contextlib import nullcontext
 
+import warnings
 import torch
+warnings.filterwarnings('ignore', message=r'\s*Online softmax is disabled') # torch.compile's note that it skipped one softmax fusion: harmless, and printed for every compiled graph
 
 from jit_common import resolve_arch, build_denoiser
 from masking import flow_loss

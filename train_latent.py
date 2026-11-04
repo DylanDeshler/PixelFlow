@@ -39,7 +39,9 @@ from contextlib import nullcontext, contextmanager
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
+import warnings
 import torch
+warnings.filterwarnings('ignore', message=r'\s*Online softmax is disabled') # torch.compile's note that it skipped one softmax fusion: harmless, and printed for every compiled graph
 
 from data_jit import MemmapImages, EpochSampler
 from jit_common import generate_and_score

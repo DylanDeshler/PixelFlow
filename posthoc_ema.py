@@ -20,7 +20,9 @@ import json
 from contextlib import nullcontext
 
 import numpy as np
+import warnings
 import torch
+warnings.filterwarnings('ignore', message=r'\s*Online softmax is disabled') # torch.compile's note that it skipped one softmax fusion: harmless, and printed for every compiled graph
 
 from jit_common import build_denoiser, generate_and_score
 from fid import InceptionMetrics, load_ref_stats
