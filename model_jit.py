@@ -1276,9 +1276,11 @@ class JiT(nn.Module):
     def routed_forward(self, x, t, y, m):
         # a batch with samples on both token sizes (eval passes with mixed t): two sub-forwards, eager, since their sizes
         # change from batch to batch (sampling calls share one t and never get here)
-        out = torch.empty_like(x)
-        out[m] = self.forward(x[m], t[m], y[m], patch=self.fine_patch)
-        out[~m] = self.forward(x[~m], t[~m], y[~m], patch=self.patch_size)
+        fine = self.forward(x[m], t[m], y[m], patch=self.fine_patch)
+        coarse = self.forward(x[~m], t[~m], y[~m], patch=self.patch_size)
+        out = fine.new_empty((x.shape[0], *fine.shape[1:])) # in the sub-forwards' dtype (bfloat16 under autocast, not x's float32)
+        out[m] = fine
+        out[~m] = coarse.to(fine.dtype)
         return out
 
     def set_attn_impl(self, impl):
