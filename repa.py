@@ -231,12 +231,21 @@ def dispersive_loss(hidden, tau=0.5, kind='infonce_l2', margin=1.0, pool='none',
     """
     if group and hidden.shape[0] > group:
         n = hidden.shape[0] // group * group # (a remainder smaller than a group is left out)
-        if kind == 'infonce_l2s': # standardize with the whole batch's statistics (a stable scale), then compare pairs within groups
+        if kind in ('infonce_l2', 'infonce_l2n', 'infonce_l2s'):
+            # all groups at once, as one batched computation (a Python loop over groups launched hundreds of small kernels per
+            # step: all-blocks dispersion ran at 1200 instead of ~1800 img/s); the same values as computing each group alone
             with torch.autocast(device_type=hidden.device.type, enabled=False):
                 z = hidden.float().mean(1) if pool == 'mean' else hidden.float().flatten(1)
-                z = z - z.mean(0, keepdim=True)
-                z = z * torch.rsqrt(z.pow(2).mean() + 1e-12)
-            return torch.stack([dispersive_loss(z[i:i + group], tau, 'infonce_l2') for i in range(0, n, group)]).mean()
+                if kind == 'infonce_l2n':
+                    z = z * torch.rsqrt(z.pow(2).mean(1, keepdim=True) + 1e-12) # unit RMS per sample
+                if kind == 'infonce_l2s': # standardized with the whole batch's statistics (a stable scale)
+                    z = z - z.mean(0, keepdim=True)
+                    z = z * torch.rsqrt(z.pow(2).mean() + 1e-12)
+                zg = z[:n].view(n // group, group, -1) # [groups, g, d]
+                sq = zg.pow(2).sum(-1)
+                off = 1 - torch.eye(group, device=z.device)
+                D = (sq[:, :, None] + sq[:, None, :] - 2 * zg @ zg.transpose(1, 2)).clamp_min(0) / zg.shape[-1] * off
+                return (torch.logsumexp(-D.flatten(1) / tau, dim=1) - math.log(group * group)).mean()
         return torch.stack([dispersive_loss(hidden[i:i + group], tau, kind, margin, pool) for i in range(0, n, group)]).mean()
     with torch.autocast(device_type=hidden.device.type, enabled=False):
         z = hidden.float().mean(1) if pool == 'mean' else hidden.float().flatten(1)
