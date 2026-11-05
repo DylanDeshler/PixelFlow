@@ -243,7 +243,8 @@ function chart(svg, series, xlabel, ylabel, line, labels) {
 }
 function showTip(ev, r, e) {
   const t = $('tip');
-  t.innerHTML = `<b>${r.label}</b><br>epoch ${fmt(e.epoch, 1)} &middot; ${fmt(e.images, 1)}M images` + (e.pflops != null ? ` &middot; ${fmt(e.pflops, 0)} PFLOPs` : '') +
+  const mark = `<svg width="14" height="14" style="vertical-align:-2px;margin-right:5px"><path d="${markerPath(r.marker, 7, 7, 5)}" fill="${r.color}"/></svg>`;
+  t.innerHTML = `${mark}<b>${r.label}</b><br><span class="muted">${r.path}</span><br>epoch ${fmt(e.epoch, 1)} &middot; ${fmt(e.images, 1)}M images` + (e.pflops != null ? ` &middot; ${fmt(e.pflops, 0)} PFLOPs` : '') +
     `<br>FID ${fmt(e.fid)}` + (e.is != null ? ` &middot; IS ${fmt(e.is)}` : '') + (e.precision != null ? ` &middot; precision ${fmt(e.precision, 3)} &middot; recall ${fmt(e.recall, 3)}` : '') +
     `<br><span class="muted">${r.params ? (r.params / 1e6).toFixed(2) + 'M params' : 'params ?'} &middot; ${r.gflops ? r.gflops.toFixed(2) + ' GFLOP/img fwd' : 'FLOPs ?'}${r.ips ? ' &middot; ' + r.ips + ' img/s' : ''}</span>`;
   t.style.display = 'block';
