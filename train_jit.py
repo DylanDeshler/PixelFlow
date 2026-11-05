@@ -153,8 +153,12 @@ tail_blocks = 0 # > 0: a Perceiver tail of this many cross-attention blocks, add
 tail_query_patch = 4 # pixels per query side (divides patch_size): (img_size / tail_query_patch)^2 queries
 tail_dim = 256 # the queries' width (keys / values projected down from hidden_size)
 tail_heads = 0 # 0 -> tail_dim / 64
+tail_head_dim = 0 # per-head width; 0 -> tail_dim / tail_heads. Set it to add heads without widening the queries (attention inner
+                  # width = tail_heads x tail_head_dim; keys / values come from the 64 trunk tokens, so heads are cheap)
 tail_keys = 'shared' # 'shared': the tail reads the final layer's tokens (with full AttnRes, its depth mix); 'own': each tail block
                      # reads its own learned depth mix of the trunk (needs attn_res='full'), so it needn't share the final layer's
+tail_query_pos = 'sincos' # the queries' position tokens: 'sincos' (fixed), 'learned' (an independent trainable token per query,
+                          # normal(0.02) init) or 'learned_sincos' (trainable, initialized from the sin-cos table)
 tail_mlp_ratio = 4.0 # the tail blocks' SwiGLU width (x tail_dim); 0 = attention only (the MLP is ~3/4 of the tail's FLOPs)
 tail_checkpoint = False # run the tail's queries in tail_chunks chunks, each recomputed in the backward, instead of keeping their
                         # activations (implementation only: same result and run name; a 4px tail at width 256 keeps ~12 GB per block
@@ -376,8 +380,9 @@ model_name, arch = resolve_arch(model, **{k: (None if v < 0 else v) for k, v in 
     **({k: v for k, v in GAUSS_FLAGS.items() if v != GAUSS_DEFAULTS[k]} if is_gauss else {}),
     **(dict(token_sizes=token_sizes, fine_frac=fine_frac, alloc_floor=alloc_floor, alloc_gain=alloc_gain) if token_sizes else {}),
     **(dict(tail_blocks=tail_blocks, tail_query_patch=tail_query_patch if tail_query_patch != 4 else None, tail_dim=tail_dim if tail_dim != 256 else None,
-            tail_heads=tail_heads or None, tail_mlp_ratio=tail_mlp_ratio if tail_mlp_ratio != 4.0 else None,
-            tail_keys=tail_keys if tail_keys != 'shared' else None) if tail_blocks > 0 else {}),
+            tail_heads=tail_heads or None, tail_head_dim=tail_head_dim or None, tail_mlp_ratio=tail_mlp_ratio if tail_mlp_ratio != 4.0 else None,
+            tail_keys=tail_keys if tail_keys != 'shared' else None,
+            tail_query_pos=tail_query_pos if tail_query_pos != 'sincos' else None) if tail_blocks > 0 else {}),
     attn_res=None if attn_res == 'none' else attn_res,
     attn_res_block_size=attn_res_block_size if (attn_res == 'block' and attn_res_block_size > 0) else None,
     adaln_single=adaln_single or None, attn_res_adaln=attn_res_adaln or None, gated_bottleneck=gated_bottleneck or None,

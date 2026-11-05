@@ -453,15 +453,18 @@ class TailBlock(nn.Module):
     SwiGLU MLP (mlp_ratio 0: none, attention only); adaLN-Zero from the conditioning (shift / scale / gate per branch, zero at init). Keys and values are
     projected from the trunk tokens (normalized once by the tail), queries live at the tail's own width.
     """
-    def __init__(self, dim, kv_dim, num_heads, cond_dim, mlp_ratio=4.0, layernorm=False):
+    def __init__(self, dim, kv_dim, num_heads, cond_dim, mlp_ratio=4.0, layernorm=False, head_dim=0):
+        # head_dim: per-head width (0 = dim / num_heads); the attention's inner width num_heads x head_dim can exceed dim,
+        # so heads can be added without widening the queries (keys / values come from the 64 trunk tokens: cheap)
         super().__init__()
         self.num_heads = num_heads
-        head_dim = dim // num_heads
+        self.head_dim = head_dim = head_dim or dim // num_heads
+        inner = num_heads * head_dim
         self.norm1 = make_norm(dim, layernorm)
-        self.q = nn.Linear(dim, dim, bias=True)
-        self.kv = nn.Linear(kv_dim, 2 * dim, bias=True)
+        self.q = nn.Linear(dim, inner, bias=True)
+        self.kv = nn.Linear(kv_dim, 2 * inner, bias=True)
         self.q_norm, self.k_norm = make_norm(head_dim, layernorm), make_norm(head_dim, layernorm)
-        self.proj = nn.Linear(dim, dim)
+        self.proj = nn.Linear(inner, dim)
         self.has_mlp = mlp_ratio > 0
         if self.has_mlp:
             self.norm2 = make_norm(dim, layernorm)
@@ -475,23 +478,23 @@ class TailBlock(nn.Module):
     def keys(self, kv, rope_k):
         # keys and values from the (normalized) trunk tokens, [B, H, K, head_dim] each: once per forward, shared by every chunk
         B, K, _ = kv.shape
-        H, D = self.num_heads, self.proj.in_features
-        k, v = self.kv(kv).reshape(B, K, 2, H, D // H).permute(2, 0, 3, 1, 4)
+        H, hd = self.num_heads, self.head_dim
+        k, v = self.kv(kv).reshape(B, K, 2, H, hd).permute(2, 0, 3, 1, 4)
         return rope_k(self.k_norm(k)), v
 
     def forward(self, x, k, v, mod, cos, sin, stats=None, masks=None):
         # x: queries [B, Q, dim] (all of them or one chunk); cos / sin: the queries' RoPE rows; masks: their [Q, K] rows
         B, Q, D = x.shape
-        H = self.num_heads
+        H, hd = self.num_heads, self.head_dim
         mod = [m.to(x.dtype) for m in mod]
         shift1, scale1, gate1 = mod[:3]
-        q = self.q_norm(self.q(modulate(self.norm1(x), shift1, scale1)).reshape(B, Q, H, D // H).transpose(1, 2))
+        q = self.q_norm(self.q(modulate(self.norm1(x), shift1, scale1)).reshape(B, Q, H, hd).transpose(1, 2))
         q = q * cos + rotate_half(q) * sin
         if stats is not None: # diagnostics (eager): attention mass on the query's own token and its 3x3 token neighbourhood
-            w = torch.softmax(q.float() @ k.float().transpose(-1, -2) * (D // H) ** -0.5, dim=-1) # [B, H, Q, K]
+            w = torch.softmax(q.float() @ k.float().transpose(-1, -2) * hd ** -0.5, dim=-1) # [B, H, Q, K]
             own, near = masks
             stats.append(((w * own).sum(-1).mean().item(), (w * near).sum(-1).mean().item()))
-        a = F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(B, Q, D)
+        a = F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(B, Q, H * hd)
         x = x + gate1.unsqueeze(1) * self.proj(a)
         if self.has_mlp:
             shift2, scale2, gate2 = mod[3:]
@@ -510,7 +513,9 @@ class PerceiverTail(nn.Module):
     prediction made from it), never the noisy input; it is trained end to end with everything else.
     """
     def __init__(self, input_size, patch_size, query_patch, dim, num_blocks, num_heads, hidden_size, out_channels,
-                 mlp_ratio=4.0, layernorm=False, keys='shared', prefix=0):
+                 mlp_ratio=4.0, layernorm=False, keys='shared', prefix=0, head_dim=0, query_pos='sincos'):
+        # query_pos: each query's position token, added to its x_lin embedding: 'sincos' (fixed table), 'learned' (an
+        # independent trainable token per query, normal(0.02) init) or 'learned_sincos' (trainable, initialized from sin-cos)
         # mlp_ratio: the tail blocks' SwiGLU width (x dim); 0 = attention only (most of the tail's FLOPs are its MLP).
         # keys: 'shared' (every block reads the tokens the final layer reads: with full AttnRes, the final layer's depth mix)
         # or 'own' (full AttnRes only: each block builds its keys / values from its own depth mix of the trunk, a zero-
@@ -518,13 +523,20 @@ class PerceiverTail(nn.Module):
         # prefix: in-context tokens at the front of the trunk's sources (dropped from the keys)
         super().__init__()
         assert patch_size % query_patch == 0, f'tail_query_patch ({query_patch}) must divide patch_size ({patch_size})'
-        assert dim % num_heads == 0 and (dim // num_heads) % 4 == 0, f'tail_dim {dim} / tail_heads {num_heads}: head dim must be a multiple of 4 (2D RoPE)'
+        hd = head_dim or dim // num_heads
+        assert (head_dim or dim % num_heads == 0) and hd % 4 == 0, f'tail_dim {dim}, tail_heads {num_heads}, tail_head_dim {head_dim}: head dim must be a multiple of 4 (2D RoPE)'
         self.qp, self.out_channels = query_patch, out_channels
         nq, nk = input_size // query_patch, input_size // patch_size
         q_coords = token_coords(nq, query_patch, patch_size) # in token units, centred on their pixels
-        self.register_buffer('pos', torch.from_numpy(sincos_at(dim, q_coords)).float().unsqueeze(0), persistent=False)
-        self.rope_q = RopeAt(dim // num_heads // 2, q_coords)
-        self.rope_k = RopeAt(dim // num_heads // 2, np.arange(nk, dtype=np.float64))
+        assert query_pos in ('sincos', 'learned', 'learned_sincos'), f"tail_query_pos must be sincos, learned or learned_sincos, got {query_pos}"
+        self.query_pos = query_pos
+        table = torch.from_numpy(sincos_at(dim, q_coords)).float().unsqueeze(0) # [1, Q, dim]
+        if query_pos == 'sincos':
+            self.register_buffer('pos', table, persistent=False)
+        else: # one token per query position, not shared (initialized in zero_init, after JiT's weight init)
+            self.pos = nn.Parameter(table.clone())
+        self.rope_q = RopeAt(hd // 2, q_coords)
+        self.rope_k = RopeAt(hd // 2, np.arange(nk, dtype=np.float64))
         self.embed = nn.Linear(query_patch * query_patch * out_channels, dim, bias=True)
         self.kv_norm = make_norm(hidden_size, layernorm)
         assert keys in ('shared', 'own'), f"tail_keys must be shared or own, got {keys}"
@@ -533,7 +545,7 @@ class PerceiverTail(nn.Module):
             self.key_queries = nn.ParameterList([nn.Parameter(torch.zeros(hidden_size)) for _ in range(num_blocks)])
             self.key_mix_norms = nn.ModuleList([make_norm(hidden_size, layernorm) for _ in range(num_blocks)])
         self.mix_record = None # diagnostics: a list -> each block's depth-mix weights (keys 'own')
-        self.blocks = nn.ModuleList([TailBlock(dim, hidden_size, num_heads, hidden_size, mlp_ratio, layernorm) for _ in range(num_blocks)])
+        self.blocks = nn.ModuleList([TailBlock(dim, hidden_size, num_heads, hidden_size, mlp_ratio, layernorm, head_dim) for _ in range(num_blocks)])
         self.norm_final = make_norm(dim, layernorm)
         self.final_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * dim, bias=True))
         self.out = nn.Linear(dim, query_patch * query_patch * out_channels, bias=True)
@@ -550,7 +562,10 @@ class PerceiverTail(nn.Module):
         self.chunks = 8
 
     def zero_init(self):
-        # adaLN-Zero gates and a zero output layer: the tail adds exactly 0 at init
+        # adaLN-Zero gates and a zero output layer: the tail adds exactly 0 at init. Learned query positions get their
+        # init here too (JiT's initialize_weights only touches Linear layers)
+        if self.query_pos == 'learned':
+            nn.init.normal_(self.pos, std=0.02)
         for b in self.blocks:
             nn.init.constant_(b.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(b.adaLN_modulation[-1].bias, 0)
@@ -1082,6 +1097,8 @@ class JiT(nn.Module):
         tail_heads=0,
         tail_mlp_ratio=4.0,
         tail_keys='shared',
+        tail_head_dim=0,
+        tail_query_pos='sincos',
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -1243,7 +1260,8 @@ class JiT(nn.Module):
             assert not (skip_pathway or dcae_head or dcae_trunk_head or patch_overlap or head_overlap or token_sizes), \
                 'tail_blocks: no skip pathway, DC-AE head, overlap or token_sizes'
             self.tail = PerceiverTail(input_size, patch_size, tail_query_patch, tail_dim, tail_blocks, tail_heads or max(1, tail_dim // 64),
-                                      hidden_size, self.out_channels, tail_mlp_ratio, layernorm, tail_keys, in_context_len)
+                                      hidden_size, self.out_channels, tail_mlp_ratio, layernorm, tail_keys, in_context_len, tail_head_dim,
+                                      tail_query_pos)
             assert tail_keys == 'shared' or attn_res == 'full', "tail_keys='own' needs attn_res='full' (a depth mix of the trunk's sources)"
         if dcae_trunk_head:
             self.trunk_output_head = DCAEHead(self.out_channels, patch_size, dcae_width, dcae_kernel2, hidden_size, layernorm, dcae_norm)
