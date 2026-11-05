@@ -100,18 +100,18 @@ def describe_arch(model, arch):
                   dcae_kernel2=1, patch_overlap=0, head_overlap=0, layernorm=False, skip_final_layer=False, skip_residual=False, dcae_trunk_head=False, gate_init='zero', dcae_norm='channel',
                   skip_decoder='linear', skip_decoder_dim=0, skip_decoder_blocks=2, skip_decoder_rank=0, skip_decoder_conv=False, skip_decoder_attnres=False,
                   skip_decoder_modulation=True, token_sizes='', fine_frac=0.25, alloc_floor=0.1, alloc_gain='rel',
-                  tail_blocks=0, tail_query_patch=4, tail_dim=256, tail_heads=0)
+                  tail_blocks=0, tail_query_patch=4, tail_dim=256, tail_heads=0, tail_mlp_ratio=4.0, tail_keys='shared')
     full = dict(preset, **arch)
     parts = []
     for k in ('depth', 'hidden_size', 'num_heads', 'patch_size', 'layernorm', 'bottleneck_dim', 'gated_bottleneck', 'patch_overlap', 'head_overlap', 'dcae_stem', 'dcae_head', 'dcae_trunk_head', 'dcae_norm', 'dcae_width', 'dcae_kernel2',
               'skip_pathway', 'skip_decoder', 'skip_decoder_dim', 'skip_decoder_blocks', 'skip_decoder_rank', 'skip_decoder_conv', 'skip_decoder_attnres',
               'skip_decoder_modulation', 'skip_head_blocks', 'skip_inject_block', 'skip_final_layer', 'skip_residual', 'mlp_ratio', 'in_context_len', 'in_context_start',
               'attn_res', 'attn_res_block_size', 'attn_res_adaln', 'adaln_single', 'gate_init', 'token_sizes', 'fine_frac', 'alloc_floor', 'alloc_gain',
-              'tail_blocks', 'tail_query_patch', 'tail_dim', 'tail_heads'):
+              'tail_blocks', 'tail_query_patch', 'tail_dim', 'tail_heads', 'tail_mlp_ratio', 'tail_keys'):
         v = full[k]
         if k in ('token_sizes', 'fine_frac', 'alloc_floor', 'alloc_gain') and not full['token_sizes']:
             continue
-        if k in ('tail_query_patch', 'tail_dim', 'tail_heads') and not full['tail_blocks']:
+        if k in ('tail_query_patch', 'tail_dim', 'tail_heads', 'tail_mlp_ratio', 'tail_keys') and not full['tail_blocks']:
             continue
         if k == 'in_context_start' and full['in_context_len'] == 0:
             continue # unused without in-context tokens
@@ -590,7 +590,7 @@ _ARCH_SHORT = {'depth': 'd', 'hidden_size': 'w', 'num_heads': 'h', 'patch_size':
 _NAME_TOKENS = {
     'optimizer_type': '', 'muon_adjust_lr': 'muon-', 'muon_lr': 'muonlr', 'muon_weight_decay': 'muonwd',
     'muon_momentum': 'muonmom', 'muon_ns_steps': 'muonns', 'muon_split_fused': 'muonsplit', 'muon_adaln': 'muonadaln',
-    'noise_scale': 'noise', 'P_mean': 'pmean', 'token_sizes': 'tok-', 'fine_frac': 'fine', 'alloc_floor': 'allocfloor', 'alloc_gain': 'allocgain-', 'tail_blocks': 'tail', 'tail_query_patch': 'tailq', 'tail_dim': 'taildim', 'tail_heads': 'tailheads', 'loss_freq_weight': 'lossf-', 'loss_freq_table': 'lossftable-', 'loss_t_weight': 'losst-', 'loss_weight_normalize': 'lossnorm', 'P_std': 'pstd', 't_eps': 'teps', 'label_drop_prob': 'labeldrop',
+    'noise_scale': 'noise', 'P_mean': 'pmean', 'token_sizes': 'tok-', 'fine_frac': 'fine', 'alloc_floor': 'allocfloor', 'alloc_gain': 'allocgain-', 'tail_blocks': 'tail', 'tail_query_patch': 'tailq', 'tail_dim': 'taildim', 'tail_heads': 'tailheads', 'tail_mlp_ratio': 'tailmlp', 'tail_keys': 'tailkeys-', 'loss_freq_weight': 'lossf-', 'loss_freq_table': 'lossftable-', 'loss_t_weight': 'losst-', 'loss_weight_normalize': 'lossnorm', 'P_std': 'pstd', 't_eps': 'teps', 'label_drop_prob': 'labeldrop',
     'blr': 'blr', 'lr_schedule': 'lr-', 'min_lr': 'minlr', 'warmup_epochs': 'warmup', 'weight_decay': 'wd',
     'beta1': 'beta1-', 'beta2': 'beta2-', 'grad_clip': 'clip', 'ema_decay1': 'ema', 'ema_decay2': 'ema2-', 'ema_warmup': 'emawarmup',
     'attn_dropout': 'attndrop', 'proj_dropout': 'projdrop', 'attn_res': 'attnres-', 'attn_res_block_size': 'attnresbs',

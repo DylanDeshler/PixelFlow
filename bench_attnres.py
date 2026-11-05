@@ -36,6 +36,8 @@ tails = '' # Perceiver tail block counts to add as rows (e.g. '1,2'), with tail_
 tail_query_patch = 4
 tail_dim = 256
 tail_heads = 0 # 0 -> tail_dim / 64, as train_jit.py
+tail_mlp_ratio = 4.0 # 0 = attention-only tail
+tail_keys = 'shared'
 only_tails = False # run only the --tails rows (the stage-2 model + tail), not the AttnRes comparison
 tail_checkpoint = False # as train_jit.py: the tail's queries in chunks, recomputed in the backward
 tail_chunks = 8
@@ -111,7 +113,7 @@ configs = [('plain', {}, 1), ('adaln_single', dict(adaln_single=True), 1), ('att
 configs += [(f'full + adaln, chunk {k}', dict(attn_res='full', adaln_single=True), int(k)) for k in chunks.split(',') if k]
 configs += [('block + adaln', dict(attn_res='block', adaln_single=True), 1)]
 configs += [(f'full + adaln, c8 + tail {n}', dict(attn_res='full', adaln_single=True, tail_blocks=int(n), tail_query_patch=tail_query_patch,
-                                                   tail_dim=tail_dim, tail_heads=tail_heads or None), 8) for n in tails.split(',') if n]
+                                                   tail_dim=tail_dim, tail_heads=tail_heads or None, tail_mlp_ratio=tail_mlp_ratio, tail_keys=tail_keys), 8) for n in tails.split(',') if n]
 if only_tails:
     configs = [c for c in configs if 'tail' in c[0]]
     assert configs, 'only_tails: pass --tails (e.g. --tails=2)'

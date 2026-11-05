@@ -450,7 +450,7 @@ class FinalLayer(nn.Module):
 class TailBlock(nn.Module):
     """
     One block of the Perceiver tail: the queries cross-attend to the trunk's tokens (no query-query attention), then a
-    SwiGLU MLP; adaLN-Zero from the conditioning (shift / scale / gate per branch, zero at init). Keys and values are
+    SwiGLU MLP (mlp_ratio 0: none, attention only); adaLN-Zero from the conditioning (shift / scale / gate per branch, zero at init). Keys and values are
     projected from the trunk tokens (normalized once by the tail), queries live at the tail's own width.
     """
     def __init__(self, dim, kv_dim, num_heads, cond_dim, mlp_ratio=4.0, layernorm=False):
@@ -462,13 +462,15 @@ class TailBlock(nn.Module):
         self.kv = nn.Linear(kv_dim, 2 * dim, bias=True)
         self.q_norm, self.k_norm = make_norm(head_dim, layernorm), make_norm(head_dim, layernorm)
         self.proj = nn.Linear(dim, dim)
-        self.norm2 = make_norm(dim, layernorm)
-        self.mlp = SwiGLUFFN(dim, int(dim * mlp_ratio))
-        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(cond_dim, 6 * dim, bias=True))
+        self.has_mlp = mlp_ratio > 0
+        if self.has_mlp:
+            self.norm2 = make_norm(dim, layernorm)
+            self.mlp = SwiGLUFFN(dim, int(dim * mlp_ratio))
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(cond_dim, (6 if self.has_mlp else 3) * dim, bias=True))
 
     def modulation(self, c):
         # the six adaLN vectors [B, dim] (computed once per forward, shared by every query chunk)
-        return self.adaLN_modulation(c).chunk(6, dim=1)
+        return self.adaLN_modulation(c).chunk(6 if self.has_mlp else 3, dim=1)
 
     def keys(self, kv, rope_k):
         # keys and values from the (normalized) trunk tokens, [B, H, K, head_dim] each: once per forward, shared by every chunk
@@ -481,7 +483,8 @@ class TailBlock(nn.Module):
         # x: queries [B, Q, dim] (all of them or one chunk); cos / sin: the queries' RoPE rows; masks: their [Q, K] rows
         B, Q, D = x.shape
         H = self.num_heads
-        shift1, scale1, gate1, shift2, scale2, gate2 = (m.to(x.dtype) for m in mod)
+        mod = [m.to(x.dtype) for m in mod]
+        shift1, scale1, gate1 = mod[:3]
         q = self.q_norm(self.q(modulate(self.norm1(x), shift1, scale1)).reshape(B, Q, H, D // H).transpose(1, 2))
         q = q * cos + rotate_half(q) * sin
         if stats is not None: # diagnostics (eager): attention mass on the query's own token and its 3x3 token neighbourhood
@@ -490,7 +493,9 @@ class TailBlock(nn.Module):
             stats.append(((w * own).sum(-1).mean().item(), (w * near).sum(-1).mean().item()))
         a = F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(B, Q, D)
         x = x + gate1.unsqueeze(1) * self.proj(a)
-        x = x + gate2.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift2, scale2))
+        if self.has_mlp:
+            shift2, scale2, gate2 = mod[3:]
+            x = x + gate2.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift2, scale2))
         return x
 
 
@@ -505,7 +510,12 @@ class PerceiverTail(nn.Module):
     prediction made from it), never the noisy input; it is trained end to end with everything else.
     """
     def __init__(self, input_size, patch_size, query_patch, dim, num_blocks, num_heads, hidden_size, out_channels,
-                 mlp_ratio=4.0, layernorm=False):
+                 mlp_ratio=4.0, layernorm=False, keys='shared', prefix=0):
+        # mlp_ratio: the tail blocks' SwiGLU width (x dim); 0 = attention only (most of the tail's FLOPs are its MLP).
+        # keys: 'shared' (every block reads the tokens the final layer reads: with full AttnRes, the final layer's depth mix)
+        # or 'own' (full AttnRes only: each block builds its keys / values from its own depth mix of the trunk, a zero-
+        # initialized query (uniform over depths at init) + key norm, so it needn't share the final layer's choice of depths).
+        # prefix: in-context tokens at the front of the trunk's sources (dropped from the keys)
         super().__init__()
         assert patch_size % query_patch == 0, f'tail_query_patch ({query_patch}) must divide patch_size ({patch_size})'
         assert dim % num_heads == 0 and (dim // num_heads) % 4 == 0, f'tail_dim {dim} / tail_heads {num_heads}: head dim must be a multiple of 4 (2D RoPE)'
@@ -517,6 +527,12 @@ class PerceiverTail(nn.Module):
         self.rope_k = RopeAt(dim // num_heads // 2, np.arange(nk, dtype=np.float64))
         self.embed = nn.Linear(query_patch * query_patch * out_channels, dim, bias=True)
         self.kv_norm = make_norm(hidden_size, layernorm)
+        assert keys in ('shared', 'own'), f"tail_keys must be shared or own, got {keys}"
+        self.keys_mode, self.prefix = keys, prefix
+        if keys == 'own':
+            self.key_queries = nn.ParameterList([nn.Parameter(torch.zeros(hidden_size)) for _ in range(num_blocks)])
+            self.key_mix_norms = nn.ModuleList([make_norm(hidden_size, layernorm) for _ in range(num_blocks)])
+        self.mix_record = None # diagnostics: a list -> each block's depth-mix weights (keys 'own')
         self.blocks = nn.ModuleList([TailBlock(dim, hidden_size, num_heads, hidden_size, mlp_ratio, layernorm) for _ in range(num_blocks)])
         self.norm_final = make_norm(dim, layernorm)
         self.final_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * dim, bias=True))
@@ -561,15 +577,22 @@ class PerceiverTail(nn.Module):
         shift, scale = (m.to(q.dtype) for m in final_mod)
         return self.out(modulate(self.norm_final(q), shift, scale))
 
-    def forward(self, tokens, x_lin, c):
+    def forward(self, tokens, x_lin, c, res=None):
         # tokens: the trunk's output tokens (what the final layer reads) [N, L, hidden]; x_lin: the final layer's image.
         # Queries never attend to each other, so given the keys / values (computed once) each query's path is independent:
         # with checkpoint, the queries run in `chunks` chunks, each recomputed in the backward, so only one chunk's
         # activations are ever alive (checkpointing whole blocks would bring a full block's back at the start of the backward,
         # on top of the trunk's). Same result either way.
         xp = self.patchify(x_lin)
-        kv = self.kv_norm(tokens)
-        keys = [b.keys(kv, self.rope_k) for b in self.blocks]
+        if self.keys_mode == 'own':
+            assert res is not None, "tail_keys='own' needs the AttnRes state"
+            mixes = [res.mix_query(q, n)[:, self.prefix:] for q, n in zip(self.key_queries, self.key_mix_norms)]
+            if self.mix_record is not None:
+                self.mix_record.append([res.mix_weights(q, n).cpu() for q, n in zip(self.key_queries, self.key_mix_norms)])
+            keys = [b.keys(self.kv_norm(m), self.rope_k) for b, m in zip(self.blocks, mixes)]
+        else:
+            kv = self.kv_norm(tokens)
+            keys = [b.keys(kv, self.rope_k) for b in self.blocks]
         mods = [b.modulation(c) for b in self.blocks]
         final_mod = self.final_modulation(c).chunk(2, dim=1)
         cos, sin = self.rope_q.freqs_cos, self.rope_q.freqs_sin
@@ -811,6 +834,13 @@ class AttnResState:
             return sum(alpha[i].unsqueeze(-1).to(v.dtype) * v for i, v in enumerate(sources))
         return _DepthMix.apply(alpha, *sources)
 
+    @torch.no_grad()
+    def mix_weights(self, query, norm):
+        # diagnostics: mix_query's weights per source, averaged over the batch and tokens [n_sources] (source 0 = embedding)
+        sources = self.sources + ([self.partial] if self.partial is not None else [])
+        keys = (norm.weight * query)[None]
+        return torch.stack([self._logits(v, keys)[..., 0] for v in sources]).softmax(0).float().mean((1, 2))
+
     def prepend(self, prefix):
         # in-context tokens: the embedding source gets them, every other source zeros at those positions
         zeros = torch.zeros_like(prefix)
@@ -1050,6 +1080,8 @@ class JiT(nn.Module):
         tail_query_patch=4,
         tail_dim=256,
         tail_heads=0,
+        tail_mlp_ratio=4.0,
+        tail_keys='shared',
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -1211,7 +1243,8 @@ class JiT(nn.Module):
             assert not (skip_pathway or dcae_head or dcae_trunk_head or patch_overlap or head_overlap or token_sizes), \
                 'tail_blocks: no skip pathway, DC-AE head, overlap or token_sizes'
             self.tail = PerceiverTail(input_size, patch_size, tail_query_patch, tail_dim, tail_blocks, tail_heads or max(1, tail_dim // 64),
-                                      hidden_size, self.out_channels, mlp_ratio, layernorm)
+                                      hidden_size, self.out_channels, tail_mlp_ratio, layernorm, tail_keys, in_context_len)
+            assert tail_keys == 'shared' or attn_res == 'full', "tail_keys='own' needs attn_res='full' (a depth mix of the trunk's sources)"
         if dcae_trunk_head:
             self.trunk_output_head = DCAEHead(self.out_channels, patch_size, dcae_width, dcae_kernel2, hidden_size, layernorm, dcae_norm)
 
@@ -1447,7 +1480,7 @@ class JiT(nn.Module):
         k = self.skip_inject_after if self.skip_pathway else depth
         x = self.run_blocks(x, res, 0, k, c_blocks, y_emb, fine)
         if not self.skip_pathway:
-            return self.output(x[:, self.in_context_len:], c, head=self.sampled_head(), fine=fine)
+            return self.output(x[:, self.in_context_len:], c, head=self.sampled_head(), fine=fine, res=res)
 
         two = return_trunk or self.skip_residual # skip_residual needs the trunk's prediction at inference too
         if two: # skip branch from a detached copy of the trunk at the injection point
@@ -1545,7 +1578,7 @@ class JiT(nn.Module):
             return self.trunk_output_head if self.dcae_trunk_head else None
         return self.sampled_head()
 
-    def output(self, x, c, final_layer=None, head=None, fine=False):
+    def output(self, x, c, final_layer=None, head=None, fine=False, res=None):
         # final layer -> image (unpatchify, or overlap-add for patch_overlap / head_overlap) -> (DC-AE head)
         if fine: # fine tokens (token_sizes)
             return self.unpatchify(self.final_layer_fine(x, c), self.fine_patch)
@@ -1563,7 +1596,7 @@ class JiT(nn.Module):
         if head is not None:
             img = head(img, c)
         if self.tail is not None and not self.tail_off:
-            img = img + self.tail(tokens, img, c)
+            img = img + self.tail(tokens, img, c, res=res)
         return img
 
 

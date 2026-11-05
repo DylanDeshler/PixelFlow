@@ -153,6 +153,9 @@ tail_blocks = 0 # > 0: a Perceiver tail of this many cross-attention blocks, add
 tail_query_patch = 4 # pixels per query side (divides patch_size): (img_size / tail_query_patch)^2 queries
 tail_dim = 256 # the queries' width (keys / values projected down from hidden_size)
 tail_heads = 0 # 0 -> tail_dim / 64
+tail_keys = 'shared' # 'shared': the tail reads the final layer's tokens (with full AttnRes, its depth mix); 'own': each tail block
+                     # reads its own learned depth mix of the trunk (needs attn_res='full'), so it needn't share the final layer's
+tail_mlp_ratio = 4.0 # the tail blocks' SwiGLU width (x tail_dim); 0 = attention only (the MLP is ~3/4 of the tail's FLOPs)
 tail_checkpoint = False # run the tail's queries in tail_chunks chunks, each recomputed in the backward, instead of keeping their
                         # activations (implementation only: same result and run name; a 4px tail at width 256 keeps ~12 GB per block
                         # at batch 1024; costs one extra tail forward)
@@ -373,7 +376,8 @@ model_name, arch = resolve_arch(model, **{k: (None if v < 0 else v) for k, v in 
     **({k: v for k, v in GAUSS_FLAGS.items() if v != GAUSS_DEFAULTS[k]} if is_gauss else {}),
     **(dict(token_sizes=token_sizes, fine_frac=fine_frac, alloc_floor=alloc_floor, alloc_gain=alloc_gain) if token_sizes else {}),
     **(dict(tail_blocks=tail_blocks, tail_query_patch=tail_query_patch if tail_query_patch != 4 else None, tail_dim=tail_dim if tail_dim != 256 else None,
-            tail_heads=tail_heads or None) if tail_blocks > 0 else {}),
+            tail_heads=tail_heads or None, tail_mlp_ratio=tail_mlp_ratio if tail_mlp_ratio != 4.0 else None,
+            tail_keys=tail_keys if tail_keys != 'shared' else None) if tail_blocks > 0 else {}),
     attn_res=None if attn_res == 'none' else attn_res,
     attn_res_block_size=attn_res_block_size if (attn_res == 'block' and attn_res_block_size > 0) else None,
     adaln_single=adaln_single or None, attn_res_adaln=attn_res_adaln or None, gated_bottleneck=gated_bottleneck or None,
@@ -971,14 +975,23 @@ def evaluate(step):
                     return torch.cat([net_.forward(z_[i:i + 256], tt[i:i + 256], yb[i:i + 256]).float() for i in range(0, len(z_), 256)])
                 lin = run_(True)
                 net_.tail.record = [] # per-block attention locality, one entry per block per chunk (equal chunks except the last)
+                if net_.tail.keys_mode == 'own':
+                    net_.tail.mix_record = []
                 full_ = run_(False)
                 rec_, net_.tail.record = net_.tail.record, None
+                if net_.tail.mix_record is not None: # [chunk][block] -> weights per source; mean over chunks
+                    mr_, net_.tail.mix_record = net_.tail.mix_record, None
+                    w_ = [torch.stack([m[b] for m in mr_]).mean(0) for b in range(nb_)]
+                    tail_stats.setdefault('mix_embed', []).append([float(v[0]) for v in w_]) # weight on the input embedding
+                    tail_stats.setdefault('mix_depth', []).append([float((v * torch.arange(len(v))).sum() / (len(v) - 1)) for v in w_]) # mean source position, 0 = embedding, 1 = last sublayer
+                    tail_stats.setdefault('mix_full', []).append([v.tolist() for v in w_])
                 net_.tail_off = False
                 for key_, j_ in (('attn_own', 0), ('attn_near', 1)):
                     tail_stats[key_].append([sum(r[j_] for r in rec_[b::nb_]) / len(rec_[b::nb_]) for b in range(nb_)])
                 tail_stats['share'].append(((full_ - lin).pow(2).mean().sqrt() / lin.pow(2).mean().sqrt().clamp_min(1e-12)).item())
                 for k_, pr in (('v_loss_lin', lin), ('v_loss', full_)):
                     tail_stats[k_].append(((xb - pr) / max(1 - t_, t_eps)).pow(2).mean().item())
+        record['tail'] = tail_stats # per noise level: share, losses, attention locality, (own keys) depth-mix weights per source
         timer.lap('tail')
     # quadtree: area per patch level, per noise level, with the router the model trains with
     layout = diag_lib.layout_stats(denoiser.net, *diag_val, diag_ts, noise_scale, ctx) if is_quadtree else None
@@ -1006,6 +1019,9 @@ def evaluate(step):
             log[f'tail/loss_gain_t{tl}'] = 1 - tail_stats['v_loss'][i] / max(tail_stats['v_loss_lin'][i], 1e-12) # relative loss reduction from the tail
             # attention locality per tail block: mass on the query's own token / its 3x3 token neighbourhood (uniform attention
             # over the 64 tokens at 128px: 0.016 / ~0.12)
+            for b_, (e_, dp_) in enumerate(zip(tail_stats.get('mix_embed', [[]] * (i + 1))[i], tail_stats.get('mix_depth', [[]] * (i + 1))[i])):
+                log[f'tail/keymix_embed_b{b_}_t{tl}'] = e_ # (tail_keys='own') the block's depth-mix weight on the input embedding
+                log[f'tail/keymix_depth_b{b_}_t{tl}'] = dp_ # and its mean source position (0 embedding .. 1 last sublayer)
             for b_, (own_, near_) in enumerate(zip(tail_stats['attn_own'][i], tail_stats['attn_near'][i])):
                 log[f'tail/attn_own_b{b_}_t{tl}'] = own_
                 log[f'tail/attn_near_b{b_}_t{tl}'] = near_
