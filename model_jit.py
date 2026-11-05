@@ -466,13 +466,24 @@ class TailBlock(nn.Module):
         self.mlp = SwiGLUFFN(dim, int(dim * mlp_ratio))
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(cond_dim, 6 * dim, bias=True))
 
-    def forward(self, x, kv, c, rope_q, rope_k, stats=None, masks=None):
+    def modulation(self, c):
+        # the six adaLN vectors [B, dim] (computed once per forward, shared by every query chunk)
+        return self.adaLN_modulation(c).chunk(6, dim=1)
+
+    def keys(self, kv, rope_k):
+        # keys and values from the (normalized) trunk tokens, [B, H, K, head_dim] each: once per forward, shared by every chunk
+        B, K, _ = kv.shape
+        H, D = self.num_heads, self.proj.in_features
+        k, v = self.kv(kv).reshape(B, K, 2, H, D // H).permute(2, 0, 3, 1, 4)
+        return rope_k(self.k_norm(k)), v
+
+    def forward(self, x, k, v, mod, cos, sin, stats=None, masks=None):
+        # x: queries [B, Q, dim] (all of them or one chunk); cos / sin: the queries' RoPE rows; masks: their [Q, K] rows
         B, Q, D = x.shape
         H = self.num_heads
-        shift1, scale1, gate1, shift2, scale2, gate2 = (m.to(x.dtype) for m in self.adaLN_modulation(c).chunk(6, dim=1))
-        q = self.q(modulate(self.norm1(x), shift1, scale1)).reshape(B, Q, H, D // H).transpose(1, 2)
-        k, v = self.kv(kv).reshape(B, kv.shape[1], 2, H, D // H).permute(2, 0, 3, 1, 4)
-        q, k = rope_q(self.q_norm(q)), rope_k(self.k_norm(k))
+        shift1, scale1, gate1, shift2, scale2, gate2 = (m.to(x.dtype) for m in mod)
+        q = self.q_norm(self.q(modulate(self.norm1(x), shift1, scale1)).reshape(B, Q, H, D // H).transpose(1, 2))
+        q = q * cos + rotate_half(q) * sin
         if stats is not None: # diagnostics (eager): attention mass on the query's own token and its 3x3 token neighbourhood
             w = torch.softmax(q.float() @ k.float().transpose(-1, -2) * (D // H) ** -0.5, dim=-1) # [B, H, Q, K]
             own, near = masks
@@ -519,7 +530,8 @@ class PerceiverTail(nn.Module):
         self.register_buffer('own_mask', ((dr == 0) & (dc == 0)).float(), persistent=False)
         self.register_buffer('near_mask', ((dr <= 1) & (dc <= 1)).float(), persistent=False)
         self.record = None
-        self.checkpoint = False # implementation only: recompute each block in the backward (activation checkpointing)
+        self.checkpoint = False # implementation only: run the queries in chunks, each recomputed in the backward (see forward)
+        self.chunks = 8
 
     def zero_init(self):
         # adaLN-Zero gates and a zero output layer: the tail adds exactly 0 at init
@@ -541,17 +553,33 @@ class PerceiverTail(nn.Module):
         p, h, C = self.qp, int(L ** 0.5), self.out_channels
         return torch.einsum('nhwpqc->nchpwq', x.reshape(N, h, h, p, p, C)).reshape(N, C, h * p, h * p)
 
+    def run_chunk(self, xp, pos, cos, sin, keys, mods, final_mod, own=None, near=None):
+        # one chunk of queries through every block and the output layer: xp = the linear prediction's sub-patches [B, q, qp*qp*C]
+        q = self.embed(xp) + pos.to(xp.dtype)
+        for b, (k, v), mod in zip(self.blocks, keys, mods):
+            q = b(q, k, v, mod, cos, sin, self.record, (own, near))
+        shift, scale = (m.to(q.dtype) for m in final_mod)
+        return self.out(modulate(self.norm_final(q), shift, scale))
+
     def forward(self, tokens, x_lin, c):
-        # tokens: the trunk's output tokens (what the final layer reads) [N, L, hidden]; x_lin: the final layer's image
-        q = self.embed(self.patchify(x_lin)) + self.pos.to(x_lin.dtype)
+        # tokens: the trunk's output tokens (what the final layer reads) [N, L, hidden]; x_lin: the final layer's image.
+        # Queries never attend to each other, so given the keys / values (computed once) each query's path is independent:
+        # with checkpoint, the queries run in `chunks` chunks, each recomputed in the backward, so only one chunk's
+        # activations are ever alive (checkpointing whole blocks would bring a full block's back at the start of the backward,
+        # on top of the trunk's). Same result either way.
+        xp = self.patchify(x_lin)
         kv = self.kv_norm(tokens)
-        for b in self.blocks:
-            if self.checkpoint and torch.is_grad_enabled(): # keeps only the block's input; its forward re-runs in the backward
-                q = torch.utils.checkpoint.checkpoint(b, q, kv, c, self.rope_q, self.rope_k, use_reentrant=False)
-            else:
-                q = b(q, kv, c, self.rope_q, self.rope_k, self.record, (self.own_mask, self.near_mask))
-        shift, scale = (m.to(q.dtype) for m in self.final_modulation(c).chunk(2, dim=1))
-        return self.unpatchify(self.out(modulate(self.norm_final(q), shift, scale)))
+        keys = [b.keys(kv, self.rope_k) for b in self.blocks]
+        mods = [b.modulation(c) for b in self.blocks]
+        final_mod = self.final_modulation(c).chunk(2, dim=1)
+        cos, sin = self.rope_q.freqs_cos, self.rope_q.freqs_sin
+        if not (self.checkpoint and torch.is_grad_enabled()):
+            return self.unpatchify(self.run_chunk(xp, self.pos, cos, sin, keys, mods, final_mod, self.own_mask, self.near_mask))
+        Q = xp.shape[1]
+        size = -(-Q // self.chunks)
+        outs = [torch.utils.checkpoint.checkpoint(self.run_chunk, xp[:, i:i + size], self.pos[:, i:i + size], cos[i:i + size], sin[i:i + size],
+                                                  keys, mods, final_mod, use_reentrant=False) for i in range(0, Q, size)]
+        return self.unpatchify(torch.cat(outs, dim=1))
 
 
 class JiTBlock(nn.Module):

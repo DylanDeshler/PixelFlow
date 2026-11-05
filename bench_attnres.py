@@ -14,6 +14,7 @@ Muon's cost is the same per matrix in every config, so AdamW stands in for the o
 $ python bench_attnres.py
 $ python bench_attnres.py --chunks=2,4,6,8 --iters=50
 $ python bench_attnres.py --chunks= --tails=1,2,4             # the Perceiver tail's cost on the stage-2 model
+$ python bench_attnres.py --chunks= --tails=2 --tail_checkpoint=True    # vs --act_memory_budget=0.7 (compile's own recompute)
 """
 
 import os
@@ -34,7 +35,9 @@ chunks = '2,4,8'
 tails = '' # Perceiver tail block counts to add as rows (e.g. '1,2'), with tail_query_patch / tail_dim below
 tail_query_patch = 4
 tail_dim = 256
-tail_checkpoint = False # as train_jit.py: recompute the tail blocks in the backward
+tail_checkpoint = False # as train_jit.py: the tail's queries in chunks, recomputed in the backward
+tail_chunks = 8
+act_memory_budget = 1.0 # as train_jit.py: < 1 lets torch.compile recompute activations in the backward (whole graph)
 warmup = 10
 iters = 30
 compile = True
@@ -47,6 +50,9 @@ exec(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'configurator
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+if act_memory_budget < 1.0:
+    import torch._functorch.config
+    torch._functorch.config.activation_memory_budget = act_memory_budget
 device_type = 'cuda' if 'cuda' in device else 'cpu'
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16}[dtype]
 ctx = nullcontext() if (device_type == 'cpu' or dtype == 'float32') else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
@@ -56,7 +62,7 @@ def bench(name, overrides, chunk=1):
     denoiser = build_denoiser(model_name, img_size, 1000, noise_scale=0.5, arch=arch).to(device).train()
     denoiser.net.attn_res_chunk = chunk
     if getattr(denoiser.net, 'tail', None) is not None:
-        denoiser.net.tail.checkpoint = tail_checkpoint
+        denoiser.net.tail.checkpoint, denoiser.net.tail.chunks = tail_checkpoint, tail_chunks
     opt = torch.optim.AdamW(denoiser.net.parameters(), lr=1e-4, fused=device_type == 'cuda')
     if compile:
         denoiser.net.compile()
