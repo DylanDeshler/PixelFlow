@@ -34,7 +34,7 @@ import torch
 warnings.filterwarnings('ignore', message=r'\s*Online softmax is disabled') # torch.compile's note that it skipped one softmax fusion: harmless, and printed for every compiled graph
 
 from data_jit import MemmapImages, EpochSampler, Prefetcher, to_model_input
-from jit_common import build_denoiser, resolve_arch, describe_arch, run_dir, legacy_run_dir, ema_state_dicts, ema_weights, generate_and_score, save_labeled_grid, save_layout_grids, save_geometry_grid, save_geometry_live, plot_geometry_vs_t, GAUSS_DEFAULTS
+from jit_common import build_denoiser, resolve_arch, describe_arch, run_dir, legacy_run_dir, ema_state_dicts, ema_weights, generate_and_score, save_labeled_grid, save_layout_grids, save_geometry_grid, save_geometry_live, plot_geometry_vs_t, GAUSS_DEFAULTS, model_cost
 from fid import InceptionMetrics, load_ref_stats, precision_recall
 from repa import FrozenEncoder, Projector, MaskedTransformerAdapter, BlockCapture, DispCapture, repa_loss, mta_loss, dispersive_loss
 from balancer import GradientBalancer
@@ -488,10 +488,17 @@ elif is_gauss:
 else:
     print(f"model {model_name}: {sum(p.numel() for p in denoiser.net.parameters()) / 1e6:.1f}M params, "
           f"{(img_size // arch['patch_size']) ** 2} tokens of {arch['patch_size'] ** 2 * 3}-d patches")
+try: # parameters and forward FLOPs per image, for FID vs compute / size across runs (plot_scaling.py); one image, seconds
+    cost = model_cost(denoiser.net, img_size, num_classes, device=next(denoiser.net.parameters()).device)
+    print(f"cost: {cost['params'] / 1e6:.2f}M trainable params, {cost['fwd_gflops']:.2f} forward GFLOPs per image")
+except Exception as e: # (other model families' forwards may not fit the probe; plot_scaling.py can still rebuild them)
+    cost = {}
+    print(f"cost: not measured ({type(e).__name__}: {e})")
 with open(os.path.join(out_dir, 'config.json'), 'w') as f:
     json.dump({**config, 'resolved': {'data_dir': data_dir, 'out_dir': out_dir, 'model_name': model_name, 'arch': arch, 'noise_scale': noise_scale,
                                        'effective_batch_size': effective_batch_size, 'lr': lr, 'max_iters': max_iters,
-                                       'iters_per_epoch': iters_per_epoch, 'train_images': len(data)}}, f, indent=2)
+                                       'iters_per_epoch': iters_per_epoch, 'train_images': len(data), 'img_size': img_size,
+                                       'num_classes': num_classes, **cost}}, f, indent=2)
 grid = img_size // denoiser.net.patch_size
 
 encoder, projector, capture = None, None, None

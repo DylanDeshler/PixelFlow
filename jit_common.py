@@ -267,6 +267,34 @@ class FastDenoiser(Denoiser):
         torch._foreach_lerp_(self.ema_params1, params, 1 - d1) # ema = d * ema + (1 - d) * param
         torch._foreach_lerp_(self.ema_params2, params, 1 - d2)
 
+def model_cost(net, img_size, num_classes, device='cpu'):
+    """
+    Size and compute of a JiT-family network, for comparing runs on FLOPs / parameters rather than hardware time:
+      params      trainable parameters (fixed sin-cos tables excluded)
+      fwd_gflops  forward GFLOPs per image, counted by torch's FLOP counter on one image (matmuls, convolutions, attention:
+                  everything the network runs, including in-context tokens, AttnRes mixing and the tail). Two token sizes:
+                  the training mix, (1 - fine_frac) x coarse + fine_frac x fine (fwd_gflops_paths has both)
+    Training FLOPs per image are ~3x the forward (backward ~2x); sampling costs NFE x the forward (x2 with batched CFG).
+    """
+    from torch.utils.flop_counter import FlopCounterMode
+    was_training = net.training
+    net.eval()
+    x = torch.randn(1, 3, img_size, img_size, device=device)
+    t, y = torch.full((1,), 0.5, device=device), torch.zeros(1, dtype=torch.long, device=device)
+    def count(**kw):
+        with torch.no_grad(), FlopCounterMode(display=False) as fc:
+            net(x, t, y, **kw)
+        return fc.get_total_flops() / 1e9
+    out = {'params': sum(p.numel() for p in net.parameters() if p.requires_grad)}
+    if getattr(net, 'token_sizes', ()):
+        coarse, fine = count(patch=net.token_sizes[0]), count(patch=net.token_sizes[1])
+        f = net.alloc.fine_frac
+        out.update(fwd_gflops=(1 - f) * coarse + f * fine, fwd_gflops_paths={'coarse': coarse, 'fine': fine})
+    else:
+        out['fwd_gflops'] = count()
+    net.train(was_training)
+    return out
+
 def build_denoiser(model, img_size, num_classes, attn_dropout=0.0, proj_dropout=0.0, label_drop_prob=0.1,
                    P_mean=-0.8, P_std=0.8, t_eps=5e-2, noise_scale=1.0, ema_decay1=0.9999, ema_decay2=0.9996,
                    sampling_method='heun', num_sampling_steps=50, cfg=1.0, interval_min=0.0, interval_max=1.0, arch=None):
