@@ -21,7 +21,8 @@
 #   (hyperparameter / noise tuning stages slot in here when added; patch allocation stays last: it slows every step)
 #   5. budget  extra tokens at equal compute (x1.34 FLOPs): JiT's 32 in-context tokens from block 4 vs two token sizes at fine
 #              share 0.11; the better is adopted if it beats the best
-#   6. tokens  --token_sizes=16,8 --fine_frac=0.25: bench_tokens.py (minutes, with and without selective recompute), the run,
+#   6. tokens  (on whatever base was adopted, in-context tokens included; at batch 1024 without accumulation)
+#              --token_sizes=16,8 --fine_frac=0.25: bench_tokens.py (minutes, with and without selective recompute), the run,
 #              sampling budgets on its checkpoint (FID-10k with fine tokens on 0 / 0.1 / 0.5 / 1.0 of the calls), and, if it
 #              wins per image, the previous best continued to the same GPU-hours (per-hour comparison; its 20-epoch
 #              checkpoint kept as ckpt_20ep.pt). Adoption is per image; the log prints the per-hour numbers next to it
@@ -162,17 +163,18 @@ fi=$(last_fid stack_icl32); ff=$(last_fid stack_fine0.11)
 echo "extra tokens at x1.34 FLOPs: in-context 32 -> FID-10k ${fi:-none} ($(ips "$(run_of stack_icl32)") img/s), fine 0.11 -> ${ff:-none} ($(ips "$(run_of stack_fine0.11)") img/s); best $BEST_FID"
 ICL=""
 if [ -n "$fi" ] && { [ -z "$ff" ] || lt "$fi" "$ff"; }; then
-    adopt stack_icl32 "--in_context_len=32" && ICL=1
+    adopt stack_icl32 "--in_context_len=32 --batch_size=512 --gradient_accumulation_steps=2" && ICL=1 # (the split comes along: continuing or rebuilding it at 1024 runs out of memory)
 elif [ -n "$ff" ]; then
     adopt stack_fine0.11 "--token_sizes=16,8 --fine_frac=0.11"
 fi
 
-# 6. tokens (last: two forwards per step make it the slowest stage); skipped if in-context tokens were adopted (the two-size
-#    model doesn't support them)
-if [ -n "$ICL" ]; then echo ">>> tokens: skipped (in-context tokens adopted; not supported with two token sizes)"; else
+# 6. tokens (last: two forwards per step make it the slowest stage). On the in-context base too (both token sizes get the
+#    in-context tokens); at the full batch 1024 without accumulation (the two paths' per-path backward splits the step anyway)
+TOK_BATCH="--batch_size=1024 --gradient_accumulation_steps=1"
+if true; then
 step stack_tokens_bench$BENCH_TAG python bench_tokens.py $ARCH_ARGS $IMPL
 step stack_tokens_bench${BENCH_TAG}_mem0.5 python bench_tokens.py $ARCH_ARGS $IMPL --act_memory_budget=0.5
-step stack_tokens python train_jit.py $BASE $IMPL $BEST_ARGS --epochs=20 --token_sizes=16,8 --fine_frac=0.25
+step stack_tokens python train_jit.py $BASE $IMPL $BEST_ARGS $TOK_BATCH --epochs=20 --token_sizes=16,8 --fine_frac=0.25
 TOK_RUN=$(run_of stack_tokens)
 if [ -n "$TOK_RUN" ] && [ -e "$TOK_RUN/ckpt.pt" ]; then
     for f in 0 0.1 0.5 1.0; do

@@ -446,6 +446,109 @@ class FinalLayer(nn.Module):
         return x
 
 
+class TailBlock(nn.Module):
+    """
+    One block of the Perceiver tail: the queries cross-attend to the trunk's tokens (no query-query attention), then a
+    SwiGLU MLP; adaLN-Zero from the conditioning (shift / scale / gate per branch, zero at init). Keys and values are
+    projected from the trunk tokens (normalized once by the tail), queries live at the tail's own width.
+    """
+    def __init__(self, dim, kv_dim, num_heads, cond_dim, mlp_ratio=4.0, layernorm=False):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.norm1 = make_norm(dim, layernorm)
+        self.q = nn.Linear(dim, dim, bias=True)
+        self.kv = nn.Linear(kv_dim, 2 * dim, bias=True)
+        self.q_norm, self.k_norm = make_norm(head_dim, layernorm), make_norm(head_dim, layernorm)
+        self.proj = nn.Linear(dim, dim)
+        self.norm2 = make_norm(dim, layernorm)
+        self.mlp = SwiGLUFFN(dim, int(dim * mlp_ratio))
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(cond_dim, 6 * dim, bias=True))
+
+    def forward(self, x, kv, c, rope_q, rope_k, stats=None, masks=None):
+        B, Q, D = x.shape
+        H = self.num_heads
+        shift1, scale1, gate1, shift2, scale2, gate2 = (m.to(x.dtype) for m in self.adaLN_modulation(c).chunk(6, dim=1))
+        q = self.q(modulate(self.norm1(x), shift1, scale1)).reshape(B, Q, H, D // H).transpose(1, 2)
+        k, v = self.kv(kv).reshape(B, kv.shape[1], 2, H, D // H).permute(2, 0, 3, 1, 4)
+        q, k = rope_q(self.q_norm(q)), rope_k(self.k_norm(k))
+        if stats is not None: # diagnostics (eager): attention mass on the query's own token and its 3x3 token neighbourhood
+            w = torch.softmax(q.float() @ k.float().transpose(-1, -2) * (D // H) ** -0.5, dim=-1) # [B, H, Q, K]
+            own, near = masks
+            stats.append(((w * own).sum(-1).mean().item(), (w * near).sum(-1).mean().item()))
+        a = F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(B, Q, D)
+        x = x + gate1.unsqueeze(1) * self.proj(a)
+        x = x + gate2.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift2, scale2))
+        return x
+
+
+class PerceiverTail(nn.Module):
+    """
+    tail_blocks > 0: a Perceiver-IO-style decoder added to JiT's prediction as a residual, giving every output pixel the
+    whole image's tokens instead of only its own patch's (the final layer decodes each patch linearly from one token).
+    Queries tile the image in query_patch^2 sub-patches (input_size / query_patch per side); each starts from an embedding of
+    the linear prediction's sub-patch plus a fixed sin-cos position, cross-attends to the trunk's output tokens in TailBlocks
+    (2D RoPE on queries and keys at their image positions, in token units), and its last layer (zero-initialized) writes a
+    query_patch^2 correction: x_pred = x_lin + tail. At init the model is exactly JiT. The tail reads only the trunk (and the
+    prediction made from it), never the noisy input; it is trained end to end with everything else.
+    """
+    def __init__(self, input_size, patch_size, query_patch, dim, num_blocks, num_heads, hidden_size, out_channels,
+                 mlp_ratio=4.0, layernorm=False):
+        super().__init__()
+        assert patch_size % query_patch == 0, f'tail_query_patch ({query_patch}) must divide patch_size ({patch_size})'
+        assert dim % num_heads == 0 and (dim // num_heads) % 4 == 0, f'tail_dim {dim} / tail_heads {num_heads}: head dim must be a multiple of 4 (2D RoPE)'
+        self.qp, self.out_channels = query_patch, out_channels
+        nq, nk = input_size // query_patch, input_size // patch_size
+        q_coords = token_coords(nq, query_patch, patch_size) # in token units, centred on their pixels
+        self.register_buffer('pos', torch.from_numpy(sincos_at(dim, q_coords)).float().unsqueeze(0), persistent=False)
+        self.rope_q = RopeAt(dim // num_heads // 2, q_coords)
+        self.rope_k = RopeAt(dim // num_heads // 2, np.arange(nk, dtype=np.float64))
+        self.embed = nn.Linear(query_patch * query_patch * out_channels, dim, bias=True)
+        self.kv_norm = make_norm(hidden_size, layernorm)
+        self.blocks = nn.ModuleList([TailBlock(dim, hidden_size, num_heads, hidden_size, mlp_ratio, layernorm) for _ in range(num_blocks)])
+        self.norm_final = make_norm(dim, layernorm)
+        self.final_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * dim, bias=True))
+        self.out = nn.Linear(dim, query_patch * query_patch * out_channels, bias=True)
+        # diagnostics: each query's own token and its 3x3 token neighbourhood among the keys ([Q, K] masks); record = a list
+        # turns on per-block attention statistics in eager forwards (TailBlock.forward)
+        qi = torch.arange(nq) * query_patch // patch_size # token row / column of each query row / column
+        qr, qc = qi[:, None].expand(nq, nq).reshape(-1), qi[None, :].expand(nq, nq).reshape(-1)
+        kr, kc = torch.arange(nk)[:, None].expand(nk, nk).reshape(-1), torch.arange(nk)[None, :].expand(nk, nk).reshape(-1)
+        dr, dc = (qr[:, None] - kr[None]).abs(), (qc[:, None] - kc[None]).abs()
+        self.register_buffer('own_mask', ((dr == 0) & (dc == 0)).float(), persistent=False)
+        self.register_buffer('near_mask', ((dr <= 1) & (dc <= 1)).float(), persistent=False)
+        self.record = None
+
+    def zero_init(self):
+        # adaLN-Zero gates and a zero output layer: the tail adds exactly 0 at init
+        for b in self.blocks:
+            nn.init.constant_(b.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(b.adaLN_modulation[-1].bias, 0)
+        for m in (self.final_modulation[-1], self.out):
+            nn.init.constant_(m.weight, 0)
+            nn.init.constant_(m.bias, 0)
+
+    def patchify(self, img):
+        # [N, C, H, W] -> [N, (H / qp)^2, qp * qp * C], the inverse of JiT.unpatchify
+        N, C, H, W = img.shape
+        p, h = self.qp, H // self.qp
+        return torch.einsum('nchpwq->nhwpqc', img.reshape(N, C, h, p, h, p)).reshape(N, h * h, p * p * C)
+
+    def unpatchify(self, x):
+        N, L, _ = x.shape
+        p, h, C = self.qp, int(L ** 0.5), self.out_channels
+        return torch.einsum('nhwpqc->nchpwq', x.reshape(N, h, h, p, p, C)).reshape(N, C, h * p, h * p)
+
+    def forward(self, tokens, x_lin, c):
+        # tokens: the trunk's output tokens (what the final layer reads) [N, L, hidden]; x_lin: the final layer's image
+        q = self.embed(self.patchify(x_lin)) + self.pos.to(x_lin.dtype)
+        kv = self.kv_norm(tokens)
+        for b in self.blocks:
+            q = b(q, kv, c, self.rope_q, self.rope_k, self.record, (self.own_mask, self.near_mask))
+        shift, scale = (m.to(q.dtype) for m in self.final_modulation(c).chunk(2, dim=1))
+        return self.unpatchify(self.out(modulate(self.norm_final(q), shift, scale)))
+
+
 class JiTBlock(nn.Module):
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0, adaln_single=False, layernorm=False):
         super().__init__()
@@ -698,18 +801,23 @@ def sincos_at(dim, coords):
 
 class RopeAt(nn.Module):
     """
-    VisionRotaryEmbeddingFast (JiT's 2D RoPE, 'lang' frequencies, no class tokens) at arbitrary 1D coordinates per axis
-    instead of 0..n-1: the same tables at integer coordinates.
+    VisionRotaryEmbeddingFast (JiT's 2D RoPE, 'lang' frequencies) at arbitrary 1D coordinates per axis instead of 0..n-1:
+    the same tables at integer coordinates. num_prefix: leading tokens left unrotated (cos 1, sin 0), as its num_cls_token
+    does for JiT's in-context class tokens.
     """
-    def __init__(self, dim, coords, theta=10000):
+    def __init__(self, dim, coords, theta=10000, num_prefix=0):
         super().__init__()
         freqs = 1. / (theta ** (torch.arange(0, dim, 2)[:(dim // 2)].float() / dim))
         f = torch.as_tensor(coords, dtype=torch.float32)[:, None] * freqs[None] # [n, dim / 2]
         f = f.repeat_interleave(2, dim=-1) # as repeat('... n -> ... (n r)', r=2)
         n = len(coords)
         f = torch.cat([f[:, None, :].expand(n, n, -1), f[None, :, :].expand(n, n, -1)], dim=-1) # as broadcat, rows then columns
-        self.register_buffer('freqs_cos', f.cos().reshape(n * n, -1), persistent=False)
-        self.register_buffer('freqs_sin', f.sin().reshape(n * n, -1), persistent=False)
+        cos, sin = f.cos().reshape(n * n, -1), f.sin().reshape(n * n, -1)
+        if num_prefix:
+            cos = torch.cat([torch.ones(num_prefix, cos.shape[1]), cos])
+            sin = torch.cat([torch.zeros(num_prefix, sin.shape[1]), sin])
+        self.register_buffer('freqs_cos', cos, persistent=False)
+        self.register_buffer('freqs_sin', sin, persistent=False)
 
     def forward(self, t):
         return t * self.freqs_cos + rotate_half(t) * self.freqs_sin
@@ -905,6 +1013,10 @@ class JiT(nn.Module):
         fine_frac=0.25,
         alloc_floor=0.1,
         alloc_gain='rel',
+        tail_blocks=0,
+        tail_query_patch=4,
+        tail_dim=256,
+        tail_heads=0,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -1041,8 +1153,8 @@ class JiT(nn.Module):
         if self.token_sizes:
             assert len(self.token_sizes) == 2 and self.token_sizes[0] == patch_size and patch_size % self.token_sizes[1] == 0, \
                 f"token_sizes: 'coarse,fine' with coarse = patch_size ({patch_size}) a multiple of fine, got {token_sizes}"
-            assert in_context_len == 0 and not (gated_bottleneck or skip_pathway or dcae_stem or dcae_head or patch_overlap or head_overlap), \
-                'token_sizes: plain JiT only (no in-context tokens, skip pathway, DC-AE, overlap or gated bottleneck)'
+            assert not (gated_bottleneck or skip_pathway or dcae_stem or dcae_head or patch_overlap or head_overlap), \
+                'token_sizes: no skip pathway, DC-AE, overlap or gated bottleneck'
             pf = self.fine_patch = self.token_sizes[1]
             self.x_embedder_fine = BottleneckPatchEmbed(input_size, pf, in_channels, bottleneck_dim, hidden_size, bias=True)
             self.final_layer_fine = FinalLayer(hidden_size, pf, self.out_channels, adaln_single=adaln_single, layernorm=layernorm)
@@ -1050,6 +1162,8 @@ class JiT(nn.Module):
             coords = token_coords(n_f, pf, patch_size) # in coarse-token units, centres aligned with the coarse grid's
             self.register_buffer('pos_embed_fine', torch.from_numpy(sincos_at(hidden_size, coords)).float().unsqueeze(0), persistent=False)
             self.feat_rope_fine = RopeAt(hidden_size // num_heads // 2, coords)
+            if in_context_len > 0: # in-context class tokens on the fine path too: prepended at the same block, unrotated
+                self.feat_rope_fine_incontext = RopeAt(hidden_size // num_heads // 2, coords, num_prefix=in_context_len)
             self.alloc = TokenAllocation(fine_frac, alloc_floor, alloc_gain)
         if skip_final_layer:
             # the with-skip prediction (what evaluation and sampling use) gets its own final layer; final_layer then only
@@ -1057,6 +1171,14 @@ class JiT(nn.Module):
             self.skip_final_layer = FinalLayer(hidden_size, patch_size + 2 * self.out_overlap, self.out_channels, adaln_single=adaln_single, layernorm=layernorm)
         if dcae_head:
             self.output_head = DCAEHead(self.out_channels, patch_size, dcae_width, dcae_kernel2, hidden_size, layernorm, dcae_norm)
+        # Perceiver tail (tail_blocks > 0): a cross-patch residual correction on the final layer's image, see PerceiverTail
+        self.tail = None
+        self.tail_off = False # diagnostics only: the prediction without the tail (the final layer's image alone)
+        if tail_blocks > 0:
+            assert not (skip_pathway or dcae_head or dcae_trunk_head or patch_overlap or head_overlap or token_sizes), \
+                'tail_blocks: no skip pathway, DC-AE head, overlap or token_sizes'
+            self.tail = PerceiverTail(input_size, patch_size, tail_query_patch, tail_dim, tail_blocks, tail_heads or max(1, tail_dim // 64),
+                                      hidden_size, self.out_channels, mlp_ratio, layernorm)
         if dcae_trunk_head:
             self.trunk_output_head = DCAEHead(self.out_channels, patch_size, dcae_width, dcae_kernel2, hidden_size, layernorm, dcae_norm)
 
@@ -1149,6 +1271,8 @@ class JiT(nn.Module):
             self.init_gates_pixart()
         if self.has_skip_final_layer: # starts as an exact copy, so both predictions start identical
             self.skip_final_layer.load_state_dict(self.final_layer.state_dict())
+        if self.tail is not None:
+            self.tail.zero_init()
 
     def init_gates_pixart(self):
         """
@@ -1235,9 +1359,6 @@ class JiT(nn.Module):
     def run_blocks(self, x, res, start, end, c_blocks, y_emb, fine=False):
         # trunk blocks start..end-1 (0-indexed), with the in-context class tokens prepended at in_context_start
         for i in range(start, end):
-            if fine: # fine tokens (token_sizes): their own RoPE table, no in-context tokens
-                x = self.blocks[i](x, c_blocks, self.feat_rope_fine, res=res, index=i)
-                continue
             if self.in_context_len > 0 and i == self.in_context_start:
                 in_context_tokens = y_emb.unsqueeze(1).repeat(1, self.in_context_len, 1)
                 in_context_tokens += self.in_context_posemb
@@ -1246,7 +1367,12 @@ class JiT(nn.Module):
                 else:
                     res.prepend(in_context_tokens)
                     x = res.mix(2 * i)
-            x = self.blocks[i](x, c_blocks, self.feat_rope if i < self.in_context_start else self.feat_rope_incontext, res=res, index=i)
+            prefix = self.in_context_len > 0 and i >= self.in_context_start
+            if fine: # fine tokens (token_sizes): their own RoPE table (with the in-context tokens' unrotated prefix once they're in)
+                rope = self.feat_rope_fine_incontext if prefix else self.feat_rope_fine
+            else:
+                rope = self.feat_rope_incontext if prefix else self.feat_rope
+            x = self.blocks[i](x, c_blocks, rope, res=res, index=i)
         return x
 
     def forward(self, x, t, y, return_trunk=False, patch=None):
@@ -1390,6 +1516,7 @@ class JiT(nn.Module):
         # final layer -> image (unpatchify, or overlap-add for patch_overlap / head_overlap) -> (DC-AE head)
         if fine: # fine tokens (token_sizes)
             return self.unpatchify(self.final_layer_fine(x, c), self.fine_patch)
+        tokens = x
         x = (final_layer or self.final_layer)(x, c)
         if self.out_overlap:
             o, p = self.out_overlap, self.patch_size
@@ -1402,6 +1529,8 @@ class JiT(nn.Module):
             img = self.unpatchify(x, self.patch_size)
         if head is not None:
             img = head(img, c)
+        if self.tail is not None and not self.tail_off:
+            img = img + self.tail(tokens, img, c)
         return img
 
 

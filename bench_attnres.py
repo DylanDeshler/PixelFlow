@@ -8,10 +8,12 @@ training batch, one config after another in one session, as bench_tokens.py:
   full + adaln           both (the stage-2 run)
   full + adaln, chunk k  the same model, mixing in chunks of k sublayers (identical outputs up to rounding)
   block + adaln          Block AttnRes (a different model: block sums as sources), for reference
+  + tail N               with --tails: full + adaln (chunk 8) plus a Perceiver tail of N blocks (train_jit.py --tail_blocks)
 Muon's cost is the same per matrix in every config, so AdamW stands in for the optimizer.
 
 $ python bench_attnres.py
 $ python bench_attnres.py --chunks=2,4,6,8 --iters=50
+$ python bench_attnres.py --chunks= --tails=1,2,4             # the Perceiver tail's cost on the stage-2 model
 """
 
 import os
@@ -29,6 +31,9 @@ from masking import flow_loss
 img_size = 128
 batch_size = 1024
 chunks = '2,4,8'
+tails = '' # Perceiver tail block counts to add as rows (e.g. '1,2'), with tail_query_patch / tail_dim below
+tail_query_patch = 4
+tail_dim = 256
 warmup = 10
 iters = 30
 compile = True
@@ -94,6 +99,8 @@ configs = [('plain', {}, 1), ('adaln_single', dict(adaln_single=True), 1), ('att
            ('full + adaln', dict(attn_res='full', adaln_single=True), 1)]
 configs += [(f'full + adaln, chunk {k}', dict(attn_res='full', adaln_single=True), int(k)) for k in chunks.split(',') if k]
 configs += [('block + adaln', dict(attn_res='block', adaln_single=True), 1)]
+configs += [(f'full + adaln, c8 + tail {n}', dict(attn_res='full', adaln_single=True, tail_blocks=int(n), tail_query_patch=tail_query_patch,
+                                                   tail_dim=tail_dim), 8) for n in tails.split(',') if n]
 print(f"batch {batch_size} at {img_size}px, {dtype}, compile {compile}; {warmup} warm-up + {iters} timed steps")
 fmt = lambda r, base: (f"{r['name']:<26} {r['ms']:>9.1f} {r['ips']:>8.0f} {r['ms'] / base['ms']:>8.2f}x {r['peak']:>8.1f} {r['micro']:>6}"
                        if 'ms' in r else f"{r['name']:<26} failed: {r['error']}")

@@ -147,6 +147,12 @@ skip_decoder_dim = 0 # decoder token width; 0 -> 16 for pixel, 64 for subpatch
 skip_decoder_blocks = 2 # decoder blocks (PixelDiT-B uses 2 pixel-level blocks)
 skip_decoder_rank = 0 # > 0: low-rank (cond -> rank -> per-token modulation) projections, instead of full ones
 skip_decoder_conv = False # a 3x3 conv over neighbouring decoder tokens in each block (crosses patch boundaries)
+tail_blocks = 0 # > 0: a Perceiver tail of this many cross-attention blocks, added to the final layer's image as a zero-initialized
+                # residual: queries at tail_query_patch sub-patches, started from the linear prediction, read every trunk token
+                # (full receptive field per pixel; model_jit.PerceiverTail). 0 = JiT as is
+tail_query_patch = 4 # pixels per query side (divides patch_size): (img_size / tail_query_patch)^2 queries
+tail_dim = 256 # the queries' width (keys / values projected down from hidden_size)
+tail_heads = 0 # 0 -> tail_dim / 64
 skip_decoder_modulation = True # False: decoder blocks are plain residual MLP blocks, without the per-token adaLN from the trunk tokens
 skip_decoder_attnres = False # each decoder block conditions on its own AttnRes mix of the (detached) trunk sources instead of the trunk output (needs attn_res)
 skip_inject_block = 0 # skip_pathway only: 0 -> after the trunk; -k -> before the last k blocks; k -> after block k
@@ -362,6 +368,8 @@ model_name, arch = resolve_arch(model, **{k: (None if v < 0 else v) for k, v in 
             area_bias=quad_area_bias, level_embed=quad_level_embed) if is_quadtree else {}),
     **({k: v for k, v in GAUSS_FLAGS.items() if v != GAUSS_DEFAULTS[k]} if is_gauss else {}),
     **(dict(token_sizes=token_sizes, fine_frac=fine_frac, alloc_floor=alloc_floor, alloc_gain=alloc_gain) if token_sizes else {}),
+    **(dict(tail_blocks=tail_blocks, tail_query_patch=tail_query_patch if tail_query_patch != 4 else None, tail_dim=tail_dim if tail_dim != 256 else None,
+            tail_heads=tail_heads or None) if tail_blocks > 0 else {}),
     attn_res=None if attn_res == 'none' else attn_res,
     attn_res_block_size=attn_res_block_size if (attn_res == 'block' and attn_res_block_size > 0) else None,
     adaln_single=adaln_single or None, attn_res_adaln=attn_res_adaln or None, gated_bottleneck=gated_bottleneck or None,
@@ -561,7 +569,7 @@ def muon_split(name):
         return 2
     if name.endswith('adaLN_modulation.1.weight') or name.endswith('t_block.1.weight'):
         return 6
-    if name.endswith('attn_res_modulation.1.weight'):
+    if name.endswith('attn_res_modulation.1.weight') or name.endswith('.kv.weight'):
         return 2
     return 1
 
@@ -589,6 +597,9 @@ if optimizer_type == 'muon' and muon_adaln and gated_bottleneck: # an adaLN-styl
     muon_named[id(denoiser.net.bottleneck_gate[1].weight)] = ('bottleneck_gate.1.weight', denoiser.net.bottleneck_gate[1].weight)
 if optimizer_type == 'muon' and muon_adaln and attn_res_adaln: # an adaLN projection like the blocks'
     muon_named[id(denoiser.net.attn_res_modulation[1].weight)] = ('attn_res_modulation.1.weight', denoiser.net.attn_res_modulation[1].weight)
+if optimizer_type == 'muon' and tail_blocks > 0: # the tail blocks' hidden matrices like the trunk's; its embed / out like the patch embed / final layer (AdamW)
+    muon_named.update({id(p): ('tail.blocks.' + n, p) for n, p in denoiser.net.tail.blocks.named_parameters()
+                       if p.ndim >= 2 and p.requires_grad and (muon_adaln or 'adaLN_modulation' not in n)}) # (its final modulation: AdamW, as the final layer's)
 muon_params = {} # split -> params
 for name, p in trainable:
     if not p.requires_grad:
@@ -929,6 +940,33 @@ def evaluate(step):
     has_skip = getattr(denoiser.net, 'skip_pathway', False)
     trunk_pass = diag_lib.noise_level_pass(denoiser.net, *diag_val, diag_ts, noise_scale, t_eps, ctx, band_masks, skip_on=False,
                                            desc='noise-level pass, trunk only') if has_skip else None
+    # Perceiver tail: its share of the prediction (RMS of the tail's correction / RMS of the final layer's image) and the held-out
+    # loss without it, on the same images, noise and t (eager forwards: the toggle would recompile the training graph)
+    tail_stats = None
+    if getattr(denoiser.net, 'tail', None) is not None:
+        net_, (xb, yb) = denoiser.net, diag_val
+        g_ = torch.Generator(device=xb.device).manual_seed(0)
+        tail_stats = {'share': [], 'v_loss_lin': [], 'v_loss': [], 'attn_own': [], 'attn_near': []}
+        nb_ = len(net_.tail.blocks)
+        with torch.no_grad(), ctx:
+            for t_ in diag_ts.tolist():
+                e_ = torch.randn(xb.shape, generator=g_, device=xb.device) * noise_scale
+                tt = torch.full((xb.size(0),), t_, device=xb.device)
+                z_ = t_ * xb + (1 - t_) * e_
+                def run_(off): # in chunks of 256
+                    net_.tail_off = off
+                    return torch.cat([net_.forward(z_[i:i + 256], tt[i:i + 256], yb[i:i + 256]).float() for i in range(0, len(z_), 256)])
+                lin = run_(True)
+                net_.tail.record = [] # per-block attention locality, one entry per block per chunk (equal chunks except the last)
+                full_ = run_(False)
+                rec_, net_.tail.record = net_.tail.record, None
+                net_.tail_off = False
+                for key_, j_ in (('attn_own', 0), ('attn_near', 1)):
+                    tail_stats[key_].append([sum(r[j_] for r in rec_[b::nb_]) / len(rec_[b::nb_]) for b in range(nb_)])
+                tail_stats['share'].append(((full_ - lin).pow(2).mean().sqrt() / lin.pow(2).mean().sqrt().clamp_min(1e-12)).item())
+                for k_, pr in (('v_loss_lin', lin), ('v_loss', full_)):
+                    tail_stats[k_].append(((xb - pr) / max(1 - t_, t_eps)).pow(2).mean().item())
+        timer.lap('tail')
     # quadtree: area per patch level, per noise level, with the router the model trains with
     layout = diag_lib.layout_stats(denoiser.net, *diag_val, diag_ts, noise_scale, ctx) if is_quadtree else None
     # 8. input sensitivity of the sampled prediction (and of the trunk-only one, for comparison on the same z)
@@ -950,6 +988,14 @@ def evaluate(step):
         if trunk_pass is not None:
             log[f'noise_loss_trunk/val_t{tl}'] = trunk_pass['v_loss'][i].item()
             log[f'noise_xmse_trunk/val_t{tl}'] = trunk_pass['x_mse'][i].item()
+        if tail_stats is not None:
+            log[f'tail/share_t{tl}'] = tail_stats['share'][i]
+            log[f'tail/loss_gain_t{tl}'] = 1 - tail_stats['v_loss'][i] / max(tail_stats['v_loss_lin'][i], 1e-12) # relative loss reduction from the tail
+            # attention locality per tail block: mass on the query's own token / its 3x3 token neighbourhood (uniform attention
+            # over the 64 tokens at 128px: 0.016 / ~0.12)
+            for b_, (own_, near_) in enumerate(zip(tail_stats['attn_own'][i], tail_stats['attn_near'][i])):
+                log[f'tail/attn_own_b{b_}_t{tl}'] = own_
+                log[f'tail/attn_near_b{b_}_t{tl}'] = near_
         if layout is not None:
             for l, p_ in enumerate(denoiser.net.geo.patches):
                 log[f'layout/area_p{p_}_t{tl}'] = layout['area'][i, l].item()
