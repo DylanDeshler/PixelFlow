@@ -14,7 +14,7 @@ Muon's cost is the same per matrix in every config, so AdamW stands in for the o
 $ python bench_attnres.py
 $ python bench_attnres.py --chunks=2,4,6,8 --iters=50
 $ python bench_attnres.py --chunks= --tails=1,2,4             # the Perceiver tail's cost on the stage-2 model
-$ python bench_attnres.py --chunks= --tails=2 --tail_checkpoint=True    # vs --act_memory_budget=0.7 (compile's own recompute)
+$ python bench_attnres.py --only_tails=True --tails=2 --tail_heads=8 --tail_checkpoint=True   # just that model; vs --act_memory_budget=0.7
 """
 
 import os
@@ -35,6 +35,8 @@ chunks = '2,4,8'
 tails = '' # Perceiver tail block counts to add as rows (e.g. '1,2'), with tail_query_patch / tail_dim below
 tail_query_patch = 4
 tail_dim = 256
+tail_heads = 0 # 0 -> tail_dim / 64, as train_jit.py
+only_tails = False # run only the --tails rows (the stage-2 model + tail), not the AttnRes comparison
 tail_checkpoint = False # as train_jit.py: the tail's queries in chunks, recomputed in the backward
 tail_chunks = 8
 act_memory_budget = 1.0 # as train_jit.py: < 1 lets torch.compile recompute activations in the backward (whole graph)
@@ -109,7 +111,10 @@ configs = [('plain', {}, 1), ('adaln_single', dict(adaln_single=True), 1), ('att
 configs += [(f'full + adaln, chunk {k}', dict(attn_res='full', adaln_single=True), int(k)) for k in chunks.split(',') if k]
 configs += [('block + adaln', dict(attn_res='block', adaln_single=True), 1)]
 configs += [(f'full + adaln, c8 + tail {n}', dict(attn_res='full', adaln_single=True, tail_blocks=int(n), tail_query_patch=tail_query_patch,
-                                                   tail_dim=tail_dim), 8) for n in tails.split(',') if n]
+                                                   tail_dim=tail_dim, tail_heads=tail_heads or None), 8) for n in tails.split(',') if n]
+if only_tails:
+    configs = [c for c in configs if 'tail' in c[0]]
+    assert configs, 'only_tails: pass --tails (e.g. --tails=2)'
 print(f"batch {batch_size} at {img_size}px, {dtype}, compile {compile}; {warmup} warm-up + {iters} timed steps")
 fmt = lambda r, base: (f"{r['name']:<26} {r['ms']:>9.1f} {r['ips']:>8.0f} {r['ms'] / base['ms']:>8.2f}x {r['peak']:>8.1f} {r['micro']:>6}"
                        if 'ms' in r else f"{r['name']:<26} failed: {r['error']}")
