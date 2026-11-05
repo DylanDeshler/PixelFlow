@@ -153,6 +153,8 @@ tail_blocks = 0 # > 0: a Perceiver tail of this many cross-attention blocks, add
 tail_query_patch = 4 # pixels per query side (divides patch_size): (img_size / tail_query_patch)^2 queries
 tail_dim = 256 # the queries' width (keys / values projected down from hidden_size)
 tail_heads = 0 # 0 -> tail_dim / 64
+tail_checkpoint = False # recompute the tail blocks in the backward instead of keeping their activations (implementation only: same
+                        # result and run name; a 4px tail at width 256 keeps ~12 GB per block at batch 1024, recomputing costs ~+4-5% per block)
 skip_decoder_modulation = True # False: decoder blocks are plain residual MLP blocks, without the per-token adaLN from the trunk tokens
 skip_decoder_attnres = False # each decoder block conditions on its own AttnRes mix of the (detached) trunk sources instead of the trunk output (needs attn_res)
 skip_inject_block = 0 # skip_pathway only: 0 -> after the trunk; -k -> before the last k blocks; k -> after block k
@@ -673,6 +675,8 @@ if phema_stds:
 
 trainable_params = [p for _, p in trainable if p.requires_grad]
 denoiser.net.attn_res_chunk = attn_res_chunk # (AttnRes models only; implementation, not architecture)
+if getattr(denoiser.net, 'tail', None) is not None:
+    denoiser.net.tail.checkpoint = tail_checkpoint
 if token_sizes:
     denoiser.net.alloc.t_dist = (denoiser.P_mean, denoiser.P_std)
 if hasattr(denoiser.net, 'set_attn_impl'):

@@ -12,6 +12,7 @@
 import copy
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint
 import math
 
 import numpy as np
@@ -518,6 +519,7 @@ class PerceiverTail(nn.Module):
         self.register_buffer('own_mask', ((dr == 0) & (dc == 0)).float(), persistent=False)
         self.register_buffer('near_mask', ((dr <= 1) & (dc <= 1)).float(), persistent=False)
         self.record = None
+        self.checkpoint = False # implementation only: recompute each block in the backward (activation checkpointing)
 
     def zero_init(self):
         # adaLN-Zero gates and a zero output layer: the tail adds exactly 0 at init
@@ -544,7 +546,10 @@ class PerceiverTail(nn.Module):
         q = self.embed(self.patchify(x_lin)) + self.pos.to(x_lin.dtype)
         kv = self.kv_norm(tokens)
         for b in self.blocks:
-            q = b(q, kv, c, self.rope_q, self.rope_k, self.record, (self.own_mask, self.near_mask))
+            if self.checkpoint and torch.is_grad_enabled(): # keeps only the block's input; its forward re-runs in the backward
+                q = torch.utils.checkpoint.checkpoint(b, q, kv, c, self.rope_q, self.rope_k, use_reentrant=False)
+            else:
+                q = b(q, kv, c, self.rope_q, self.rope_k, self.record, (self.own_mask, self.near_mask))
         shift, scale = (m.to(q.dtype) for m in self.final_modulation(c).chunk(2, dim=1))
         return self.unpatchify(self.out(modulate(self.norm_final(q), shift, scale)))
 

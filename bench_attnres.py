@@ -34,6 +34,7 @@ chunks = '2,4,8'
 tails = '' # Perceiver tail block counts to add as rows (e.g. '1,2'), with tail_query_patch / tail_dim below
 tail_query_patch = 4
 tail_dim = 256
+tail_checkpoint = False # as train_jit.py: recompute the tail blocks in the backward
 warmup = 10
 iters = 30
 compile = True
@@ -54,6 +55,8 @@ def bench(name, overrides, chunk=1):
     model_name, arch = resolve_arch('JiT-B/16', in_context_len=0, **overrides)
     denoiser = build_denoiser(model_name, img_size, 1000, noise_scale=0.5, arch=arch).to(device).train()
     denoiser.net.attn_res_chunk = chunk
+    if getattr(denoiser.net, 'tail', None) is not None:
+        denoiser.net.tail.checkpoint = tail_checkpoint
     opt = torch.optim.AdamW(denoiser.net.parameters(), lr=1e-4, fused=device_type == 'cuda')
     if compile:
         denoiser.net.compile()
