@@ -149,6 +149,7 @@ main { display: grid; grid-template-columns: 330px 1fr; min-height: calc(100vh -
 #legend .item.off { opacity: 0.35; }
 #charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 12px; }
 .chart h2 { font-size: 13px; font-weight: 600; margin: 4px 0 2px; }
+.chart h2 .reset { font-weight: 400; font-size: 12px; margin-left: 8px; color: #2a78d6; display: none; }
 svg text { fill: var(--ink2); font-size: 11px; }
 #tip { position: fixed; pointer-events: none; background: #fff; border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px;
        box-shadow: 0 2px 8px rgba(0,0,0,.08); display: none; max-width: 420px; word-break: break-all; z-index: 10; }
@@ -162,7 +163,7 @@ details summary { cursor: pointer; color: var(--ink2); margin-top: 12px; }
   <h1>Runs</h1><span class="muted">__ROOT__ &middot; generated __GENERATED__</span>
   <label>metric <select id="metric"></select></label>
   <label>parameters chart at epoch <select id="atep"></select></label>
-  <span class="muted">legend: click hides / shows a run, double-click shows only it</span>
+  <span class="muted">legend: click hides / shows a run, double-click shows only it &middot; charts: drag a box to zoom, double-click to reset</span>
 </header>
 <main>
 <div id="side">
@@ -173,9 +174,9 @@ details summary { cursor: pointer; color: var(--ink2); margin-top: 12px; }
 <div id="content">
   <div id="legend"></div>
   <div id="charts">
-    <div class="chart"><h2>vs images seen</h2><svg id="c_images"></svg></div>
-    <div class="chart"><h2>vs training compute</h2><svg id="c_flops"></svg></div>
-    <div class="chart"><h2>vs parameters</h2><svg id="c_params"></svg></div>
+    <div class="chart"><h2>vs images seen <a href="#" class="reset" data-c="c_images">reset zoom</a></h2><svg id="c_images"></svg></div>
+    <div class="chart"><h2>vs training compute <a href="#" class="reset" data-c="c_flops">reset zoom</a></h2><svg id="c_flops"></svg></div>
+    <div class="chart"><h2>vs parameters <a href="#" class="reset" data-c="c_params">reset zoom</a></h2><svg id="c_params"></svg></div>
   </div>
   <details><summary>table of the visible runs</summary><div id="table"></div></details>
 </div>
@@ -185,7 +186,7 @@ details summary { cursor: pointer; color: var(--ink2); margin-top: 12px; }
 const D = __DATA__;
 const MARKERS = ['circle', 'square', 'triangle', 'diamond', 'down', 'plus'];
 D.runs.forEach((r, i) => { r.color = D.colors[i % D.colors.length]; r.marker = MARKERS[Math.floor(i / D.colors.length) % MARKERS.length]; r.i = i; });
-const state = { selected: new Set(D.runs.filter(r => r.default).map(r => r.i)), hidden: new Set(), metric: 'fid', atep: null };
+const state = { selected: new Set(D.runs.filter(r => r.default).map(r => r.i)), hidden: new Set(), metric: 'fid', atep: null, zoom: {} };
 const $ = id => document.getElementById(id);
 const NS = 'http://www.w3.org/2000/svg';
 const el = (tag, attrs = {}, parent) => { const e = document.createElementNS(NS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); if (parent) parent.appendChild(e); return e; };
@@ -224,16 +225,42 @@ function chart(svg, series, xlabel, ylabel, line, labels) {
   let [y0, y1] = [Math.min(...pts.map(p => p.y)), Math.max(...pts.map(p => p.y))];
   const minSpan = Math.abs(x1) * 0.1 || 1; if (x1 - x0 < minSpan) { const c = (x0 + x1) / 2; x0 = c - minSpan / 2; x1 = c + minSpan / 2; }
   const px = (x1 - x0) * 0.04, py = (y1 - y0) * 0.06 || 1; x0 -= px; x1 += px; y0 -= py; y1 += py;
+  const z = state.zoom[svg.id]; if (z) [x0, x1, y0, y1] = z; // box zoom (drag), reset by double-click
+  const zr = svg.parentNode.querySelector('.reset'); if (zr) zr.style.display = z ? 'inline' : 'none';
   const sx = x => m.l + (x - x0) / (x1 - x0) * (W - m.l - m.r), sy = y => H - m.b - (y - y0) / (y1 - y0) * (H - m.t - m.b);
+  const ix = px_ => x0 + (px_ - m.l) / (W - m.l - m.r) * (x1 - x0), iy = py_ => y0 + (H - m.b - py_) / (H - m.t - m.b) * (y1 - y0);
+  const inside = p => p.x >= x0 && p.x <= x1 && p.y >= y0 && p.y <= y1;
+  const clipId = 'clip_' + svg.id;
+  el('rect', { x: m.l, y: m.t, width: W - m.l - m.r, height: H - m.t - m.b }, el('clipPath', { id: clipId }, el('defs', {}, svg)));
+  // drag area under the marks: a box zooms in, double-click resets
+  const bg = el('rect', { x: m.l, y: m.t, width: W - m.l - m.r, height: H - m.t - m.b, fill: 'transparent', style: 'cursor:crosshair' }, svg);
+  bg.addEventListener('dblclick', () => { delete state.zoom[svg.id]; render(); });
+  bg.addEventListener('mousedown', ev => {
+    ev.preventDefault();
+    const box = svg.getBoundingClientRect(), sc = W / box.width;
+    const p0 = [(ev.clientX - box.left) * sc, (ev.clientY - box.top) * sc];
+    const sel = el('rect', { x: p0[0], y: p0[1], width: 0, height: 0, fill: 'rgba(42,120,214,0.10)', stroke: '#2a78d6', 'stroke-width': 1, 'pointer-events': 'none' }, svg);
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+    let p1 = p0;
+    const move = e => { p1 = [clamp((e.clientX - box.left) * sc, m.l, W - m.r), clamp((e.clientY - box.top) * sc, m.t, H - m.b)];
+      sel.setAttribute('x', Math.min(p0[0], p1[0])); sel.setAttribute('y', Math.min(p0[1], p1[1]));
+      sel.setAttribute('width', Math.abs(p1[0] - p0[0])); sel.setAttribute('height', Math.abs(p1[1] - p0[1])); };
+    const up = () => { window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up); sel.remove();
+      if (Math.abs(p1[0] - p0[0]) > 6 && Math.abs(p1[1] - p0[1]) > 6) {
+        state.zoom[svg.id] = [ix(Math.min(p0[0], p1[0])), ix(Math.max(p0[0], p1[0])), iy(Math.max(p0[1], p1[1])), iy(Math.min(p0[1], p1[1]))]; render(); } };
+    window.addEventListener('mousemove', move); window.addEventListener('mouseup', up);
+  });
   for (const v of ticks(y0, y1)) { el('line', { x1: m.l, x2: W - m.r, y1: sy(v), y2: sy(v), stroke: D.grid }, svg); el('text', { x: m.l - 6, y: sy(v) + 4, 'text-anchor': 'end' }, svg).textContent = v; }
   for (const v of ticks(x0, x1, 6)) { el('line', { x1: sx(v), x2: sx(v), y1: m.t, y2: H - m.b, stroke: D.grid }, svg); el('text', { x: sx(v), y: H - m.b + 15, 'text-anchor': 'middle' }, svg).textContent = v; }
   el('text', { x: (m.l + W - m.r) / 2, y: H - 6, 'text-anchor': 'middle' }, svg).textContent = xlabel;
   el('text', { x: 12, y: (m.t + H - m.b) / 2, 'text-anchor': 'middle', transform: `rotate(-90 12 ${(m.t + H - m.b) / 2})` }, svg).textContent = ylabel;
+  const marks = el('g', { 'clip-path': `url(#${clipId})` }, svg); // lines and markers clipped to the plot area when zoomed
   for (const s of series) {
-    if (line && s.pts.length > 1) el('path', { d: s.pts.map((p, k) => `${k ? 'L' : 'M'}${sx(p.x)},${sy(p.y)}`).join(''), fill: 'none', stroke: s.run.color, 'stroke-width': 2, 'stroke-linejoin': 'round' }, svg);
+    if (line && s.pts.length > 1) el('path', { d: s.pts.map((p, k) => `${k ? 'L' : 'M'}${sx(p.x)},${sy(p.y)}`).join(''), fill: 'none', stroke: s.run.color, 'stroke-width': 2, 'stroke-linejoin': 'round' }, marks);
   }
   for (const s of series) for (const p of s.pts) {
-    el('path', { d: markerPath(s.run.marker, sx(p.x), sy(p.y), 4.5), fill: s.run.color, stroke: D.surface, 'stroke-width': 2 }, svg);
+    if (!inside(p)) continue;
+    el('path', { d: markerPath(s.run.marker, sx(p.x), sy(p.y), 4.5), fill: s.run.color, stroke: D.surface, 'stroke-width': 2 }, marks);
     const hit = el('circle', { cx: sx(p.x), cy: sy(p.y), r: 10, fill: 'transparent', style: 'cursor:pointer' }, svg);
     hit.addEventListener('mousemove', ev => showTip(ev, s.run, p.ev));
     hit.addEventListener('mouseleave', () => { $('tip').style.display = 'none'; });
@@ -298,7 +325,9 @@ for (const [k, v] of Object.entries(D.metrics)) { const o = document.createEleme
 const allEps = [...new Set(D.runs.flatMap(r => r.evals.map(e => Math.round(e.epoch))))].filter(e => e > 0).sort((a, b) => a - b);
 for (const e of allEps) { const o = document.createElement('option'); o.value = e; o.textContent = e; $('atep').appendChild(o); }
 state.atep = allEps.includes(20) ? 20 : allEps[allEps.length - 1]; $('atep').value = state.atep;
-$('metric').addEventListener('change', e => { state.metric = e.target.value; render(); });
+$('metric').addEventListener('change', e => { state.metric = e.target.value; state.zoom = {}; render(); });
+$('atep').addEventListener('change', () => { delete state.zoom.c_params; });
+document.querySelectorAll('.reset').forEach(a => a.addEventListener('click', e => { e.preventDefault(); delete state.zoom[a.dataset.c]; render(); }));
 $('atep').addEventListener('change', e => { state.atep = +e.target.value; render(); });
 $('search').addEventListener('input', renderList);
 const visibleInList = () => D.runs.filter(r => { const t = $('search').value.toLowerCase().split(/\s+/).filter(Boolean); return t.every(x => r.path.toLowerCase().includes(x)); });
