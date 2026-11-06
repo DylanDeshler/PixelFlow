@@ -182,7 +182,8 @@ def instrumented_forward(net, x, t, y, capture_blocks=(), tile=None, skip_on=Tru
     else:
         # final layer (the skip branch's own when the skip is on), unpatchify / overlap-add, DC-AE head
         out = net.output(h, c, net.prediction_layer() if skip is not None else None,
-                         head=net.sampled_head() if skip is not None or not getattr(net, 'skip_pathway', False) else net.trunk_head())
+                         head=net.sampled_head() if skip is not None or not getattr(net, 'skip_pathway', False) else net.trunk_head(),
+                         **({'res': res} if getattr(net, 'tail', None) is not None else {})) # a tail with its own key mixes reads the AttnRes state
     stats = {k: torch.stack(v) for k, v in stats.items()}
     if bypass_ratio is not None:
         stats['bypass_ratio'] = bypass_ratio.reshape(1)

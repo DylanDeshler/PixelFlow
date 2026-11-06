@@ -545,6 +545,7 @@ class PerceiverTail(nn.Module):
             self.key_queries = nn.ParameterList([nn.Parameter(torch.zeros(hidden_size)) for _ in range(num_blocks)])
             self.key_mix_norms = nn.ModuleList([make_norm(hidden_size, layernorm) for _ in range(num_blocks)])
         self.mix_record = None # diagnostics: a list -> each block's depth-mix weights (keys 'own')
+        self.mix_base = None # (keys 'own') index of the first tail key mix among the AttnRes queries, set by JiT: 2 * depth + 1
         self.blocks = nn.ModuleList([TailBlock(dim, hidden_size, num_heads, hidden_size, mlp_ratio, layernorm, head_dim) for _ in range(num_blocks)])
         self.norm_final = make_norm(dim, layernorm)
         self.final_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * dim, bias=True))
@@ -601,7 +602,7 @@ class PerceiverTail(nn.Module):
         xp = self.patchify(x_lin)
         if self.keys_mode == 'own':
             assert res is not None, "tail_keys='own' needs the AttnRes state"
-            mixes = [res.mix_query(q, n)[:, self.prefix:] for q, n in zip(self.key_queries, self.key_mix_norms)]
+            mixes = [res.mix(self.mix_base + b)[:, self.prefix:] for b in range(len(self.blocks))] # (AttnResState: extra queries)
             if self.mix_record is not None:
                 self.mix_record.append([res.mix_weights(q, n).cpu() for q, n in zip(self.key_queries, self.key_mix_norms)])
             keys = [b.keys(self.kv_norm(m), self.rope_k) for b, m in zip(self.blocks, mixes)]
@@ -736,7 +737,13 @@ class AttnResState:
         w_l(c) = w_l * (1 + scale(c)) + shift(c), from one zero-initialized projection shared by all of them (as in
         adaLN-single). On the key side the shift would cancel in the softmax over sources, so it goes on the query.
         """
-        self.queries, self.norms = net.attn_res_queries, net.attn_res_norms
+        self.queries, self.norms = list(net.attn_res_queries), list(net.attn_res_norms)
+        tail = getattr(net, 'tail', None)
+        if tail is not None and tail.keys_mode == 'own': # the tail's key-mix queries ride along as extra columns after the
+            # final layer's (index 2 * depth + 1 + b): scored in the same matmul as every source is created, mixed in the same
+            # chunked pass as the final layer's mix
+            self.queries += list(tail.key_queries)
+            self.norms += list(tail.key_mix_norms)
         self.eps = self.norms[0].variance_epsilon
         self.centered = isinstance(self.norms[0], LayerNorm) # LayerNorm keys: scores need the mean subtracted
         self.group = 1 if net.attn_res == 'full' else 2 * net.attn_res_block_size # sublayers per source
@@ -750,8 +757,8 @@ class AttnResState:
         self._append(emb)
 
     def make_keys(self, net, c):
-        gains = torch.stack([n.weight for n in self.norms]) # [2 * depth + 1, D]
-        queries = torch.stack(list(self.queries))
+        gains = torch.stack([n.weight for n in self.norms]) # [2 * depth + 1 (+ tail key mixes), D]
+        queries = torch.stack(self.queries)
         if net.attn_res_adaln:
             shift, scale = net.attn_res_modulation(c).unsqueeze(1).chunk(2, dim=-1) # [B, 1, D] each
             queries = queries * (1 + scale) + shift # [B, 2 * depth + 1, D]
@@ -1263,6 +1270,7 @@ class JiT(nn.Module):
                                       hidden_size, self.out_channels, tail_mlp_ratio, layernorm, tail_keys, in_context_len, tail_head_dim,
                                       tail_query_pos)
             assert tail_keys == 'shared' or attn_res == 'full', "tail_keys='own' needs attn_res='full' (a depth mix of the trunk's sources)"
+            self.tail.mix_base = 2 * depth + 1
         if dcae_trunk_head:
             self.trunk_output_head = DCAEHead(self.out_channels, patch_size, dcae_width, dcae_kernel2, hidden_size, layernorm, dcae_norm)
 
