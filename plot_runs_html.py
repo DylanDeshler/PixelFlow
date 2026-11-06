@@ -5,7 +5,9 @@ vs images seen, vs training compute and vs parameters, for every run under --run
   run list    every run with in-loop evals, searchable; checked by default if it has evals at >= --min_epochs epochs
   legend      the checked runs; click one to hide / show it on every chart, double-click to show only it (again: all)
   charts      FID vs images seen (sample efficiency), vs training PFLOPs (images x 3 x forward FLOPs: compute efficiency),
-              vs trainable parameters at a chosen epoch; hover a point for its numbers
+              vs training wall-clock hours (hardware- and implementation-dependent: images seen / the run's typical
+              throughput, the mode of its logged img/s; evals and compilation excluded), vs trainable parameters at a chosen epoch; hover a point for its numbers,
+              drag a box to zoom, double-click to reset
   table       the visible runs' numbers (the same data as the charts)
 A run keeps its colour + marker whatever else is selected (6 colours x 6 markers, by its position in the full list).
 
@@ -21,6 +23,7 @@ $ python plot_runs_html.py --runs_root=runs/in100_128 --out=runs/plots/in100.htm
 import os
 import glob
 import json
+import math
 import time
 
 import plot_style as ps
@@ -110,10 +113,18 @@ for d in bar(dirs, f'reading {len(dirs)} runs'):
     log = os.path.join(d, 'train_log.jsonl')
     if os.path.exists(log):
         try:
-            v = sorted(r['imgs_per_sec'] for r in map(json.loads, open(log)) if 'imgs_per_sec' in r and r.get('epoch', 0) > 0.5)
-            ips = round(v[len(v) // 2]) if v else None
+            v = [r['imgs_per_sec'] for r in map(json.loads, open(log)) if r.get('imgs_per_sec') and r.get('epoch', 0) > 0.5]
         except json.JSONDecodeError:
-            pass
+            v = []
+        if v: # the run's typical steady throughput: the mode of its logged img/s (2% bins), robust to compilation, eval
+              # stalls, a shared GPU or resumes, then the mean of the values in that bin
+            bins = {}
+            for x in v:
+                bins.setdefault(round(math.log(x) / math.log(1.02)), []).append(x)
+            top = max(bins.values(), key=len)
+            ips = round(sum(top) / len(top))
+    for e in evals: # training wall-clock at the typical throughput (evals and compilation excluded)
+        e['hours'] = e['images'] * 1e6 / ips / 3600 if ips else None
     runs.append({'path': os.path.relpath(d, runs_root), 'tokens': label_tokens(d, runs_root, res.get('arch')), 'params': params, 'gflops': gfl,
                  'ips': ips, 'evals': evals, 'max_epoch': evals[-1]['epoch'], 'default': evals[-1]['epoch'] >= min_epochs - 0.25})
 os.makedirs(os.path.dirname(out) or '.', exist_ok=True)
@@ -147,7 +158,7 @@ main { display: grid; grid-template-columns: 330px 1fr; min-height: calc(100vh -
 #legend .item { display: flex; gap: 5px; align-items: center; cursor: pointer; padding: 2px 4px; border-radius: 4px; }
 #legend .item:hover { background: #f1f0ec; }
 #legend .item.off { opacity: 0.35; }
-#charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 12px; }
+#charts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 20px; }
 .chart h2 { font-size: 13px; font-weight: 600; margin: 4px 0 2px; }
 .chart h2 .reset { font-weight: 400; font-size: 12px; margin-left: 8px; color: #2a78d6; display: none; }
 svg text { fill: var(--ink2); font-size: 11px; }
@@ -176,6 +187,7 @@ details summary { cursor: pointer; color: var(--ink2); margin-top: 12px; }
   <div id="charts">
     <div class="chart"><h2>vs images seen <a href="#" class="reset" data-c="c_images">reset zoom</a></h2><svg id="c_images"></svg></div>
     <div class="chart"><h2>vs training compute <a href="#" class="reset" data-c="c_flops">reset zoom</a></h2><svg id="c_flops"></svg></div>
+    <div class="chart"><h2>vs training wall-clock <a href="#" class="reset" data-c="c_hours">reset zoom</a></h2><svg id="c_hours"></svg></div>
     <div class="chart"><h2>vs parameters <a href="#" class="reset" data-c="c_params">reset zoom</a></h2><svg id="c_params"></svg></div>
   </div>
   <details><summary>table of the visible runs</summary><div id="table"></div></details>
@@ -272,7 +284,7 @@ function showTip(ev, r, e) {
   const t = $('tip');
   const mark = `<svg width="14" height="14" style="vertical-align:-2px;margin-right:5px"><path d="${markerPath(r.marker, 7, 7, 5)}" fill="${r.color}"/></svg>`;
   t.innerHTML = `${mark}<b>${r.label}</b><br><span class="muted">${r.path}</span><br>epoch ${fmt(e.epoch, 1)} &middot; ${fmt(e.images, 1)}M images` + (e.pflops != null ? ` &middot; ${fmt(e.pflops, 0)} PFLOPs` : '') +
-    `<br>FID ${fmt(e.fid)}` + (e.is != null ? ` &middot; IS ${fmt(e.is)}` : '') + (e.precision != null ? ` &middot; precision ${fmt(e.precision, 3)} &middot; recall ${fmt(e.recall, 3)}` : '') +
+    (e.hours != null ? ` &middot; ${fmt(e.hours, 2)} h` : '') + `<br>FID ${fmt(e.fid)}` + (e.is != null ? ` &middot; IS ${fmt(e.is)}` : '') + (e.precision != null ? ` &middot; precision ${fmt(e.precision, 3)} &middot; recall ${fmt(e.recall, 3)}` : '') +
     `<br><span class="muted">${r.params ? (r.params / 1e6).toFixed(2) + 'M params' : 'params ?'} &middot; ${r.gflops ? r.gflops.toFixed(2) + ' GFLOP/img fwd' : 'FLOPs ?'}${r.ips ? ' &middot; ' + r.ips + ' img/s' : ''}</span>`;
   t.style.display = 'block';
   const x = Math.min(ev.clientX + 14, window.innerWidth - t.offsetWidth - 8), y = Math.min(ev.clientY + 14, window.innerHeight - t.offsetHeight - 8);
@@ -287,6 +299,7 @@ function render() {
   const series = (fx) => vis.map(r => ({ run: r, pts: r.evals.filter(e => e[mk] != null && fx(e) != null).map(e => ({ x: fx(e), y: e[mk], ev: e })) })).filter(s => s.pts.length);
   chart($('c_images'), series(e => e.images), 'images seen (M)', ylab, true);
   chart($('c_flops'), series(e => e.pflops), 'training compute (PFLOPs: images × 3 × forward FLOPs)', ylab, true);
+  chart($('c_hours'), series(e => e.hours), 'training hours (images / typical img/s on this GPU; evals excluded)', ylab, true);
   const ps = vis.map(r => { const e = nearest(r, state.atep); return e && r.params && e[mk] != null ? { run: r, pts: [{ x: r.params / 1e6, y: e[mk], ev: e }] } : null; }).filter(Boolean);
   chart($('c_params'), ps, 'trainable parameters (M)', `${ylab} at epoch ${state.atep}`, false, ps.length <= 4);
   // legend: the selected runs
