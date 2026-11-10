@@ -177,6 +177,8 @@ proj_dropout = 0.0
 P_mean = -0.8
 P_std = 0.8
 t_eps = 5e-2
+input_perturb = 0.0 # DDPM-IP: the training input's noise gets an extra Gaussian of this relative size (target unchanged), so the model
+                    # learns to correct slightly-off inputs like its own sampling steps produce (exposure bias); 0 = off, paper ~0.1
 noise_scale = 0.0 # 0 -> img_size / 256, JiT's resolution rule (1.0 at 256, 2.0 at 512)
 token_sizes = '' # 'coarse,fine' (e.g. '16,8', coarse = the model's patch size): two token sizes on one trunk, each training
                  # sample's size drawn in proportion to the fine tokens' measured loss gain at its noise level (model_jit.TokenAllocation)
@@ -278,6 +280,9 @@ diag_opt_stats = True # 4: grad norms and update/weight ratios per block, every 
 device = 'cuda'
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float32'
 compile = True # torch.compile the whole network; False disables dynamo entirely
+compile_mode = 'model' # 'model': one whole-network graph (fastest steps at depth 12; full AttnRes makes its compile grow with the
+                       # square of depth: 20-30 min at depth 18); 'blocks': blocks' branches + AttnRes mixing compiled as small
+                       # separate graphs (compile ~linear in depth). Implementation only: same math, run names and checkpoints
 alloc_eval = True # two token sizes: the allocation's eval (alloc_eval.py) at every eval: matched per-size held-out loss per t,
                   # FID under fixed allocations (same noise and labels), fixed sample rows, plots
 alloc_eval_conditions = 'coarse,budget,budget:0.5,fine,window:0-0.25,window:0.25-0.5,window:0.5-0.75,window:0.75-1'
@@ -483,6 +488,7 @@ if skip_pathway:
 assert time_schedule in ('uniform', 'shift', 'train_quantile'), f'unknown time_schedule {time_schedule}'
 assert sampling_method in ('heun', 'euler', 'ancestral'), f'unknown sampling_method {sampling_method}'
 denoiser.time_schedule = time_schedule
+denoiser.input_perturb = input_perturb # training inputs only (masking.perturbed)
 summary(denoiser)
 print(describe_arch(model, arch))
 if is_quadtree:
@@ -708,7 +714,11 @@ if compile:
     if act_memory_budget < 1.0:
         import torch._functorch.config
         torch._functorch.config.activation_memory_budget = act_memory_budget
-    denoiser.net.compile()
+    assert compile_mode in ('model', 'blocks'), f"compile_mode must be model or blocks, got {compile_mode}"
+    if compile_mode == 'blocks' and hasattr(denoiser.net, 'use_block_compile'):
+        denoiser.net.use_block_compile()
+    else:
+        denoiser.net.compile()
 ref_stats_path = os.path.join(data_dir, 'fid_stats_jit.npz')
 if not os.path.exists(ref_stats_path):
     ref_stats_path = os.path.join(data_dir, 'fid_stats.npz')

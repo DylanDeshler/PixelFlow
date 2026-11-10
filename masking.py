@@ -99,7 +99,7 @@ def flow_loss(denoiser, x, labels, masker=None, mask=None, weighting='effective_
     labels = denoiser.drop_labels(labels) if denoiser.training else labels
     t = denoiser.sample_t(x.size(0), device=x.device).view(-1, *([1] * (x.ndim - 1)))
     e = torch.randn_like(x) * denoiser.noise_scale
-    z = t * x + (1 - t) * e
+    z = t * x + (1 - t) * perturbed(denoiser, e)
     two = denoiser.training and getattr(denoiser.net, 'skip_stop_grad', False)
     kwargs = {'return_trunk': True} if two else {}
     if mask is None:
@@ -132,6 +132,20 @@ def flow_loss(denoiser, x, labels, masker=None, mask=None, weighting='effective_
     return loss
 
 
+def perturbed(denoiser, e):
+    """
+    Input perturbation (DDPM-IP, Ning et al. ICML 2023, 'Input Perturbation Reduces Exposure Bias in Diffusion Models'), in
+    training only: the network's input uses the noise e + gamma * noise_scale * xi (xi a fresh Gaussian) while the target stays
+    the clean image, so it learns to map slightly-off inputs, like the ones its own earlier sampling steps produce, back to
+    the data instead of following their error. Scaled by (1 - t) with the noise, as in the paper. gamma =
+    denoiser.input_perturb (train_jit.py --input_perturb, 0 = off); evals and diagnostics never perturb.
+    """
+    gamma = getattr(denoiser, 'input_perturb', 0.0)
+    if gamma <= 0 or not denoiser.training:
+        return e
+    return e + gamma * denoiser.noise_scale * torch.randn_like(e)
+
+
 def _two_size_loss(denoiser, x, labels, return_aux, parts, weighter, mask, backward=None, path_aux=None):
     """
     flow_loss for a two-token-size JiT (token_sizes, model_jit.TokenAllocation): a fixed quota of the batch (fine_frac) goes
@@ -145,7 +159,7 @@ def _two_size_loss(denoiser, x, labels, return_aux, parts, weighter, mask, backw
     labels = denoiser.drop_labels(labels)
     B = x.size(0)
     t = denoiser.sample_t(B, device=x.device).view(-1, *([1] * (x.ndim - 1)))
-    z = t * x + (1 - t) * torch.randn_like(x) * denoiser.noise_scale
+    z = t * x + (1 - t) * perturbed(denoiser, torch.randn_like(x) * denoiser.noise_scale)
     k = max(1, min(B - 1, round(net.alloc.fine_frac * B)))
     w = net.alloc.weights(t.flatten())
     gumbel = -torch.log(-torch.log(torch.rand(B, device=x.device).clamp(1e-20, 1.0)))

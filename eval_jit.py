@@ -153,6 +153,7 @@ save_samples = '' # '', 'png' or 'npz'
 device = 'cuda'
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float32'
 compile = True
+compile_mode = 'model' # as train_jit.py: 'model' (whole network) or 'blocks' (small graphs: fast compile for deep full-AttnRes models)
 attn_impl = 'sdpa' # attention kernel: 'sdpa' (torch's fused kernel, default) or 'jit' (JiT's explicit attention); see model_jit.JiT.set_attn_impl
 attn_res_chunk = 1 # full AttnRes models: mix in chunks of this many sublayers (same samples up to rounding, faster); 1 = off
 alloc_infer = 'rank' # two token sizes: 'rank' (fine on the top fine_frac of t by gain) or 'train' (each call fine with the training
@@ -189,7 +190,7 @@ if hasattr(denoiser.net, 'set_attn_impl'):
     denoiser.net.set_attn_impl(attn_impl)
 if compile:
     # every sampling call has the same batch (fixed_shape below), so one static graph serves the whole evaluation
-    denoiser.net.compile()
+    denoiser.net.use_block_compile() if compile_mode == 'blocks' and hasattr(denoiser.net, 'use_block_compile') else denoiser.net.compile()
 denoiser.time_schedule = time_schedule
 if getattr(denoiser.net, 'token_sizes', ()):
     denoiser.net.alloc.t_dist = (denoiser.P_mean, denoiser.P_std)

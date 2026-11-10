@@ -706,6 +706,47 @@ class _DepthMix(torch.autograd.Function):
         return (grad_alpha, *(grad * a[i] for i in range(len(sources))))
 
 
+# compile_mode='blocks' (JiT.use_block_compile): the AttnRes mixing as a few small compiled functions instead of being unrolled
+# into one whole-model graph, whose mixing terms grow with the square of the number of sublayers (a 20-30 minute compile at
+# depth 18). Each is compiled once per source count that occurs (a handful), so compile time grows ~linearly with depth,
+# and each keeps the fused access pattern: a chunk's k mixes read every older source once.
+def _attnres_logits(v, keys, eps: float, centered: bool):
+    ms = torch.linalg.vecdot(v, v).unsqueeze(-1).float() / v.shape[-1]
+    dots = (v @ keys.transpose(-1, -2).to(v.dtype)).float()
+    if not centered:
+        return dots * torch.rsqrt(ms + eps)
+    mean = v.float().mean(-1, keepdim=True)
+    ksum = keys.float().sum(-1)
+    ksum = ksum[:, None, :] if ksum.dim() == 2 else ksum
+    return (dots - mean * ksum) * torch.rsqrt(ms - mean ** 2 + eps)
+
+def _attnres_chunk(z, *sources):
+    # z: [S, B, T, k] logits of the k sublayers of a chunk over the S sources existing at its start -> the k partial mixes
+    # [k, B, T, D] (each normalized over these sources) and their logsumexp [B, T, k]
+    alpha = z.softmax(0)
+    dt = sources[0].dtype
+    A = torch.stack([sum(alpha[i, ..., j].unsqueeze(-1).to(dt) * v for i, v in enumerate(sources)) for j in range(z.shape[-1])])
+    return A, torch.logsumexp(z, 0)
+
+def _attnres_fold(lse, A, z_new, *new):
+    # merge a chunk's partial mix (logsumexp lse [B, T], mix A [B, T, D]) with its newer sources (logits z_new [n, B, T])
+    w = torch.cat([lse.unsqueeze(0), z_new]).softmax(0)
+    dt = A.dtype
+    return w[0].unsqueeze(-1).to(dt) * A + sum(w[i + 1].unsqueeze(-1).to(dt) * v for i, v in enumerate(new))
+
+def _attnres_mix(z, *sources):
+    # plain mix: z [S, B, T] logits over S sources
+    alpha = z.softmax(0)
+    return sum(alpha[i].unsqueeze(-1).to(v.dtype) * v for i, v in enumerate(sources))
+
+_ATTNRES_COMPILED = {}
+def _attnres_fn(name):
+    if name not in _ATTNRES_COMPILED:
+        fn = {'logits': _attnres_logits, 'chunk': _attnres_chunk, 'fold': _attnres_fold, 'mix': _attnres_mix}[name]
+        _ATTNRES_COMPILED[name] = torch.compile(fn)
+    return _ATTNRES_COMPILED[name]
+
+
 class AttnResState:
     """
     Attention Residuals (Kimi Team 2026, arXiv 2603.15031): instead of the fixed sum h_l = h_1 + sum_i f_i(h_i), the
@@ -753,6 +794,7 @@ class AttnResState:
         self.count = 0
         self.weights = None # {sublayer: mean mixing weight per source [S]} when recording (diagnostics only)
         self.chunk = getattr(net, 'attn_res_chunk', 1) if self.group == 1 else 1
+        self.compiled = getattr(net, 'compile_blocks', False) # compile_mode='blocks': mixing through the small compiled helpers
         self._pre = None # chunked mixing: the current chunk's partial mixes over the sources that existed at its start
         self._append(emb)
 
@@ -781,6 +823,8 @@ class AttnResState:
 
     def _logits(self, v, keys):
         # v: [B, T, D] -> w . RMSNorm(v) for each row of keys, fp32 [B, T, K]
+        if self.compiled and not torch.compiler.is_compiling():
+            return _attnres_fn('logits')(v, keys, self.eps, self.centered)
         ms = torch.linalg.vecdot(v, v).unsqueeze(-1).float() / v.shape[-1] # mean square, [B, T, 1]
         dots = (v @ keys.transpose(-1, -2).to(v.dtype)).float()
         if not self.centered:
@@ -811,13 +855,21 @@ class AttnResState:
         if pre is None or not (pre['start'] <= l < pre['start'] + len(pre['A'])):
             cols = list(range(l, min(l + self.chunk, self.logits[0].shape[-1])))
             z = torch.stack([c[..., cols] for c in self.logits]) # [S, B, T, k] fp32
-            alpha = z.softmax(0)
-            A = [sum(alpha[i, ..., j].unsqueeze(-1).to(dt) * v for i, v in enumerate(self.sources)) for j in range(len(cols))]
-            pre = self._pre = dict(start=l, n0=len(self.sources), A=A, lse=torch.logsumexp(z, 0))
+            if self.compiled and not torch.compiler.is_compiling():
+                A, lse = _attnres_fn('chunk')(z, *self.sources)
+                A = list(A.unbind(0))
+            else:
+                alpha = z.softmax(0)
+                A = [sum(alpha[i, ..., j].unsqueeze(-1).to(dt) * v for i, v in enumerate(self.sources)) for j in range(len(cols))]
+                lse = torch.logsumexp(z, 0)
+            pre = self._pre = dict(start=l, n0=len(self.sources), A=A, lse=lse)
         j = l - pre['start']
         new = self.sources[pre['n0']:]
         if not new:
             return pre['A'][j]
+        if self.compiled and not torch.compiler.is_compiling():
+            z_new = torch.stack([self.logits[i][..., l] for i in range(pre['n0'], len(self.sources))])
+            return _attnres_fn('fold')(pre['lse'][..., j], pre['A'][j], z_new, *new)
         w = torch.stack([pre['lse'][..., j]] + [self.logits[i][..., l] for i in range(pre['n0'], len(self.sources))]).softmax(0)
         return w[0].unsqueeze(-1).to(dt) * pre['A'][j] + sum(w[i + 1].unsqueeze(-1).to(dt) * v for i, v in enumerate(new))
 
@@ -839,6 +891,8 @@ class AttnResState:
             # whole-model compile unrolls the block loop, so S is fixed here: the plain weighted sum fuses into one
             # kernel and the compiler saves only alpha and the sources for backward
             return sum(alpha[i].unsqueeze(-1).to(v.dtype) * v for i, v in enumerate(sources))
+        if self.compiled and self.weights is None:
+            return _attnres_fn('mix')(torch.stack(logits), *sources)
         return _DepthMix.apply(alpha, *sources)
 
     def mix_query(self, query, norm):
@@ -1122,6 +1176,7 @@ class JiT(nn.Module):
         # JiT blocks per Block AttnRes block; 0 -> about 8 blocks, the paper's default
         self.attn_res_block_size = attn_res_block_size or max(1, round(depth / 8))
         self.attn_res_chunk = 1 # implementation only (AttnResState): > 1 mixes full AttnRes in chunks of sublayers; no parameters
+        self.compile_blocks = False # implementation only: see use_block_compile
         self.adaln_single = adaln_single
         assert not attn_res_adaln or attn_res != 'none', 'attn_res_adaln needs attn_res'
         self.attn_res_adaln = attn_res_adaln
@@ -1546,6 +1601,25 @@ class JiT(nn.Module):
         out[m] = fine
         out[~m] = coarse.to(fine.dtype)
         return out
+
+    def use_block_compile(self):
+        """
+        compile_mode='blocks' (instead of Module.compile on the whole network): the blocks' attention / MLP branches compile
+        on their own (they're @torch.compile methods: identical graphs, cached after the first block), the AttnRes mixing
+        runs through small compiled helpers (see _attnres_fn), the patch embedding, final layer and tail's dense part are
+        compiled separately; the glue in between runs eagerly. Same math, same parameters and checkpoints; compile time
+        grows ~linearly with depth instead of with its square.
+        """
+        self.compile_blocks = True
+        import torch._dynamo.config as dcfg
+        for k in ('recompile_limit', 'cache_size_limit'): # each block's branches are a recompile of the same method (guards on
+            try:                                          # the module), and the AttnRes helpers one per source count: past the
+                setattr(dcfg, k, max(getattr(dcfg, k), 256))  # default limit of 8 they would silently run uncompiled
+            except AttributeError:
+                pass
+        self.x_embedder.compile()
+        if self.tail is not None:
+            self.tail.run_chunk = torch.compile(self.tail.run_chunk)
 
     def set_attn_impl(self, impl):
         """

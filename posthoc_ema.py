@@ -47,6 +47,7 @@ save_best = True # write the best EMA as a checkpoint for eval_jit.py
 device = 'cuda'
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float32'
 compile = True
+compile_mode = 'model' # as train_jit.py: 'model' (whole network) or 'blocks' (small graphs: fast compile for deep full-AttnRes models)
 attn_res_chunk = 1 # full AttnRes models: chunked mixing (same samples up to rounding, faster)
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
@@ -100,7 +101,7 @@ ctx = nullcontext() if (device_type == 'cpu' or dtype == 'float32') else torch.a
 denoiser = build_denoiser(**meta['denoiser_args']).to(device).eval()
 denoiser.net.attn_res_chunk = attn_res_chunk
 if compile:
-    denoiser.net.compile()
+    denoiser.net.use_block_compile() if compile_mode == 'blocks' and hasattr(denoiser.net, 'use_block_compile') else denoiser.net.compile()
 denoiser.time_schedule = 'uniform'
 ref_path = os.path.join(data_dir, 'fid_stats_jit.npz')
 ref_stats = load_ref_stats(ref_path if os.path.exists(ref_path) else os.path.join(data_dir, 'fid_stats.npz'))
