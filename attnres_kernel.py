@@ -92,35 +92,44 @@ if HAVE_TRITON:
     class _MultiMix(torch.autograd.Function):
         @staticmethod
         def forward(ctx, alpha, *sources):
-            S, N, K = alpha.shape
-            D = sources[0].shape[-1]
-            dt = sources[0].dtype
-            out = torch.empty((K, N, D), device=alpha.device, dtype=dt)
-            ptrs = torch.tensor([v.data_ptr() for v in sources], device=alpha.device, dtype=torch.int64)
-            KP, warps = _launch_cfg(K)
-            grid = (triton.cdiv(N, BLOCK_N), triton.cdiv(D, BLOCK_D))
-            _mix_fwd[grid](ptrs, alpha, out, S, N, K, D, DTYPE=_TL_DTYPE[dt], KP=KP, BN=BLOCK_N, BD=BLOCK_D, num_warps=warps)
+            out = _mix_forward(alpha, sources)
             ctx.save_for_backward(alpha, *sources)
             return out
+
+    def _mix_forward(alpha, sources):
+        # alpha [S, N, K] fp32, sources S x [N, D] -> [K, N, D]
+        S, N, K = alpha.shape
+        D = sources[0].shape[-1]
+        dt = sources[0].dtype
+        out = torch.empty((K, N, D), device=alpha.device, dtype=dt)
+        ptrs = torch.tensor([v.data_ptr() for v in sources], device=alpha.device, dtype=torch.int64)
+        KP, warps = _launch_cfg(K)
+        grid = (triton.cdiv(N, BLOCK_N), triton.cdiv(D, BLOCK_D))
+        _mix_fwd[grid](ptrs, alpha, out, S, N, K, D, DTYPE=_TL_DTYPE[dt], KP=KP, BN=BLOCK_N, BD=BLOCK_D, num_warps=warps)
+        return out
 
         @staticmethod
         def backward(ctx, gout):
             alpha, *sources = ctx.saved_tensors
-            S, N, K = alpha.shape
-            D = sources[0].shape[-1]
-            dt = sources[0].dtype
-            gout = gout.contiguous()
-            if gout.dtype != dt:
-                gout = gout.to(dt)
-            grads = [torch.empty_like(v) for v in sources]
-            galpha = torch.zeros_like(alpha)
-            ptrs = torch.tensor([v.data_ptr() for v in sources], device=alpha.device, dtype=torch.int64)
-            gptrs = torch.tensor([g.data_ptr() for g in grads], device=alpha.device, dtype=torch.int64)
-            KP, warps = _launch_cfg(K)
-            grid = (triton.cdiv(N, BLOCK_N), triton.cdiv(D, BLOCK_D))
-            _mix_bwd[grid](ptrs, gptrs, alpha, gout, galpha, S, N, K, D, DTYPE=_TL_DTYPE[dt], KP=KP, BN=BLOCK_N, BD=BLOCK_D,
-                           num_warps=warps)
-            return (galpha, *grads)
+            return tuple(_mix_backward(alpha, sources, gout))
+
+    def _mix_backward(alpha, sources, gout):
+        # alpha [S, N, K] fp32, sources S x [N, D], gout [K, N, D] -> [d alpha, d source_0, ..., d source_S-1]
+        S, N, K = alpha.shape
+        D = sources[0].shape[-1]
+        dt = sources[0].dtype
+        gout = gout.contiguous()
+        if gout.dtype != dt:
+            gout = gout.to(dt)
+        grads = [torch.empty_like(v) for v in sources]
+        galpha = torch.zeros_like(alpha)
+        ptrs = torch.tensor([v.data_ptr() for v in sources], device=alpha.device, dtype=torch.int64)
+        gptrs = torch.tensor([g.data_ptr() for g in grads], device=alpha.device, dtype=torch.int64)
+        KP, warps = _launch_cfg(K)
+        grid = (triton.cdiv(N, BLOCK_N), triton.cdiv(D, BLOCK_D))
+        _mix_bwd[grid](ptrs, gptrs, alpha, gout, galpha, S, N, K, D, DTYPE=_TL_DTYPE[dt], KP=KP, BN=BLOCK_N, BD=BLOCK_D,
+                       num_warps=warps)
+        return [galpha, *grads]
 
 
 def kernel_usable(sources):
