@@ -92,6 +92,10 @@ class Prefetcher:
             os.posix_fadvise(self.fd, 0, 0, os.POSIX_FADV_RANDOM)
         shape = (sampler.batch_size, data.img_size, data.img_size, 3)
         self.buffers = [torch.empty(shape, dtype=torch.uint8, pin_memory=self.cuda) for _ in range(depth + 1)]
+        # labels in pinned buffers too: a pageable host-to-device copy synchronizes the stream before it starts (whatever
+        # non_blocking says), which stalled every training step until the GPU drained its queue. Harmless when a step is
+        # one compiled graph, costly when Python launches many small ops (compile_mode='blocks': ~2.5x slower)
+        self.label_buffers = [torch.empty(sampler.batch_size, dtype=torch.int64, pin_memory=self.cuda) for _ in range(depth + 1)]
         self.copied = [None] * len(self.buffers) # CUDA event after each buffer's last host-to-device copy
         self.free, self.ready = queue.Queue(), queue.Queue()
         for k in range(len(self.buffers)):
@@ -126,26 +130,28 @@ class Prefetcher:
                 parts = np.array_split(np.arange(len(idx)), min(self.workers, len(idx)))
                 for f in [self.pool.submit(self._read_rows, out[p[0]:p[-1] + 1], idx[p[0]:p[-1] + 1]) for p in parts if len(p)]:
                     f.result()
-                self.ready.put((k, self.data.labels[idx]))
+                self.label_buffers[k].numpy()[:] = self.data.labels[idx]
+                self.ready.put((k, None))
         except BaseException as e: # surfaced by next()
             self.ready.put((None, e))
 
     def next(self):
-        k, labels = self.ready.get()
+        k, err = self.ready.get()
         if k is None:
-            raise RuntimeError('background data loading failed') from labels
-        if self.cuda:
+            raise RuntimeError('background data loading failed') from err
+        if self.cuda: # both copies from pinned memory: truly asynchronous; the event marks when the buffers can be refilled
             x = self.buffers[k].to(self.device, non_blocking=True)
+            y = self.label_buffers[k].to(self.device, non_blocking=True)
             self.copied[k] = torch.cuda.Event()
             self.copied[k].record()
         else:
-            x = self.buffers[k].clone()
+            x, y = self.buffers[k].clone(), self.label_buffers[k].clone()
         self.free.put(k)
         x = x.permute(0, 3, 1, 2)
         if self.flip:
             mask = torch.rand(x.shape[0], device=self.device) < 0.5
             x = torch.where(mask.view(-1, 1, 1, 1), x.flip(-1), x)
-        return x.float().div_(255).mul_(2).sub_(1), torch.from_numpy(labels).to(self.device, non_blocking=True)
+        return x.float().div_(255).mul_(2).sub_(1), y
 
 def to_model_input(x_uint8, flip, device):
     """

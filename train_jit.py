@@ -457,7 +457,8 @@ def get_batch():
     if prefetcher is not None:
         return prefetcher.next()
     x, y = data.get(sampler.next())
-    return to_model_input(x, flip=True, device=device), torch.from_numpy(y).to(device, non_blocking=True)
+    y = torch.from_numpy(y)
+    return to_model_input(x, flip=True, device=device), (y.pin_memory() if 'cuda' in device else y).to(device, non_blocking=True) # pinned: no stream sync
 prefetcher = None # started just before training (after a resume has set the sampler's epoch)
 
 # model
