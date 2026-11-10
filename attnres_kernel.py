@@ -89,13 +89,6 @@ if HAVE_TRITON:
         KP = max(1, triton.next_power_of_2(K))
         return KP, (8 if KP >= 16 else 4)
 
-    class _MultiMix(torch.autograd.Function):
-        @staticmethod
-        def forward(ctx, alpha, *sources):
-            out = _mix_forward(alpha, sources)
-            ctx.save_for_backward(alpha, *sources)
-            return out
-
     def _mix_forward(alpha, sources):
         # alpha [S, N, K] fp32, sources S x [N, D] -> [K, N, D]
         S, N, K = alpha.shape
@@ -107,6 +100,13 @@ if HAVE_TRITON:
         grid = (triton.cdiv(N, BLOCK_N), triton.cdiv(D, BLOCK_D))
         _mix_fwd[grid](ptrs, alpha, out, S, N, K, D, DTYPE=_TL_DTYPE[dt], KP=KP, BN=BLOCK_N, BD=BLOCK_D, num_warps=warps)
         return out
+
+    class _MultiMix(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, alpha, *sources):
+            out = _mix_forward(alpha, sources)
+            ctx.save_for_backward(alpha, *sources)
+            return out
 
         @staticmethod
         def backward(ctx, gout):
