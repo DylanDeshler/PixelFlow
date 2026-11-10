@@ -795,6 +795,7 @@ class AttnResState:
         self.weights = None # {sublayer: mean mixing weight per source [S]} when recording (diagnostics only)
         self.chunk = getattr(net, 'attn_res_chunk', 1) if self.group == 1 else 1
         self.compiled = getattr(net, 'compile_blocks', False) # compile_mode='blocks': mixing through the small compiled helpers
+        self.kernel = getattr(net, 'attn_res_kernel', False) # (outside compiled graphs) the fused Triton multi-mix, attnres_kernel.py
         self._pre = None # chunked mixing: the current chunk's partial mixes over the sources that existed at its start
         self._append(emb)
 
@@ -855,7 +856,11 @@ class AttnResState:
         if pre is None or not (pre['start'] <= l < pre['start'] + len(pre['A'])):
             cols = list(range(l, min(l + self.chunk, self.logits[0].shape[-1])))
             z = torch.stack([c[..., cols] for c in self.logits]) # [S, B, T, k] fp32
-            if self.compiled and not torch.compiler.is_compiling():
+            if self.kernel and not torch.compiler.is_compiling():
+                from attnres_kernel import multi_mix
+                A = list(multi_mix(z.softmax(0), self.sources).unbind(0)) # [k] x [B, T, D], each source read once
+                lse = torch.logsumexp(z, 0)
+            elif self.compiled and not torch.compiler.is_compiling():
                 A, lse = _attnres_fn('chunk')(z, *self.sources)
                 A = list(A.unbind(0))
             else:
@@ -867,8 +872,12 @@ class AttnResState:
         new = self.sources[pre['n0']:]
         if not new:
             return pre['A'][j]
-        if self.compiled and not torch.compiler.is_compiling():
+        if (self.kernel or self.compiled) and not torch.compiler.is_compiling():
             z_new = torch.stack([self.logits[i][..., l] for i in range(pre['n0'], len(self.sources))])
+            if self.kernel:
+                from attnres_kernel import multi_mix
+                w = torch.cat([pre['lse'][..., j].unsqueeze(0), z_new]).softmax(0) # [1 + n, B, T]
+                return multi_mix(w.unsqueeze(-1), [pre['A'][j], *new])[0]
             return _attnres_fn('fold')(pre['lse'][..., j], pre['A'][j], z_new, *new)
         w = torch.stack([pre['lse'][..., j]] + [self.logits[i][..., l] for i in range(pre['n0'], len(self.sources))]).softmax(0)
         return w[0].unsqueeze(-1).to(dt) * pre['A'][j] + sum(w[i + 1].unsqueeze(-1).to(dt) * v for i, v in enumerate(new))
@@ -891,6 +900,9 @@ class AttnResState:
             # whole-model compile unrolls the block loop, so S is fixed here: the plain weighted sum fuses into one
             # kernel and the compiler saves only alpha and the sources for backward
             return sum(alpha[i].unsqueeze(-1).to(v.dtype) * v for i, v in enumerate(sources))
+        if self.kernel and self.weights is None:
+            from attnres_kernel import multi_mix
+            return multi_mix(alpha.unsqueeze(-1), sources)[0]
         if self.compiled and self.weights is None:
             return _attnres_fn('mix')(torch.stack(logits), *sources)
         return _DepthMix.apply(alpha, *sources)
@@ -1177,6 +1189,7 @@ class JiT(nn.Module):
         self.attn_res_block_size = attn_res_block_size or max(1, round(depth / 8))
         self.attn_res_chunk = 1 # implementation only (AttnResState): > 1 mixes full AttnRes in chunks of sublayers; no parameters
         self.compile_blocks = False # implementation only: see use_block_compile
+        self.attn_res_kernel = False # implementation only: AttnRes mixes through attnres_kernel.multi_mix (outside compiled graphs)
         self.adaln_single = adaln_single
         assert not attn_res_adaln or attn_res != 'none', 'attn_res_adaln needs attn_res'
         self.attn_res_adaln = attn_res_adaln

@@ -154,6 +154,7 @@ device = 'cuda'
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float32'
 compile = True
 compile_mode = 'model' # as train_jit.py: 'model' (whole network) or 'blocks' (small graphs: fast compile for deep full-AttnRes models)
+attn_res_kernel = False # full AttnRes: mixes through the fused Triton kernel (attnres_kernel.py; needs compile_mode='blocks' or no compile)
 attn_impl = 'sdpa' # attention kernel: 'sdpa' (torch's fused kernel, default) or 'jit' (JiT's explicit attention); see model_jit.JiT.set_attn_impl
 attn_res_chunk = 1 # full AttnRes models: mix in chunks of this many sublayers (same samples up to rounding, faster); 1 = off
 alloc_infer = 'rank' # two token sizes: 'rank' (fine on the top fine_frac of t by gain) or 'train' (each call fine with the training
@@ -186,6 +187,7 @@ ctx = nullcontext() if (device_type == 'cpu' or dtype == 'float32') else torch.a
 
 denoiser, meta = load_denoiser(ckpt, ema, device) # eval mode: inference only (also keeps the compiled graph from being rebuilt for a train-mode call)
 denoiser.net.attn_res_chunk = attn_res_chunk
+denoiser.net.attn_res_kernel = attn_res_kernel
 if hasattr(denoiser.net, 'set_attn_impl'):
     denoiser.net.set_attn_impl(attn_impl)
 if compile:

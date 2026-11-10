@@ -283,6 +283,7 @@ compile = True # torch.compile the whole network; False disables dynamo entirely
 compile_mode = 'model' # 'model': one whole-network graph (fastest steps at depth 12; full AttnRes makes its compile grow with the
                        # square of depth: 20-30 min at depth 18); 'blocks': blocks' branches + AttnRes mixing compiled as small
                        # separate graphs (compile ~linear in depth). Implementation only: same math, run names and checkpoints
+attn_res_kernel = False # full AttnRes: mixes through the fused Triton kernel (attnres_kernel.py; needs compile_mode='blocks' or no compile)
 alloc_eval = True # two token sizes: the allocation's eval (alloc_eval.py) at every eval: matched per-size held-out loss per t,
                   # FID under fixed allocations (same noise and labels), fixed sample rows, plots
 alloc_eval_conditions = 'coarse,budget,budget:0.5,fine,window:0-0.25,window:0.25-0.5,window:0.5-0.75,window:0.75-1'
@@ -699,6 +700,9 @@ if phema_stds:
 
 trainable_params = [p for _, p in trainable if p.requires_grad]
 denoiser.net.attn_res_chunk = attn_res_chunk # (AttnRes models only; implementation, not architecture)
+if attn_res_kernel:
+    assert not compile or compile_mode == 'blocks', "attn_res_kernel runs outside compiled graphs: use --compile_mode=blocks (or --compile=False)"
+    denoiser.net.attn_res_kernel = True
 if getattr(denoiser.net, 'tail', None) is not None:
     denoiser.net.tail.checkpoint, denoiser.net.tail.chunks = tail_checkpoint, tail_chunks
 if token_sizes:
