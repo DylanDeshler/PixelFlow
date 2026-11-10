@@ -85,6 +85,14 @@ if HAVE_TRITON:
             ga = tl.sum(v[None, :, :] * g, axis=2) # [KP, BN]: this feature tile's part of d out / d alpha
             tl.atomic_add(galpha + s * N * K + rn[None, :] * K + rk[:, None], ga, mask=ma)
 
+    def _ptr_table(tensors, device):
+        # the sources' data pointers as a device int64 table, uploaded asynchronously from pinned memory: a plain
+        # torch.tensor(..., device='cuda') copies from pageable memory, which blocks the host until the GPU drains, i.e. a
+        # full synchronize on every mix (~80 per step), leaving the GPU idle while Python launches the next work. PyTorch's
+        # pinned-memory allocator keeps the host buffer until the copy has run.
+        host = torch.tensor([t.data_ptr() for t in tensors], dtype=torch.int64).pin_memory()
+        return host.to(device, non_blocking=True)
+
     def _launch_cfg(K):
         KP = max(1, triton.next_power_of_2(K))
         return KP, (8 if KP >= 16 else 4)
@@ -95,7 +103,7 @@ if HAVE_TRITON:
         D = sources[0].shape[-1]
         dt = sources[0].dtype
         out = torch.empty((K, N, D), device=alpha.device, dtype=dt)
-        ptrs = torch.tensor([v.data_ptr() for v in sources], device=alpha.device, dtype=torch.int64)
+        ptrs = _ptr_table(sources, alpha.device)
         KP, warps = _launch_cfg(K)
         grid = (triton.cdiv(N, BLOCK_N), triton.cdiv(D, BLOCK_D))
         _mix_fwd[grid](ptrs, alpha, out, S, N, K, D, DTYPE=_TL_DTYPE[dt], KP=KP, BN=BLOCK_N, BD=BLOCK_D, num_warps=warps)
@@ -123,8 +131,8 @@ if HAVE_TRITON:
             gout = gout.to(dt)
         grads = [torch.empty_like(v) for v in sources]
         galpha = torch.zeros_like(alpha)
-        ptrs = torch.tensor([v.data_ptr() for v in sources], device=alpha.device, dtype=torch.int64)
-        gptrs = torch.tensor([g.data_ptr() for g in grads], device=alpha.device, dtype=torch.int64)
+        ptrs = _ptr_table(sources, alpha.device)
+        gptrs = _ptr_table(grads, alpha.device)
         KP, warps = _launch_cfg(K)
         grid = (triton.cdiv(N, BLOCK_N), triton.cdiv(D, BLOCK_D))
         _mix_bwd[grid](ptrs, gptrs, alpha, gout, galpha, S, N, K, D, DTYPE=_TL_DTYPE[dt], KP=KP, BN=BLOCK_N, BD=BLOCK_D,
