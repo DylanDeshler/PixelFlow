@@ -66,35 +66,60 @@ def tile_mask(g, tile, n_prefix, device):
     mask[n_prefix:, n_prefix:] = same_tile
     return mask
 
-def _attention(attn, x, rope, n_prefix, g, mask=None):
+def _attention(attn, x, rope, n_prefix, g, mask=None, prefix=None):
+    # prefix (kv_prefix): normed / modulated prefix tokens [B, P, C], extra keys / values only (keys ordered [prefix,
+    # in-context, patches]). Gated attention (attn.gate_mode) applied as in model_jit.Attention
     B, N, C = x.shape
     H = attn.num_heads
     qkv = attn.qkv(x).reshape(B, N, 3, H, C // H).permute(2, 0, 3, 1, 4)
     q, k, v = qkv[0], qkv[1], qkv[2]
     q, k = rope(attn.q_norm(q)), rope(attn.k_norm(k))
+    P = 0
+    if prefix is not None:
+        kp, vp = attn.prefix_kv(prefix)
+        P = kp.shape[2]
+        k, v = torch.cat([kp, k], dim=2), torch.cat([vp, v], dim=2)
+        if mask is not None: # windowed ablation: every query may see the prefix
+            mask = torch.cat([torch.ones(*mask.shape[:-1], P, dtype=mask.dtype, device=mask.device), mask], dim=-1)
+    K = k.shape[2]
     with torch.autocast(device_type=x.device.type, enabled=False):
         logits = q.float() @ k.float().transpose(-2, -1) / math.sqrt(q.shape[-1])
         if mask is not None:
             logits = logits.masked_fill(~mask, float('-inf'))
         w = torch.softmax(logits, dim=-1)
     stats = {}
-    # attention entropy per query, normalized by log(N): 1 = uniform, 0 = attends to one token
-    stats['attn_entropy'] = (-(w * torch.log(w.clamp_min(1e-12))).sum(-1) / math.log(N)).mean()
+    # attention entropy per query, normalized by log(keys): 1 = uniform, 0 = attends to one token
+    stats['attn_entropy'] = (-(w * torch.log(w.clamp_min(1e-12))).sum(-1) / math.log(K)).mean()
     # locality of patch queries: mean spatial distance to the patches they attend to (renormalized over patch keys),
-    # relative to uniform attention; and the attention mass they put on the in-context class tokens
+    # relative to uniform attention; and the attention mass they put on the in-context class tokens (and kv_prefix tokens)
     wp = w[:, :, n_prefix:, :]
-    wpp = wp[..., n_prefix:]
+    wpp = wp[..., P + n_prefix:]
     wpp = wpp / wpp.sum(-1, keepdim=True).clamp_min(1e-12)
     _, dist, uniform = grid_geometry(g, x.device)
     stats['attn_dist'] = (wpp * dist).sum(-1).mean() / uniform
-    stats['attn_prefix_mass'] = wp[..., :n_prefix].sum(-1).mean() if n_prefix else torch.zeros((), device=x.device)
-    out = attn.proj((w @ v).transpose(1, 2).reshape(B, N, C)) # same casting as JiT: fp32 weights @ v under the caller's autocast
+    stats['attn_prefix_mass'] = wp[..., :P + n_prefix].sum(-1).mean() if (n_prefix or P) else torch.zeros((), device=x.device)
+    # attention sinks: per head, the largest share of attention any single key receives (mean over queries); mean and
+    # max over heads (uniform attention: 1 / keys), and which kind of key it is for the max head is left to the caller
+    received = w.mean(2) # [B, H, K]
+    sink = received.max(-1).values # [B, H]
+    stats['attn_sink_mass'] = sink.mean()
+    stats['attn_sink_max'] = sink.max(-1).values.mean()
+    stats['attn_sink_uniform'] = torch.tensor(1.0 / K, device=x.device)
+    o = w @ v # same casting as JiT: fp32 weights @ v under the caller's autocast
+    if getattr(attn, 'gate_mode', 'none') != 'none':
+        gv = attn.gate_values(x)
+        o = o * gv.to(o.dtype)
+        stats['attn_gate_mean'] = gv.float().mean()
+    else:
+        stats['attn_gate_mean'] = torch.ones((), device=x.device)
+    out = attn.proj(o.transpose(1, 2).reshape(B, N, C))
     return out, stats
 
-def _block(block, x, c, rope, n_prefix, g, mask=None, res=None, index=None):
+def _block(block, x, c, rope, n_prefix, g, mask=None, res=None, index=None, prefix=None):
     # res: AttnResState for attention-residual models (x is then the depth-mixed attention input, see JiTBlock.forward_attn_res)
     shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = block.modulation(c)
-    attn_out, stats = _attention(block.attn, modulate(block.norm1(x), shift_msa, scale_msa), rope, n_prefix, g, mask)
+    p = modulate(block.norm1(prefix), shift_msa, scale_msa) if prefix is not None else None
+    attn_out, stats = _attention(block.attn, modulate(block.norm1(x), shift_msa, scale_msa), rope, n_prefix, g, mask, prefix=p)
     if res is None:
         x = x + gate_msa.unsqueeze(1) * attn_out
         x = x + gate_mlp.unsqueeze(1) * block.mlp(modulate(block.norm2(x), shift_mlp, scale_mlp))
@@ -103,6 +128,9 @@ def _block(block, x, c, rope, n_prefix, g, mask=None, res=None, index=None):
         res.add(gate_mlp.unsqueeze(1) * block.mlp(modulate(block.norm2(res.mix(2 * index + 1)), shift_mlp, scale_mlp)))
         x = res.mix(2 * index + 2)
     stats['gate_msa'], stats['gate_mlp'] = gate_msa.abs().mean(), gate_mlp.abs().mean()
+    # high-norm token outliers (attention-sink tokens often show up as norm spikes): max / median token RMS, patch tokens
+    r = x[:, n_prefix:].float().pow(2).mean(-1).sqrt() # [B, N]
+    stats['token_norm_ratio'] = (r.max(-1).values / r.median(-1).values.clamp_min(1e-12)).mean()
     return x, stats
 
 def instrumented_forward(net, x, t, y, capture_blocks=(), tile=None, skip_on=True):
@@ -137,14 +165,16 @@ def instrumented_forward(net, x, t, y, capture_blocks=(), tile=None, skip_on=Tru
     else:
         h = net.x_embedder(x) + net.pos_embed
         bypass_ratio = None
-    stats = {k: [] for k in ('attn_entropy', 'attn_dist', 'attn_prefix_mass', 'gate_msa', 'gate_mlp')}
+    stats = {k: [] for k in ('attn_entropy', 'attn_dist', 'attn_prefix_mass', 'gate_msa', 'gate_mlp', 'attn_sink_mass', 'attn_sink_max',
+                             'attn_sink_uniform', 'attn_gate_mean', 'token_norm_ratio')}
+    kvp = y_emb.unsqueeze(1) + net.kv_prefix_posemb if getattr(net, 'kv_prefix_len', 0) > 0 else None # (kv_prefix, as JiT.run_blocks)
     feats = {}
     res = AttnResState(net, h, c) if getattr(net, 'attn_res', 'none') != 'none' else None
     if res is not None:
         res.weights = {0: torch.ones(1, device=x.device)} # record the depth-mixing weights; the first sublayer reads the embedding only
     for i, block in enumerate(net.blocks):
         if net.in_context_len > 0 and i == net.in_context_start:
-            ic = y_emb.unsqueeze(1).repeat(1, net.in_context_len, 1) + net.in_context_posemb
+            ic = (y_emb.unsqueeze(1).repeat(1, net.in_context_len, 1) * (1.0 if getattr(net, 'in_context_cond', True) else 0.0)) + net.in_context_posemb
             if res is None:
                 h = torch.cat([ic, h], dim=1)
             else:
@@ -152,7 +182,8 @@ def instrumented_forward(net, x, t, y, capture_blocks=(), tile=None, skip_on=Tru
                 h = res.mix(2 * i)
         n_prefix = net.in_context_len if (net.in_context_len > 0 and i >= net.in_context_start) else 0
         rope = net.feat_rope if i < net.in_context_start else net.feat_rope_incontext
-        h, block_stats = _block(block, h, c_blocks, rope, n_prefix, g, masks.get(n_prefix), res, i)
+        h, block_stats = _block(block, h, c_blocks, rope, n_prefix, g, masks.get(n_prefix), res, i,
+                                prefix=kvp if (kvp is not None and i >= net.kv_prefix_start) else None)
         if skip is not None and i + 1 == net.skip_inject_after < len(net.blocks):
             gated = net.skip_gate(c).unsqueeze(1) * skip
             skip_ratio = gated.float().pow(2).mean().sqrt() / h[:, n_prefix:].float().pow(2).mean().sqrt().clamp_min(1e-12)

@@ -59,6 +59,8 @@ eval_every_epochs = 10 # FID eval
 save_every_epochs = 1 # overwrite ckpt.pt
 keep_ckpt_every_epochs = 0 # also keep ckpt_{iter}.pt (EMA1 weights only, ~0.5 GB for JiT-B) for eval_jit.py / eval_linear.py; 0 = off
 log_interval = 100
+phase_timing = 0 # > 0: time this many training steps phase by phase (GPU synchronized around each phase, after 5 warm-up steps)
+                 # and print the averages once: data / forward / backward / optimizer / EMA. A diagnostic: it removes overlap
 eval_only = False # if True, script exits right after one FID eval (use with init_from='resume')
 init_from = 'scratch' # 'scratch' or 'resume'
 # wandb logging
@@ -147,6 +149,14 @@ skip_decoder_dim = 0 # decoder token width; 0 -> 16 for pixel, 64 for subpatch
 skip_decoder_blocks = 2 # decoder blocks (PixelDiT-B uses 2 pixel-level blocks)
 skip_decoder_rank = 0 # > 0: low-rank (cond -> rank -> per-token modulation) projections, instead of full ones
 skip_decoder_conv = False # a 3x3 conv over neighbouring decoder tokens in each block (crosses patch boundaries)
+attn_gate = 'none' # gated attention (Qiu et al. 2025): SDPA's output times 2 sigmoid(x W + b) from each token's attention input, per
+                   # head ('head') or per channel ('elem'); starts at exactly 1. Lets a head switch off per token (no need for sinks)
+in_context_cond = True # False: the in-context tokens are register tokens (learned per-token embedding only, no class embedding),
+                       # same count and entry block: what in-context tokens buy beyond being more tokens
+kv_prefix_len = 0 # > 0: this many conditioning tokens as extra keys / values only: JiT's in-context tokens frozen at their input value
+                  # (class embedding + learned per-token embedding), read by each block from kv_prefix_start through its own
+                  # norm / adaLN / key-value projections; never updated (no queries, MLP or residual): the in-context ablation
+kv_prefix_start = -1 # first block reading the prefix (0-indexed); -1 = the model's in_context_start (4 for JiT-B)
 tail_blocks = 0 # > 0: a Perceiver tail of this many cross-attention blocks, added to the final layer's image as a zero-initialized
                 # residual: queries at tail_query_patch sub-patches, started from the linear prediction, read every trunk token
                 # (full receptive field per pixel; model_jit.PerceiverTail). 0 = JiT as is
@@ -389,6 +399,9 @@ model_name, arch = resolve_arch(model, **{k: (None if v < 0 else v) for k, v in 
             tail_heads=tail_heads or None, tail_head_dim=tail_head_dim or None, tail_mlp_ratio=tail_mlp_ratio if tail_mlp_ratio != 4.0 else None,
             tail_keys=tail_keys if tail_keys != 'shared' else None,
             tail_query_pos=tail_query_pos if tail_query_pos != 'sincos' else None) if tail_blocks > 0 else {}),
+    attn_gate=None if attn_gate == 'none' else attn_gate, kv_prefix_len=kv_prefix_len or None,
+    in_context_cond=False if not in_context_cond else None,
+    kv_prefix_start=kv_prefix_start if kv_prefix_len and kv_prefix_start >= 0 else None,
     attn_res=None if attn_res == 'none' else attn_res,
     attn_res_block_size=attn_res_block_size if (attn_res == 'block' and attn_res_block_size > 0) else None,
     adaln_single=adaln_single or None, attn_res_adaln=attn_res_adaln or None, gated_bottleneck=gated_bottleneck or None,
@@ -459,6 +472,7 @@ def get_batch():
     x, y = data.get(sampler.next())
     y = torch.from_numpy(y)
     return to_model_input(x, flip=True, device=device), (y.pin_memory() if 'cuda' in device else y).to(device, non_blocking=True) # pinned: no stream sync
+phase_acc, phase_clock = {}, [0.0] # (phase_timing)
 prefetcher = None # started just before training (after a resume has set the sampler's epoch)
 
 # model
@@ -1324,6 +1338,18 @@ while True:
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     data_seconds = 0.0
+    timing = phase_timing > 0 and 5 <= local_iter_num < 5 + phase_timing
+    def tick(name): # phase_timing: synchronized wall time per phase
+        if timing:
+            if device_type == 'cuda':
+                torch.cuda.synchronize()
+            now = time.perf_counter()
+            phase_acc[name] = phase_acc.get(name, 0.0) + now - phase_clock[0]
+            phase_clock[0] = now
+    if timing:
+        if device_type == 'cuda':
+            torch.cuda.synchronize()
+        phase_clock[0] = time.perf_counter()
     for micro_step in range(gradient_accumulation_steps):
         with ctx:
             loss_parts = {}
@@ -1356,12 +1382,15 @@ while True:
                 loss_disp = sum(dispersive_loss(c.out, disp_temp, disp_kind, pool=disp_pool, group=disp_group) for c in disp_captures) / len(disp_captures)
                 loss = loss + disp_weight * loss_disp
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+        tick('forward')
         # immediately fetch the next batch while the GPU works on the forward pass
         t_data = time.time()
         X, Y = get_batch()
         data_seconds += time.time() - t_data # host time reading the next batch (the GPU only overlaps it with the forward)
+        tick('data')
         if not token_sizes: # (already backpropagated per path)
             loss.backward()
+        tick('backward')
     # 4. optimization health: grad norms and update/weight ratios per block (only on logging iterations)
     log_opt = diag_opt_stats and iter_num % log_interval == 0
     if log_opt:
@@ -1371,7 +1400,9 @@ while True:
     # clip the gradient
     if grad_clip != 0.0:
         torch.nn.utils.clip_grad_norm_(trainable_params, grad_clip)
+    tick('log stats / clip')
     optimizer.step()
+    tick('optimizer')
     if log_opt:
         update_norms = diag_lib.grouped_norms((n, p.detach() - w) for (n, p), (_, w) in zip(named, weights_before))
         weight_norms = diag_lib.grouped_norms(weights_before)
@@ -1381,6 +1412,12 @@ while True:
     denoiser.update_ema(iter_num)
     if phema is not None:
         phema.update(denoiser.parameters(), iter_num + 1) # t = optimizer steps taken, counting this one
+    tick('ema')
+    if timing and local_iter_num == 4 + phase_timing:
+        tot = sum(phase_acc.values())
+        print(f"phase timing over {phase_timing} steps (GPU synchronized per phase, ms/step): " +
+              ', '.join(f"{k} {v / phase_timing * 1e3:.0f}" for k, v in phase_acc.items()) +
+              f"; total {tot / phase_timing * 1e3:.0f} ms = {effective_batch_size * phase_timing / tot:.0f} img/s", flush=True)
 
     # timing and logging
     t1 = time.time()

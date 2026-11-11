@@ -358,10 +358,17 @@ def scaled_dot_product_attention(query, key, value, dropout_p=0.0) -> torch.Tens
 
 
 class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=True, qk_norm=True, attn_drop=0., proj_drop=0., layernorm=False):
+    def __init__(self, dim, num_heads=8, qkv_bias=True, qk_norm=True, attn_drop=0., proj_drop=0., layernorm=False, gate='none'):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
+        # gate (attn_gate): Y = SDPA(...) * 2 sigmoid(x W_g + b), per head ('head') or per channel ('elem'), from each token's own
+        # attention input (Qiu et al. 2025, gated attention): a head can switch off per token, so it needn't park attention
+        # on a sink. W_g and b start at zero, so the gate starts at exactly 1 (the model starts as without it)
+        assert gate in ('none', 'head', 'elem'), f"attn_gate must be none, head or elem, got {gate}"
+        self.gate_mode = gate
+        if gate != 'none':
+            self.gate = nn.Linear(dim, num_heads if gate == 'head' else dim, bias=True)
 
         self.q_norm = make_norm(head_dim, layernorm) if qk_norm else nn.Identity()
         self.k_norm = make_norm(head_dim, layernorm) if qk_norm else nn.Identity()
@@ -372,8 +379,25 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x, rope):
+    def prefix_kv(self, prefix):
+        # kv_prefix: keys / values of the prefix tokens [B, P, C] (already normed and modulated): this layer's own key and
+        # value projections and key norm, no rotation (like JiT's in-context tokens), no queries
+        B, P, C = prefix.shape
+        kv = F.linear(prefix, self.qkv.weight[C:], self.qkv.bias[C:] if self.qkv.bias is not None else None)
+        k, v = kv.reshape(B, P, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        return self.k_norm(k), v
+
+    def gate_values(self, x):
+        # [B, H, N, 1] (head) or [B, H, N, head_dim] (elem) multipliers for SDPA's output, 1 at init
         B, N, C = x.shape
+        g = 2 * torch.sigmoid(self.gate(x))
+        if self.gate_mode == 'head':
+            return g.transpose(1, 2).unsqueeze(-1)
+        return g.reshape(B, N, self.num_heads, C // self.num_heads).transpose(1, 2)
+
+    def forward(self, x, rope, prefix=None):
+        B, N, C = x.shape
+        x_in = x # the gate reads each token's attention input
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
 
@@ -382,11 +406,16 @@ class Attention(nn.Module):
 
         q = rope(q)
         k = rope(k)
+        if prefix is not None: # kv_prefix: extra keys / values only
+            kp, vp = self.prefix_kv(prefix)
+            k, v = torch.cat([kp, k], dim=2), torch.cat([vp, v], dim=2)
 
         if self.impl == 'sdpa': # PyTorch's fused kernel (flash / memory-efficient): never stores the N x N weights
             x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.)
         else: # JiT's own: the full attention matrix in float32 (memory grows with N^2, saved for backward)
             x = scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.)
+        if self.gate_mode != 'none':
+            x = x * self.gate_values(x_in).to(x.dtype)
 
         x = x.transpose(1, 2).reshape(B, N, C)
 
@@ -622,11 +651,11 @@ class PerceiverTail(nn.Module):
 
 
 class JiTBlock(nn.Module):
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0, adaln_single=False, layernorm=False):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0, adaln_single=False, layernorm=False, attn_gate='none'):
         super().__init__()
         self.norm1 = make_norm(hidden_size, layernorm)
         self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=True,
-                              attn_drop=attn_drop, proj_drop=proj_drop, layernorm=layernorm)
+                              attn_drop=attn_drop, proj_drop=proj_drop, layernorm=layernorm, gate=attn_gate)
         self.norm2 = make_norm(hidden_size, layernorm)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         self.mlp = SwiGLUFFN(hidden_size, mlp_hidden_dim, drop=proj_drop)
@@ -652,34 +681,37 @@ class JiTBlock(nn.Module):
             return (self.scale_shift_table[None] + c.view(c.shape[0], 6, -1)).to(c.dtype).unbind(1)
         return self.adaLN_modulation(c).chunk(6, dim=-1)
 
-    def forward(self, x, c, feat_rope=None, res=None, index=None):
+    def forward(self, x, c, feat_rope=None, res=None, index=None, prefix=None):
+        # prefix (kv_prefix): tokens [B, P, D] whose keys / values the patches can attend to, normed and modulated like x
         if res is None:
-            return self.forward_residual(x, c, feat_rope)
-        return self.forward_attn_res(x, c, feat_rope, res, index)
+            return self.forward_residual(x, c, feat_rope, prefix)
+        return self.forward_attn_res(x, c, feat_rope, res, index, prefix)
 
     @torch.compile
-    def forward_residual(self, x,  c, feat_rope=None):
+    def forward_residual(self, x,  c, feat_rope=None, prefix=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.modulation(c)
-        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), rope=feat_rope)
+        p = modulate(self.norm1(prefix), shift_msa, scale_msa) if prefix is not None else None
+        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), rope=feat_rope, prefix=p)
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
     @torch.compile
-    def attn_branch(self, x, c, feat_rope=None):
+    def attn_branch(self, x, c, feat_rope=None, prefix=None):
         shift_msa, scale_msa, gate_msa = self.modulation(c)[:3]
-        return gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), rope=feat_rope)
+        p = modulate(self.norm1(prefix), shift_msa, scale_msa) if prefix is not None else None
+        return gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), rope=feat_rope, prefix=p)
 
     @torch.compile
     def mlp_branch(self, x, c):
         shift_mlp, scale_mlp, gate_mlp = self.modulation(c)[3:]
         return gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
 
-    def forward_attn_res(self, x, c, feat_rope, res, index):
+    def forward_attn_res(self, x, c, feat_rope, res, index, prefix=None):
         """
         x: this block's attention input (already depth-mixed). Returns the next block's attention input (the final
         layer's input for the last block), so forward hooks see the representation the network actually passes on.
         """
-        res.add(self.attn_branch(x, c, feat_rope))
+        res.add(self.attn_branch(x, c, feat_rope, prefix))
         res.add(self.mlp_branch(res.mix(2 * index + 1), c))
         return res.mix(2 * index + 2)
 
@@ -1172,6 +1204,10 @@ class JiT(nn.Module):
         tail_keys='shared',
         tail_head_dim=0,
         tail_query_pos='sincos',
+        attn_gate='none',
+        in_context_cond=True,
+        kv_prefix_len=0,
+        kv_prefix_start=-1,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -1264,6 +1300,23 @@ class JiT(nn.Module):
         if self.in_context_len > 0:
             self.in_context_posemb = nn.Parameter(torch.zeros(1, self.in_context_len, hidden_size), requires_grad=True)
             torch.nn.init.normal_(self.in_context_posemb, std=.02)
+        # kv_prefix: JiT's in-context tokens frozen at their input value (class embedding + a learned per-token embedding),
+        # read by every block from kv_prefix_start (default: in_context_start) as extra keys / values only, through that
+        # block's own norm, adaLN modulation, key / value projections and key norm: no queries, no MLP, no residual stream, so
+        # they never update. The ablation of in-context tokens that keeps the conditioning tokens and drops their evolution
+        # (and nearly all their compute)
+        self.attn_gate = attn_gate
+        # in_context_cond=False: the in-context tokens carry no class embedding, only their learned per-token embedding, i.e.
+        # register tokens (Darcet et al. 2024) entering at in_context_start: separates "more tokens / a scratchpad" from
+        # "conditioning tokens" in what JiT's in-context tokens buy
+        self.in_context_cond = in_context_cond
+        self.kv_prefix_len = kv_prefix_len
+        self.kv_prefix_start = kv_prefix_start if kv_prefix_start >= 0 else in_context_start
+        if kv_prefix_len > 0:
+            assert not skip_pathway and not token_sizes, 'kv_prefix: no skip pathway or token_sizes'
+            assert self.kv_prefix_start < depth, f'kv_prefix_start {self.kv_prefix_start} must be < depth {depth}'
+            self.kv_prefix_posemb = nn.Parameter(torch.zeros(1, kv_prefix_len, hidden_size))
+            torch.nn.init.normal_(self.kv_prefix_posemb, std=.02)
 
         # rope
         half_head_dim = hidden_size // num_heads // 2
@@ -1283,7 +1336,8 @@ class JiT(nn.Module):
         self.blocks = nn.ModuleList([
             JiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio,
                      attn_drop=attn_drop if (depth // 4 * 3 > i >= depth // 4) else 0.0,
-                     proj_drop=proj_drop if (depth // 4 * 3 > i >= depth // 4) else 0.0, adaln_single=adaln_single, layernorm=layernorm)
+                     proj_drop=proj_drop if (depth // 4 * 3 > i >= depth // 4) else 0.0, adaln_single=adaln_single, layernorm=layernorm,
+                     attn_gate=attn_gate)
             for i in range(depth)
         ])
 
@@ -1433,6 +1487,10 @@ class JiT(nn.Module):
             self.skip_final_layer.load_state_dict(self.final_layer.state_dict())
         if self.tail is not None:
             self.tail.zero_init()
+        for block in self.blocks: # attention gates start at exactly 1 (2 sigmoid(0))
+            if getattr(block.attn, 'gate_mode', 'none') != 'none':
+                nn.init.constant_(block.attn.gate.weight, 0)
+                nn.init.constant_(block.attn.gate.bias, 0)
 
     def init_gates_pixart(self):
         """
@@ -1518,9 +1576,12 @@ class JiT(nn.Module):
 
     def run_blocks(self, x, res, start, end, c_blocks, y_emb, fine=False):
         # trunk blocks start..end-1 (0-indexed), with the in-context class tokens prepended at in_context_start
+        kvp = y_emb.unsqueeze(1) + self.kv_prefix_posemb if self.kv_prefix_len > 0 else None # [B, P, D] (kv_prefix)
         for i in range(start, end):
             if self.in_context_len > 0 and i == self.in_context_start:
                 in_context_tokens = y_emb.unsqueeze(1).repeat(1, self.in_context_len, 1)
+                if not self.in_context_cond: # register tokens: no class information
+                    in_context_tokens = torch.zeros_like(in_context_tokens)
                 in_context_tokens += self.in_context_posemb
                 if res is None:
                     x = torch.cat([in_context_tokens, x], dim=1)
@@ -1532,7 +1593,7 @@ class JiT(nn.Module):
                 rope = self.feat_rope_fine_incontext if prefix else self.feat_rope_fine
             else:
                 rope = self.feat_rope_incontext if prefix else self.feat_rope
-            x = self.blocks[i](x, c_blocks, rope, res=res, index=i)
+            x = self.blocks[i](x, c_blocks, rope, res=res, index=i, prefix=kvp if (kvp is not None and i >= self.kv_prefix_start) else None)
         return x
 
     def forward(self, x, t, y, return_trunk=False, patch=None):
