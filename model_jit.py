@@ -1208,6 +1208,7 @@ class JiT(nn.Module):
         in_context_cond=True,
         kv_prefix_len=0,
         kv_prefix_start=-1,
+        kv_prefix_depth=False,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -1318,6 +1319,11 @@ class JiT(nn.Module):
             assert self.kv_prefix_start < depth, f'kv_prefix_start {self.kv_prefix_start} must be < depth {depth}'
             self.kv_prefix_posemb = nn.Parameter(torch.zeros(1, kv_prefix_len, hidden_size))
             torch.nn.init.normal_(self.kv_prefix_posemb, std=.02)
+        # kv_prefix_depth: each reading block adds its own learned offset to the prefix tokens (so it reads its own prefix,
+        # not only its own projection of a shared one); zero at init, i.e. the model starts as the plain shared prefix
+        self.kv_prefix_depth = kv_prefix_depth and kv_prefix_len > 0
+        if self.kv_prefix_depth:
+            self.kv_prefix_depth_emb = nn.Parameter(torch.zeros(depth - self.kv_prefix_start, kv_prefix_len, hidden_size))
 
         # rope
         half_head_dim = hidden_size // num_heads // 2
@@ -1594,7 +1600,7 @@ class JiT(nn.Module):
                 rope = self.feat_rope_fine_incontext if prefix else self.feat_rope_fine
             else:
                 rope = self.feat_rope_incontext if prefix else self.feat_rope
-            x = self.blocks[i](x, c_blocks, rope, res=res, index=i, prefix=kvp if (kvp is not None and i >= self.kv_prefix_start) else None)
+            x = self.blocks[i](x, c_blocks, rope, res=res, index=i, prefix=self.prefix_for_block(kvp, i))
         return x
 
     def forward(self, x, t, y, return_trunk=False, patch=None):
@@ -1680,6 +1686,12 @@ class JiT(nn.Module):
         out[m] = fine
         out[~m] = coarse.to(fine.dtype)
         return out
+
+    def prefix_for_block(self, kvp, i):
+        # kv_prefix tokens block i reads ([B, P, D], or None before kv_prefix_start / without a prefix)
+        if kvp is None or i < self.kv_prefix_start:
+            return None
+        return kvp + self.kv_prefix_depth_emb[i - self.kv_prefix_start] if self.kv_prefix_depth else kvp
 
     def use_block_compile(self):
         """

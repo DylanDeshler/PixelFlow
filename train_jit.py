@@ -158,6 +158,7 @@ in_context_cond = True # False: the in-context tokens are register tokens (learn
 kv_prefix_len = 0 # > 0: this many conditioning tokens as extra keys / values only: JiT's in-context tokens frozen at their input value
                   # (class embedding + learned per-token embedding), read by each block from kv_prefix_start through its own
                   # norm / adaLN / key-value projections; never updated (no queries, MLP or residual): the in-context ablation
+kv_prefix_depth = False # kv_prefix: each reading block adds its own learned offset to the prefix tokens (zero at init: starts as the shared prefix)
 kv_prefix_start = -1 # first block reading the prefix (0-indexed); -1 = the model's in_context_start (4 for JiT-B)
 tail_blocks = 0 # > 0: a Perceiver tail of this many cross-attention blocks, added to the final layer's image as a zero-initialized
                 # residual: queries at tail_query_patch sub-patches, started from the linear prediction, read every trunk token
@@ -407,6 +408,7 @@ model_name, arch = resolve_arch(model, **{k: (None if v < 0 else v) for k, v in 
     attn_gate=None if attn_gate == 'none' else attn_gate, kv_prefix_len=kv_prefix_len or None,
     in_context_cond=False if not in_context_cond else None,
     kv_prefix_start=kv_prefix_start if kv_prefix_len and kv_prefix_start >= 0 else None,
+    kv_prefix_depth=True if kv_prefix_len and kv_prefix_depth else None,
     attn_res=None if attn_res == 'none' else attn_res,
     attn_res_block_size=attn_res_block_size if (attn_res == 'block' and attn_res_block_size > 0) else None,
     adaln_single=adaln_single or None, attn_res_adaln=attn_res_adaln or None, gated_bottleneck=gated_bottleneck or None,

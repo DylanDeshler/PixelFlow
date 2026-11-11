@@ -183,7 +183,7 @@ def instrumented_forward(net, x, t, y, capture_blocks=(), tile=None, skip_on=Tru
         n_prefix = net.in_context_len if (net.in_context_len > 0 and i >= net.in_context_start) else 0
         rope = net.feat_rope if i < net.in_context_start else net.feat_rope_incontext
         h, block_stats = _block(block, h, c_blocks, rope, n_prefix, g, masks.get(n_prefix), res, i,
-                                prefix=kvp if (kvp is not None and i >= net.kv_prefix_start) else None)
+                                prefix=net.prefix_for_block(kvp, i) if kvp is not None else None)
         if skip is not None and i + 1 == net.skip_inject_after < len(net.blocks):
             gated = net.skip_gate(c).unsqueeze(1) * skip
             skip_ratio = gated.float().pow(2).mean().sqrt() / h[:, n_prefix:].float().pow(2).mean().sqrt().clamp_min(1e-12)
