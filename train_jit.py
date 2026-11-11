@@ -59,6 +59,8 @@ eval_every_epochs = 10 # FID eval
 save_every_epochs = 1 # overwrite ckpt.pt
 keep_ckpt_every_epochs = 0 # also keep ckpt_{iter}.pt (EMA1 weights only, ~0.5 GB for JiT-B) for eval_jit.py / eval_linear.py; 0 = off
 log_interval = 100
+profile_steps = 0 # > 0: profile this many training steps (after 5 warm-up steps) with torch.profiler and print the top GPU ops by self
+                  # time (also {out_dir}/profile_trace.json for chrome://tracing / Perfetto). A diagnostic
 phase_timing = 0 # > 0: time this many training steps phase by phase (GPU synchronized around each phase, after 5 warm-up steps)
                  # and print the averages once: data / forward / backward / optimizer / EMA. A diagnostic: it removes overlap
 eval_only = False # if True, script exits right after one FID eval (use with init_from='resume')
@@ -1339,6 +1341,10 @@ while True:
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     data_seconds = 0.0
     timing = phase_timing > 0 and 5 <= local_iter_num < 5 + phase_timing
+    if profile_steps > 0 and local_iter_num == 5:
+        from torch.profiler import profile as _profile, ProfilerActivity
+        profiler = _profile(activities=[ProfilerActivity.CPU] + ([ProfilerActivity.CUDA] if device_type == 'cuda' else []), record_shapes=False)
+        profiler.__enter__()
     def tick(name): # phase_timing: synchronized wall time per phase
         if timing:
             if device_type == 'cuda':
@@ -1413,6 +1419,15 @@ while True:
     if phema is not None:
         phema.update(denoiser.parameters(), iter_num + 1) # t = optimizer steps taken, counting this one
     tick('ema')
+    if profile_steps > 0 and local_iter_num == 4 + profile_steps:
+        if device_type == 'cuda':
+            torch.cuda.synchronize()
+        profiler.__exit__(None, None, None)
+        sort_key = 'self_cuda_time_total' if device_type == 'cuda' else 'self_cpu_time_total'
+        print(f"profile over {profile_steps} training steps (top ops by GPU self time):\n" +
+              profiler.key_averages().table(sort_by=sort_key, row_limit=30, max_name_column_width=70), flush=True)
+        profiler.export_chrome_trace(os.path.join(out_dir, 'profile_trace.json'))
+        print(f"trace: {os.path.join(out_dir, 'profile_trace.json')}", flush=True)
     if timing and local_iter_num == 4 + phase_timing:
         tot = sum(phase_acc.values())
         print(f"phase timing over {phase_timing} steps (GPU synchronized per phase, ms/step): " +

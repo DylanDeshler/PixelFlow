@@ -42,6 +42,7 @@ tail_heads = 0 # 0 -> tail_dim / 64, as train_jit.py
 tail_head_dim = 0
 tail_mlp_ratio = 4.0 # 0 = attention-only tail
 tail_keys = 'shared'
+profile = False # profile 3 timed steps of each row with torch.profiler: top GPU ops by self time (compare with train_jit.py --profile_steps)
 rows = '' # ';'-separated row names to run (e.g. 'plain;full + adaln, chunk 8;block + adaln'); '' = all
 only_tails = False # run only the --tails rows (the stage-2 model + tail), not the AttnRes comparison
 tail_checkpoint = False # as train_jit.py: the tail's queries in chunks, recomputed in the backward
@@ -115,6 +116,16 @@ def bench(name, overrides, chunk=1):
             micro //= 2
             print(f'  {name}: out of memory, micro-batch {micro} x {batch_size // micro}', flush=True)
     ms = (time.perf_counter() - t0) / iters * 1e3
+    if profile:
+        from torch.profiler import profile as _profile, ProfilerActivity
+        with _profile(activities=[ProfilerActivity.CPU] + ([ProfilerActivity.CUDA] if device_type == 'cuda' else [])) as prof:
+            for _ in range(3):
+                step()
+            if device_type == 'cuda':
+                torch.cuda.synchronize()
+        sort_key = 'self_cuda_time_total' if device_type == 'cuda' else 'self_cpu_time_total'
+        print(f"  {name}: profile over 3 steps (top ops by GPU self time):\n" +
+              prof.key_averages().table(sort_by=sort_key, row_limit=30, max_name_column_width=70), flush=True)
     peak = torch.cuda.max_memory_allocated() / 1e9 if device_type == 'cuda' else float('nan')
     row = dict(name=name, ms=ms, ips=batch_size / ms * 1e3, peak=peak, micro=micro, compile_min=compile_s / 60)
     del denoiser, opt
