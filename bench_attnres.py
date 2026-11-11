@@ -52,6 +52,7 @@ warmup = 10
 iters = 30
 compile = True
 compile_mode = 'model' # as train_jit.py: 'model' (whole network) or 'blocks' (small graphs: fast compile for deep full-AttnRes models)
+attn_res_fused = False # as train_jit.py: the fused-backward AttnRes state (attnres_fused.py)
 attn_res_kernel = False # full AttnRes: mixes through the fused Triton kernel (attnres_kernel.py; needs compile_mode='blocks' or no compile)
 device = 'cuda'
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float32'
@@ -74,6 +75,7 @@ def bench(name, overrides, chunk=1):
     denoiser = build_denoiser(model_name, img_size, 1000, noise_scale=0.5, arch=arch).to(device).train()
     denoiser.net.attn_res_chunk = chunk
     denoiser.net.attn_res_kernel = attn_res_kernel
+    denoiser.net.attn_res_fused = attn_res_fused
     if getattr(denoiser.net, 'tail', None) is not None:
         denoiser.net.tail.checkpoint, denoiser.net.tail.chunks = tail_checkpoint, tail_chunks
     opt = torch.optim.AdamW(denoiser.net.parameters(), lr=1e-4, fused=device_type == 'cuda')

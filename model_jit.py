@@ -1226,6 +1226,7 @@ class JiT(nn.Module):
         self.attn_res_chunk = 1 # implementation only (AttnResState): > 1 mixes full AttnRes in chunks of sublayers; no parameters
         self.compile_blocks = False # implementation only: see use_block_compile
         self.attn_res_kernel = False # implementation only: AttnRes mixes through attnres_kernel.multi_mix (outside compiled graphs)
+        self.attn_res_fused = False # implementation only, opt-in: training uses attnres_fused (shared gradient buffer), else unchanged
         self.adaln_single = adaln_single
         assert not attn_res_adaln or attn_res != 'none', 'attn_res_adaln needs attn_res'
         self.attn_res_adaln = attn_res_adaln
@@ -1630,7 +1631,11 @@ class JiT(nn.Module):
         x_input = x # the raw noisy image, for a skip_decoder
         x = self.embed(x, c, fine)
 
-        res = AttnResState(self, x, c) if self.attn_res != 'none' else None
+        if self.attn_res != 'none' and self.attn_res_fused and not torch.compiler.is_compiling():
+            from attnres_fused import fused_supported, make_state
+            res = make_state(self, x, c) if fused_supported(self, self.training) else AttnResState(self, x, c)
+        else:
+            res = AttnResState(self, x, c) if self.attn_res != 'none' else None
         depth = len(self.blocks)
         k = self.skip_inject_after if self.skip_pathway else depth
         x = self.run_blocks(x, res, 0, k, c_blocks, y_emb, fine)
