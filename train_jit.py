@@ -522,7 +522,12 @@ else:
     print(f"model {model_name}: {sum(p.numel() for p in denoiser.net.parameters()) / 1e6:.1f}M params, "
           f"{(img_size // arch['patch_size']) ** 2} tokens of {arch['patch_size'] ** 2 * 3}-d patches")
 try: # parameters and forward FLOPs per image, for FID vs compute / size across runs (plot_scaling.py); one image, seconds
-    cost = model_cost(denoiser.net, img_size, num_classes, device=next(denoiser.net.parameters()).device)
+    # with torch.compile switched off, then Dynamo's state cleared: the blocks' branches carry class-level @torch.compile, and a
+    # forward under the FLOP counter (a dispatch mode) must not leave any compile decision behind (with compile_mode='blocks',
+    # training on the GPU box ran those branches uncompiled: 2.4x slower forward + backward and several GB more memory)
+    with torch.compiler.set_stance('force_eager'):
+        cost = model_cost(denoiser.net, img_size, num_classes, device=next(denoiser.net.parameters()).device)
+    torch._dynamo.reset()
     print(f"cost: {cost['params'] / 1e6:.2f}M trainable params, {cost['fwd_gflops']:.2f} forward GFLOPs per image")
 except Exception as e: # (other model families' forwards may not fit the probe; plot_scaling.py can still rebuild them)
     cost = {}
@@ -1433,6 +1438,24 @@ while True:
         print(f"phase timing over {phase_timing} steps (GPU synchronized per phase, ms/step): " +
               ', '.join(f"{k} {v / phase_timing * 1e3:.0f}" for k, v in phase_acc.items()) +
               f"; total {tot / phase_timing * 1e3:.0f} ms = {effective_batch_size * phase_timing / tot:.0f} img/s", flush=True)
+
+    if local_iter_num == 1 and compile and compile_mode == 'blocks' and hasattr(denoiser.net, 'blocks'):
+        # compile health check: the blocks' branches must have compiled graphs, or every block runs op by op (silently)
+        try:
+            from torch._dynamo.eval_frame import _debug_get_cache_entry_list
+            from model_jit import JiTBlock
+            counts = {}
+            for nm in ('attn_branch', 'mlp_branch'):
+                fn = getattr(JiTBlock, nm)
+                code = getattr(fn, '_torchdynamo_orig_callable', getattr(fn, '__wrapped__', fn)).__code__
+                counts[nm] = len(_debug_get_cache_entry_list(code))
+            msg = ', '.join(f'{k} {v} compiled graph(s)' for k, v in counts.items())
+            if min(counts.values()) == 0:
+                print(f"WARNING compile check: {msg}: the block branches are running UNCOMPILED (op by op: much slower, more memory)", flush=True)
+            else:
+                print(f"compile check: {msg}", flush=True)
+        except Exception as e:
+            print(f"compile check: could not inspect ({type(e).__name__}: {e})", flush=True)
 
     # timing and logging
     t1 = time.time()
