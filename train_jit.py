@@ -161,6 +161,7 @@ kv_prefix_len = 0 # > 0: this many conditioning tokens as extra keys / values on
 kv_prefix_depth = False # kv_prefix: each reading block adds its own learned offset to the prefix tokens (zero at init: starts as the shared prefix)
 kv_prefix_pool = 'none' # kv_prefix: each prefix token also carries a pooled image summary, scaled by a per-block function of t (zero at init):
                         # 'static' (pooled once at kv_prefix_start) or 'layer' (re-pooled at every reading block from its input)
+kv_prefix_pool_init = 0.02 # std of the pooling logits / queries at init (attn: ~ the logits' std); the model starts the same either way
 kv_prefix_pool_mode = 'spatial' # 'spatial' (learned content-independent weights over the patches) or 'attn' (learned queries vs the patches)
 kv_prefix_start = -1 # first block reading the prefix (0-indexed); -1 = the model's in_context_start (4 for JiT-B)
 tail_blocks = 0 # > 0: a Perceiver tail of this many cross-attention blocks, added to the final layer's image as a zero-initialized
@@ -414,6 +415,7 @@ model_name, arch = resolve_arch(model, **{k: (None if v < 0 else v) for k, v in 
     kv_prefix_depth=True if kv_prefix_len and kv_prefix_depth else None,
     kv_prefix_pool=kv_prefix_pool if kv_prefix_len and kv_prefix_pool != 'none' else None,
     kv_prefix_pool_mode=kv_prefix_pool_mode if kv_prefix_len and kv_prefix_pool != 'none' and kv_prefix_pool_mode != 'spatial' else None,
+    kv_prefix_pool_init=kv_prefix_pool_init if kv_prefix_len and kv_prefix_pool != 'none' and kv_prefix_pool_init != 0.02 else None,
     attn_res=None if attn_res == 'none' else attn_res,
     attn_res_block_size=attn_res_block_size if (attn_res == 'block' and attn_res_block_size > 0) else None,
     adaln_single=adaln_single or None, attn_res_adaln=attn_res_adaln or None, gated_bottleneck=gated_bottleneck or None,

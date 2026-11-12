@@ -1211,6 +1211,7 @@ class JiT(nn.Module):
         kv_prefix_depth=False,
         kv_prefix_pool='none',
         kv_prefix_pool_mode='spatial',
+        kv_prefix_pool_init=0.02,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -1341,10 +1342,13 @@ class JiT(nn.Module):
             n_read = depth - self.kv_prefix_start
             n_pool = n_read if self.kv_prefix_pool == 'layer' else 1
             n_patches = (input_size // patch_size) ** 2
+            # kv_prefix_pool_init: std of the pooling logits (spatial) or queries (attn: pooling logits then have std ~ this).
+            # The summary's scale starts at 0, so this doesn't change the model at init: pooling can start already selective
+            # (e.g. 1.0) instead of ~uniform (0.02), which a softmax over 64 patches is slow to leave
             if kv_prefix_pool_mode == 'spatial':
-                self.kv_prefix_pool_logits = nn.Parameter(torch.randn(n_pool, kv_prefix_len, n_patches) * 0.02)
+                self.kv_prefix_pool_logits = nn.Parameter(torch.randn(n_pool, kv_prefix_len, n_patches) * kv_prefix_pool_init)
             else:
-                self.kv_prefix_pool_queries = nn.Parameter(torch.randn(n_pool, kv_prefix_len, hidden_size) * 0.02)
+                self.kv_prefix_pool_queries = nn.Parameter(torch.randn(n_pool, kv_prefix_len, hidden_size) * kv_prefix_pool_init)
             self.kv_prefix_pool_scale = nn.Linear(hidden_size, n_read) # zero-initialized in initialize_weights
 
         # rope

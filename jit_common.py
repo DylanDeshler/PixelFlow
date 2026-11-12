@@ -100,14 +100,14 @@ def describe_arch(model, arch):
                   dcae_kernel2=1, patch_overlap=0, head_overlap=0, layernorm=False, skip_final_layer=False, skip_residual=False, dcae_trunk_head=False, gate_init='zero', dcae_norm='channel',
                   skip_decoder='linear', skip_decoder_dim=0, skip_decoder_blocks=2, skip_decoder_rank=0, skip_decoder_conv=False, skip_decoder_attnres=False,
                   skip_decoder_modulation=True, token_sizes='', fine_frac=0.25, alloc_floor=0.1, alloc_gain='rel',
-                  tail_blocks=0, tail_query_patch=4, tail_dim=256, tail_heads=0, tail_mlp_ratio=4.0, tail_keys='shared', tail_head_dim=0, tail_query_pos='sincos', attn_gate='none', in_context_cond=True, kv_prefix_len=0, kv_prefix_start=-1, kv_prefix_depth=False, kv_prefix_pool='none', kv_prefix_pool_mode='spatial')
+                  tail_blocks=0, tail_query_patch=4, tail_dim=256, tail_heads=0, tail_mlp_ratio=4.0, tail_keys='shared', tail_head_dim=0, tail_query_pos='sincos', attn_gate='none', in_context_cond=True, kv_prefix_len=0, kv_prefix_start=-1, kv_prefix_depth=False, kv_prefix_pool='none', kv_prefix_pool_mode='spatial', kv_prefix_pool_init=0.02)
     full = dict(preset, **arch)
     parts = []
     for k in ('depth', 'hidden_size', 'num_heads', 'patch_size', 'layernorm', 'bottleneck_dim', 'gated_bottleneck', 'patch_overlap', 'head_overlap', 'dcae_stem', 'dcae_head', 'dcae_trunk_head', 'dcae_norm', 'dcae_width', 'dcae_kernel2',
               'skip_pathway', 'skip_decoder', 'skip_decoder_dim', 'skip_decoder_blocks', 'skip_decoder_rank', 'skip_decoder_conv', 'skip_decoder_attnres',
               'skip_decoder_modulation', 'skip_head_blocks', 'skip_inject_block', 'skip_final_layer', 'skip_residual', 'mlp_ratio', 'in_context_len', 'in_context_start',
               'attn_res', 'attn_res_block_size', 'attn_res_adaln', 'adaln_single', 'gate_init', 'token_sizes', 'fine_frac', 'alloc_floor', 'alloc_gain',
-              'tail_blocks', 'tail_query_patch', 'tail_dim', 'tail_heads', 'tail_head_dim', 'tail_mlp_ratio', 'tail_keys', 'tail_query_pos', 'attn_gate', 'in_context_cond', 'kv_prefix_len', 'kv_prefix_start', 'kv_prefix_depth', 'kv_prefix_pool', 'kv_prefix_pool_mode'):
+              'tail_blocks', 'tail_query_patch', 'tail_dim', 'tail_heads', 'tail_head_dim', 'tail_mlp_ratio', 'tail_keys', 'tail_query_pos', 'attn_gate', 'in_context_cond', 'kv_prefix_len', 'kv_prefix_start', 'kv_prefix_depth', 'kv_prefix_pool', 'kv_prefix_pool_mode', 'kv_prefix_pool_init'):
         v = full[k]
         if k in ('token_sizes', 'fine_frac', 'alloc_floor', 'alloc_gain') and not full['token_sizes']:
             continue
@@ -117,7 +117,7 @@ def describe_arch(model, arch):
             continue
         if k in ('kv_prefix_start', 'kv_prefix_depth', 'kv_prefix_pool') and not full['kv_prefix_len']:
             continue
-        if k == 'kv_prefix_pool_mode' and (not full['kv_prefix_len'] or full['kv_prefix_pool'] == 'none'):
+        if k in ('kv_prefix_pool_mode', 'kv_prefix_pool_init') and (not full['kv_prefix_len'] or full['kv_prefix_pool'] == 'none'):
             continue
         if k == 'in_context_start' and full['in_context_len'] == 0 and not full['kv_prefix_len']:
             continue # unused without in-context tokens
@@ -596,7 +596,7 @@ _ARCH_SHORT = {'depth': 'd', 'hidden_size': 'w', 'num_heads': 'h', 'patch_size':
 _NAME_TOKENS = {
     'optimizer_type': '', 'muon_adjust_lr': 'muon-', 'muon_lr': 'muonlr', 'muon_weight_decay': 'muonwd',
     'muon_momentum': 'muonmom', 'muon_ns_steps': 'muonns', 'muon_split_fused': 'muonsplit', 'muon_adaln': 'muonadaln',
-    'noise_scale': 'noise', 'P_mean': 'pmean', 'token_sizes': 'tok-', 'fine_frac': 'fine', 'alloc_floor': 'allocfloor', 'alloc_gain': 'allocgain-', 'tail_blocks': 'tail', 'tail_query_patch': 'tailq', 'tail_dim': 'taildim', 'tail_heads': 'tailheads', 'tail_head_dim': 'tailhd', 'tail_query_pos': 'tailpos-', 'attn_gate': 'attngate-', 'in_context_cond': 'iclcond', 'kv_prefix_len': 'kvprefix', 'kv_prefix_start': 'kvprefixstart', 'kv_prefix_depth': 'kvprefixdepth', 'kv_prefix_pool': 'kvpool-', 'kv_prefix_pool_mode': 'kvpoolmode-', 'tail_mlp_ratio': 'tailmlp', 'tail_keys': 'tailkeys-', 'loss_freq_weight': 'lossf-', 'loss_freq_table': 'lossftable-', 'loss_t_weight': 'losst-', 'loss_weight_normalize': 'lossnorm', 'P_std': 'pstd', 't_eps': 'teps', 'input_perturb': 'ip', 'label_drop_prob': 'labeldrop',
+    'noise_scale': 'noise', 'P_mean': 'pmean', 'token_sizes': 'tok-', 'fine_frac': 'fine', 'alloc_floor': 'allocfloor', 'alloc_gain': 'allocgain-', 'tail_blocks': 'tail', 'tail_query_patch': 'tailq', 'tail_dim': 'taildim', 'tail_heads': 'tailheads', 'tail_head_dim': 'tailhd', 'tail_query_pos': 'tailpos-', 'attn_gate': 'attngate-', 'in_context_cond': 'iclcond', 'kv_prefix_len': 'kvprefix', 'kv_prefix_start': 'kvprefixstart', 'kv_prefix_depth': 'kvprefixdepth', 'kv_prefix_pool': 'kvpool-', 'kv_prefix_pool_mode': 'kvpoolmode-', 'kv_prefix_pool_init': 'kvpoolinit', 'tail_mlp_ratio': 'tailmlp', 'tail_keys': 'tailkeys-', 'loss_freq_weight': 'lossf-', 'loss_freq_table': 'lossftable-', 'loss_t_weight': 'losst-', 'loss_weight_normalize': 'lossnorm', 'P_std': 'pstd', 't_eps': 'teps', 'input_perturb': 'ip', 'label_drop_prob': 'labeldrop',
     'blr': 'blr', 'lr_schedule': 'lr-', 'min_lr': 'minlr', 'warmup_epochs': 'warmup', 'weight_decay': 'wd',
     'beta1': 'beta1-', 'beta2': 'beta2-', 'grad_clip': 'clip', 'ema_decay1': 'ema', 'ema_decay2': 'ema2-', 'ema_warmup': 'emawarmup',
     'attn_dropout': 'attndrop', 'proj_dropout': 'projdrop', 'attn_res': 'attnres-', 'attn_res_block_size': 'attnresbs',
