@@ -168,6 +168,8 @@ def instrumented_forward(net, x, t, y, capture_blocks=(), tile=None, skip_on=Tru
     stats = {k: [] for k in ('attn_entropy', 'attn_dist', 'attn_prefix_mass', 'gate_msa', 'gate_mlp', 'attn_sink_mass', 'attn_sink_max',
                              'attn_sink_uniform', 'attn_gate_mean', 'token_norm_ratio')}
     kvp = y_emb.unsqueeze(1) + net.kv_prefix_posemb if getattr(net, 'kv_prefix_len', 0) > 0 else None # (kv_prefix, as JiT.run_blocks)
+    pool_scale = net.kv_prefix_pool_scale(torch.nn.functional.silu(t_emb)) if getattr(net, 'kv_prefix_pool', 'none') != 'none' else None
+    pool_cache = {}
     feats = {}
     res = AttnResState(net, h, c) if getattr(net, 'attn_res', 'none') != 'none' else None
     if res is not None:
@@ -183,7 +185,7 @@ def instrumented_forward(net, x, t, y, capture_blocks=(), tile=None, skip_on=Tru
         n_prefix = net.in_context_len if (net.in_context_len > 0 and i >= net.in_context_start) else 0
         rope = net.feat_rope if i < net.in_context_start else net.feat_rope_incontext
         h, block_stats = _block(block, h, c_blocks, rope, n_prefix, g, masks.get(n_prefix), res, i,
-                                prefix=net.prefix_for_block(kvp, i) if kvp is not None else None)
+                                prefix=net.prefix_for_block(kvp, i, h[:, n_prefix:], pool_scale, pool_cache) if kvp is not None else None)
         if skip is not None and i + 1 == net.skip_inject_after < len(net.blocks):
             gated = net.skip_gate(c).unsqueeze(1) * skip
             skip_ratio = gated.float().pow(2).mean().sqrt() / h[:, n_prefix:].float().pow(2).mean().sqrt().clamp_min(1e-12)

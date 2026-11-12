@@ -1209,6 +1209,8 @@ class JiT(nn.Module):
         kv_prefix_len=0,
         kv_prefix_start=-1,
         kv_prefix_depth=False,
+        kv_prefix_pool='none',
+        kv_prefix_pool_mode='spatial',
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -1324,6 +1326,26 @@ class JiT(nn.Module):
         self.kv_prefix_depth = kv_prefix_depth and kv_prefix_len > 0
         if self.kv_prefix_depth:
             self.kv_prefix_depth_emb = nn.Parameter(torch.zeros(depth - self.kv_prefix_start, kv_prefix_len, hidden_size))
+        # kv_prefix_pool: each prefix token also carries a pooled summary of the image's patch tokens:
+        #   prefix_p(i) = class + position_p + s_i(t) * pool_p(block i's patch input)
+        # 'static' pools once (at kv_prefix_start, reused by every reading block), 'layer' at every reading block from its own
+        # input (the context follows the patches' evolution without a stream of its own). pool mode 'spatial': learned,
+        # content-independent weights over the patches (softmax of logits, small Gaussian init: ~uniform = the global mean at
+        # first); 'attn': content-dependent, learned queries dotted with the RMS-normalized patch features. s_i(t): one scalar
+        # per reading block from the timestep embedding, zero-initialized, so the model starts as the plain prefix
+        assert kv_prefix_pool in ('none', 'static', 'layer'), f"kv_prefix_pool must be none, static or layer, got {kv_prefix_pool}"
+        assert kv_prefix_pool_mode in ('spatial', 'attn'), f"kv_prefix_pool_mode must be spatial or attn, got {kv_prefix_pool_mode}"
+        self.kv_prefix_pool = kv_prefix_pool if kv_prefix_len > 0 else 'none'
+        self.kv_prefix_pool_mode = kv_prefix_pool_mode
+        if self.kv_prefix_pool != 'none':
+            n_read = depth - self.kv_prefix_start
+            n_pool = n_read if self.kv_prefix_pool == 'layer' else 1
+            n_patches = (input_size // patch_size) ** 2
+            if kv_prefix_pool_mode == 'spatial':
+                self.kv_prefix_pool_logits = nn.Parameter(torch.randn(n_pool, kv_prefix_len, n_patches) * 0.02)
+            else:
+                self.kv_prefix_pool_queries = nn.Parameter(torch.randn(n_pool, kv_prefix_len, hidden_size) * 0.02)
+            self.kv_prefix_pool_scale = nn.Linear(hidden_size, n_read) # zero-initialized in initialize_weights
 
         # rope
         half_head_dim = hidden_size // num_heads // 2
@@ -1494,6 +1516,9 @@ class JiT(nn.Module):
             self.skip_final_layer.load_state_dict(self.final_layer.state_dict())
         if self.tail is not None:
             self.tail.zero_init()
+        if getattr(self, 'kv_prefix_pool', 'none') != 'none': # the pooled summary starts switched off (scale 0)
+            nn.init.constant_(self.kv_prefix_pool_scale.weight, 0)
+            nn.init.constant_(self.kv_prefix_pool_scale.bias, 0)
         for block in self.blocks: # attention gates start at exactly 1 (2 sigmoid(0))
             if getattr(block.attn, 'gate_mode', 'none') != 'none':
                 nn.init.constant_(block.attn.gate.weight, 0)
@@ -1581,9 +1606,10 @@ class JiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def run_blocks(self, x, res, start, end, c_blocks, y_emb, fine=False):
+    def run_blocks(self, x, res, start, end, c_blocks, y_emb, fine=False, pool_scale=None):
         # trunk blocks start..end-1 (0-indexed), with the in-context class tokens prepended at in_context_start
         kvp = y_emb.unsqueeze(1) + self.kv_prefix_posemb if self.kv_prefix_len > 0 else None # [B, P, D] (kv_prefix)
+        pool_cache = {}
         for i in range(start, end):
             if self.in_context_len > 0 and i == self.in_context_start:
                 in_context_tokens = y_emb.unsqueeze(1).repeat(1, self.in_context_len, 1)
@@ -1600,7 +1626,8 @@ class JiT(nn.Module):
                 rope = self.feat_rope_fine_incontext if prefix else self.feat_rope_fine
             else:
                 rope = self.feat_rope_incontext if prefix else self.feat_rope
-            x = self.blocks[i](x, c_blocks, rope, res=res, index=i, prefix=self.prefix_for_block(kvp, i))
+            n_ic = self.in_context_len if (self.in_context_len > 0 and i >= self.in_context_start) else 0
+            x = self.blocks[i](x, c_blocks, rope, res=res, index=i, prefix=self.prefix_for_block(kvp, i, x[:, n_ic:], pool_scale, pool_cache))
         return x
 
     def forward(self, x, t, y, return_trunk=False, patch=None):
@@ -1644,7 +1671,8 @@ class JiT(nn.Module):
             res = AttnResState(self, x, c) if self.attn_res != 'none' else None
         depth = len(self.blocks)
         k = self.skip_inject_after if self.skip_pathway else depth
-        x = self.run_blocks(x, res, 0, k, c_blocks, y_emb, fine)
+        pool_scale = self.kv_prefix_pool_scale(F.silu(t_emb)) if getattr(self, 'kv_prefix_pool', 'none') != 'none' else None
+        x = self.run_blocks(x, res, 0, k, c_blocks, y_emb, fine, pool_scale=pool_scale)
         if not self.skip_pathway:
             return self.output(x[:, self.in_context_len:], c, head=self.sampled_head(), fine=fine, res=res)
 
@@ -1687,11 +1715,29 @@ class JiT(nn.Module):
         out[~m] = coarse.to(fine.dtype)
         return out
 
-    def prefix_for_block(self, kvp, i):
-        # kv_prefix tokens block i reads ([B, P, D], or None before kv_prefix_start / without a prefix)
+    def prefix_for_block(self, kvp, i, h=None, pool_scale=None, pool_cache=None):
+        # kv_prefix tokens block i reads ([B, P, D], or None before kv_prefix_start / without a prefix). h: block i's patch input
+        # [B, N, D] and pool_scale [B, reading blocks] (kv_prefix_pool); pool_cache: a dict holding the static pool
         if kvp is None or i < self.kv_prefix_start:
             return None
-        return kvp + self.kv_prefix_depth_emb[i - self.kv_prefix_start] if self.kv_prefix_depth else kvp
+        j = i - self.kv_prefix_start
+        out = kvp + self.kv_prefix_depth_emb[j] if self.kv_prefix_depth else kvp
+        if self.kv_prefix_pool != 'none':
+            if self.kv_prefix_pool == 'static' and pool_cache is not None and 'pooled' in pool_cache:
+                pooled = pool_cache['pooled']
+            else:
+                k = j if self.kv_prefix_pool == 'layer' else 0
+                if self.kv_prefix_pool_mode == 'spatial':
+                    w = self.kv_prefix_pool_logits[k].softmax(-1).to(h.dtype) # [P, N]
+                    pooled = torch.einsum('pn,bnd->bpd', w, h)
+                else:
+                    hn = F.rms_norm(h.float(), (h.shape[-1],)).to(h.dtype)
+                    logits = torch.einsum('pd,bnd->bpn', self.kv_prefix_pool_queries[k].to(h.dtype), hn) * h.shape[-1] ** -0.5
+                    pooled = torch.einsum('bpn,bnd->bpd', logits.float().softmax(-1).to(h.dtype), h)
+                if pool_cache is not None and self.kv_prefix_pool == 'static':
+                    pool_cache['pooled'] = pooled
+            out = out + pool_scale[:, j, None, None].to(out.dtype) * pooled
+        return out
 
     def use_block_compile(self):
         """
