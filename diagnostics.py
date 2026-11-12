@@ -167,7 +167,7 @@ def instrumented_forward(net, x, t, y, capture_blocks=(), tile=None, skip_on=Tru
         bypass_ratio = None
     stats = {k: [] for k in ('attn_entropy', 'attn_dist', 'attn_prefix_mass', 'gate_msa', 'gate_mlp', 'attn_sink_mass', 'attn_sink_max',
                              'attn_sink_uniform', 'attn_gate_mean', 'token_norm_ratio')}
-    kvp = y_emb.unsqueeze(1) + net.kv_prefix_posemb if getattr(net, 'kv_prefix_len', 0) > 0 else None # (kv_prefix, as JiT.run_blocks)
+    kvp = net.kv_prefix_tokens(y_emb) if getattr(net, 'kv_prefix_len', 0) > 0 else None # (kv_prefix, as JiT.run_blocks)
     pool_scale = net.kv_prefix_pool_scale(torch.nn.functional.silu(t_emb)) if getattr(net, 'kv_prefix_pool', 'none') != 'none' else None
     pool_cache = {}
     feats = {}

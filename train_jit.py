@@ -159,6 +159,8 @@ kv_prefix_len = 0 # > 0: this many conditioning tokens as extra keys / values on
                   # (class embedding + learned per-token embedding), read by each block from kv_prefix_start through its own
                   # norm / adaLN / key-value projections; never updated (no queries, MLP or residual): the in-context ablation
 kv_prefix_depth = False # kv_prefix: each reading block adds its own learned offset to the prefix tokens (zero at init: starts as the shared prefix)
+kv_prefix_mlp = 0.0 # > 0: prefix tokens = SwiGLU-MLP(RMSNorm(class + learned vector)) with this hidden ratio (4 = the trunk's): class-specific
+                    # prefix specialties from shared parameters; no residual. 0 = the plain sum class + vector
 kv_prefix_pool = 'none' # kv_prefix: each prefix token also carries a pooled image summary, scaled by a per-block function of t (zero at init):
                         # 'static' (pooled once at kv_prefix_start) or 'layer' (re-pooled at every reading block from its input)
 kv_prefix_pool_init = 0.02 # std of the pooling logits / queries at init (attn: ~ the logits' std); the model starts the same either way
@@ -413,6 +415,7 @@ model_name, arch = resolve_arch(model, **{k: (None if v < 0 else v) for k, v in 
     in_context_cond=False if not in_context_cond else None,
     kv_prefix_start=kv_prefix_start if kv_prefix_len and kv_prefix_start >= 0 else None,
     kv_prefix_depth=True if kv_prefix_len and kv_prefix_depth else None,
+    kv_prefix_mlp=kv_prefix_mlp if kv_prefix_len and kv_prefix_mlp > 0 else None,
     kv_prefix_pool=kv_prefix_pool if kv_prefix_len and kv_prefix_pool != 'none' else None,
     kv_prefix_pool_mode=kv_prefix_pool_mode if kv_prefix_len and kv_prefix_pool != 'none' and kv_prefix_pool_mode != 'spatial' else None,
     kv_prefix_pool_init=kv_prefix_pool_init if kv_prefix_len and kv_prefix_pool != 'none' and kv_prefix_pool_init != 0.02 else None,

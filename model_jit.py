@@ -1212,6 +1212,7 @@ class JiT(nn.Module):
         kv_prefix_pool='none',
         kv_prefix_pool_mode='spatial',
         kv_prefix_pool_init=0.02,
+        kv_prefix_mlp=0.0,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -1322,6 +1323,14 @@ class JiT(nn.Module):
             assert self.kv_prefix_start < depth, f'kv_prefix_start {self.kv_prefix_start} must be < depth {depth}'
             self.kv_prefix_posemb = nn.Parameter(torch.zeros(1, kv_prefix_len, hidden_size))
             torch.nn.init.normal_(self.kv_prefix_posemb, std=.02)
+        # kv_prefix_mlp > 0: the prefix tokens are generated per class by a shared MLP instead of the sum class + vector:
+        #   prefix_p = SwiGLU(RMSNorm(class + vector_p)), hidden width kv_prefix_mlp x hidden_size (the trunk's MLP form), no
+        # residual: any class x token interaction, so each class can have its own set of prefix specialties, sharing
+        # parameters across classes. Computed once per forward on the prefix tokens (not per block)
+        self.kv_prefix_mlp = kv_prefix_mlp if kv_prefix_len > 0 else 0.0
+        if self.kv_prefix_mlp > 0:
+            self.kv_prefix_mlp_norm = make_norm(hidden_size, layernorm)
+            self.kv_prefix_mlp_net = SwiGLUFFN(hidden_size, int(hidden_size * kv_prefix_mlp))
         # kv_prefix_depth: each reading block adds its own learned offset to the prefix tokens (so it reads its own prefix,
         # not only its own projection of a shared one); zero at init, i.e. the model starts as the plain shared prefix
         self.kv_prefix_depth = kv_prefix_depth and kv_prefix_len > 0
@@ -1612,7 +1621,7 @@ class JiT(nn.Module):
 
     def run_blocks(self, x, res, start, end, c_blocks, y_emb, fine=False, pool_scale=None):
         # trunk blocks start..end-1 (0-indexed), with the in-context class tokens prepended at in_context_start
-        kvp = y_emb.unsqueeze(1) + self.kv_prefix_posemb if self.kv_prefix_len > 0 else None # [B, P, D] (kv_prefix)
+        kvp = self.kv_prefix_tokens(y_emb) # [B, P, D] (kv_prefix) or None
         pool_cache = {}
         for i in range(start, end):
             if self.in_context_len > 0 and i == self.in_context_start:
@@ -1718,6 +1727,15 @@ class JiT(nn.Module):
         out[m] = fine
         out[~m] = coarse.to(fine.dtype)
         return out
+
+    def kv_prefix_tokens(self, y_emb):
+        # the prefix tokens before any per-block addition: class + learned vector, or the class-conditional MLP of it
+        if self.kv_prefix_len <= 0:
+            return None
+        base = y_emb.unsqueeze(1) + self.kv_prefix_posemb # [B, P, D]
+        if self.kv_prefix_mlp > 0:
+            return self.kv_prefix_mlp_net(self.kv_prefix_mlp_norm(base))
+        return base
 
     def prefix_for_block(self, kvp, i, h=None, pool_scale=None, pool_cache=None):
         # kv_prefix tokens block i reads ([B, P, D], or None before kv_prefix_start / without a prefix). h: block i's patch input
