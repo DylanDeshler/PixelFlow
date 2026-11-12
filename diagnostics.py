@@ -708,6 +708,74 @@ def heatmap(values, row_labels, col_labels, title, path, log=True):
     plt.close(fig)
     return path
 
+@torch.no_grad()
+def kv_prefix_pool_stats(net, ts, attn_weights=None):
+    """
+    kv_prefix_pool: what each prefix token pools and how much each reading block uses it.
+    weights [pool sets, P, N]: spatial mode from the parameters; attn mode the image-averaged weights passed in
+    (attn_weights: {set index: [P, N]}). scale [len(ts), reading blocks]: s_i(t) from the timestep embedding.
+    entropy / area per pool set: mean over tokens of the normalized entropy (1 = uniform: the global mean, 0 = one patch) and
+    exp(entropy) / N (fraction of the patches covered).
+    """
+    if net.kv_prefix_pool_mode == 'spatial':
+        w = net.kv_prefix_pool_logits.float().softmax(-1).cpu()
+    else:
+        w = torch.stack([attn_weights[k] for k in sorted(attn_weights)]) if attn_weights else None
+    t = torch.as_tensor(ts, dtype=torch.float32, device=net.kv_prefix_pool_scale.weight.device)
+    scale = net.kv_prefix_pool_scale(torch.nn.functional.silu(net.t_embedder(t))).float().cpu()
+    out = {'scale': scale, 'weights': w}
+    if w is not None:
+        N = w.shape[-1]
+        ent = -(w * w.clamp_min(1e-12).log()).sum(-1) # [sets, P]
+        out['entropy'] = (ent / math.log(N)).mean(-1)
+        out['area'] = (ent.exp() / N).mean(-1)
+    return out
+
+def kv_prefix_figure(stats, ts, mass, mass_blocks, start, path, step):
+    """
+    Left: each prefix token's pooling weights as an 8x8 map over the patch grid (rows: pool sets, i.e. reading blocks with
+    'layer' pooling; cols: prefix tokens), each map on its own color scale. Middle: the pooled summary's scale s_i(t) per reading block vs t. Right: attention
+    mass the patches put on the prefix per reading block and noise level (mass: [len(ts), blocks]).
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    w = stats['weights']
+    nsets, P = (w.shape[0], w.shape[1]) if w is not None else (0, 0)
+    fig = plt.figure(figsize=(max(10, 0.32 * P + 7), 1.8 + 0.42 * max(nsets, 6)))
+    gs = fig.add_gridspec(1, 3, width_ratios=[max(P, 1) * 0.32, 3, 3])
+    if w is not None:
+        g = int(round(w.shape[-1] ** 0.5))
+        sub = gs[0].subgridspec(nsets, P, wspace=0.05, hspace=0.05)
+        for r in range(nsets):
+            for p in range(P):
+                ax = fig.add_subplot(sub[r, p])
+                ax.imshow(w[r, p].reshape(g, g), cmap='viridis', vmin=0) # each map on its own scale: where the token looks
+                # (how sharply is in the logged kvpool/entropy and kvpool/area)
+                ax.set_xticks([]); ax.set_yticks([])
+                if p == 0:
+                    ax.set_ylabel(f'b{start + r + 1}' if nsets > 1 else 'all', fontsize=6, rotation=0, labelpad=10)
+                if r == 0 and p % 4 == 0:
+                    ax.set_title(f'tok {p}', fontsize=6)
+    ax = fig.add_subplot(gs[1])
+    sc = stats['scale'].numpy()
+    cmap = plt.get_cmap('viridis')
+    for i in range(sc.shape[1]):
+        ax.plot(ts, sc[:, i], color=cmap(i / max(1, sc.shape[1] - 1)), lw=1.5, label=f'b{start + i + 1}')
+    ax.axhline(0, color='0.6', lw=0.6)
+    ax.set_xlabel('t (0 = noise)', fontsize=8); ax.set_title('pooled-summary scale s_i(t)', fontsize=9)
+    ax.legend(fontsize=6, ncol=2, frameon=False); ax.tick_params(labelsize=7)
+    ax = fig.add_subplot(gs[2])
+    im = ax.imshow(mass.T, aspect='auto', cmap='viridis', vmin=0)
+    ax.set_yticks(range(len(mass_blocks)), [f'b{b + 1}' for b in mass_blocks], fontsize=7)
+    ax.set_xticks(range(len(ts)), [f'{v:.2f}' for v in ts], rotation=45, fontsize=6)
+    ax.set_xlabel('t', fontsize=8); ax.set_title('attention mass on the prefix', fontsize=9)
+    fig.colorbar(im, ax=ax, fraction=0.05)
+    fig.suptitle(f'KV-prefix: pooling maps, scale and use by depth / noise level (iter {step})', fontsize=10)
+    fig.savefig(path, dpi=110, bbox_inches='tight')
+    plt.close(fig)
+    return path
+
 def attn_res_figure(alpha, rows, cols, t_labels, path, step):
     """
     AttnRes mixing weights (rows: each sublayer's input and the final layer, cols: sources, blank = not available yet)

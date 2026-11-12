@@ -1095,8 +1095,39 @@ def evaluate(step):
         log[f'gate_msa/block{b + 1:02d}'] = pv['gate_msa'][:, b].mean().item()
         log[f'gate_mlp/block{b + 1:02d}'] = pv['gate_mlp'][:, b].mean().item()
         log[f'attn_dist/block{b + 1:02d}'] = pv['attn_dist'][:, b].mean().item()
-        if arch['in_context_len'] > 0 and b >= arch['in_context_start']: # only blocks that see in-context class tokens
+        kv_len, kv_start = getattr(denoiser.net, 'kv_prefix_len', 0), getattr(denoiser.net, 'kv_prefix_start', 0)
+        if (arch['in_context_len'] > 0 and b >= arch['in_context_start']) or (kv_len and b >= kv_start): # blocks that see in-context / prefix tokens
             log[f'attn_prefix_mass/block{b + 1:02d}'] = pv['attn_prefix_mass'][:, b].mean().item()
+        if getattr(denoiser.net, 'attn_gate', 'none') != 'none' and 'attn_gate_mean' in pv: # gated attention: mean gate (1 = init)
+            log[f'attn_gate/block{b + 1:02d}'] = pv['attn_gate_mean'][:, b].mean().item()
+    if getattr(denoiser.net, 'kv_prefix_len', 0) and 'attn_prefix_mass' in pv: # KV-prefix: pooling maps, scale and use by depth / t
+        net_ = denoiser.net
+        mass_blocks = list(range(net_.kv_prefix_start, pv['attn_prefix_mass'].shape[1]))
+        mass = pv['attn_prefix_mass'][:, mass_blocks].numpy()
+        if getattr(net_, 'kv_prefix_pool', 'none') != 'none':
+            attn_w = None
+            if net_.kv_prefix_pool_mode == 'attn': # image-averaged weights: one eager forward on held-out images at the middle t
+                net_._pool_record = {}
+                xb_, yb_ = diag_val[0][:64], diag_val[1][:64]
+                tm = float(diag_ts[len(diag_ts) // 2])
+                g_ = torch.Generator(device=xb_.device).manual_seed(0)
+                zb_ = tm * xb_ + (1 - tm) * torch.randn(xb_.shape, generator=g_, device=xb_.device) * noise_scale
+                with torch.no_grad(), ctx:
+                    diag_lib.instrumented_forward(net_, zb_, torch.full((len(xb_),), tm, device=xb_.device), yb_)
+                attn_w, net_._pool_record = net_._pool_record, None
+            ps_ = diag_lib.kv_prefix_pool_stats(net_, diag_ts.tolist(), attn_w)
+            for i_, tl in enumerate(t_labels):
+                for j_ in range(ps_['scale'].shape[1]):
+                    log[f'kvpool/scale_b{net_.kv_prefix_start + j_ + 1:02d}_t{tl}'] = ps_['scale'][i_, j_].item()
+            for r_ in range(len(ps_.get('entropy', []))):
+                tag = f'b{net_.kv_prefix_start + r_ + 1:02d}' if len(ps_['entropy']) > 1 else 'all'
+                log[f'kvpool/entropy_{tag}'] = ps_['entropy'][r_].item()
+                log[f'kvpool/area_{tag}'] = ps_['area'][r_].item()
+            record['kvpool'] = {'scale': ps_['scale'].tolist(), 'weights': ps_['weights'].tolist() if ps_['weights'] is not None else None}
+        else:
+            ps_ = {'scale': torch.zeros(len(diag_ts), 0), 'weights': None}
+        images['kv_prefix'] = diag_lib.kv_prefix_figure(ps_, diag_ts.tolist(), mass, mass_blocks, net_.kv_prefix_start,
+                                                        os.path.join(out_dir, 'diagnostics', f'kv_prefix_{step}.png'), step)
     # relative held-out loss increase when attention can't leave a tile: ~0 means the model doesn't use longer-range context there
     window_increase = {k: (wp['v_loss'] / pv['v_loss'] - 1) for k, wp in window_passes.items()}
     for k, inc in window_increase.items():

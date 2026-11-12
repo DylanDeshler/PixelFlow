@@ -1733,7 +1733,10 @@ class JiT(nn.Module):
                 else:
                     hn = F.rms_norm(h.float(), (h.shape[-1],)).to(h.dtype)
                     logits = torch.einsum('pd,bnd->bpn', self.kv_prefix_pool_queries[k].to(h.dtype), hn) * h.shape[-1] ** -0.5
-                    pooled = torch.einsum('bpn,bnd->bpd', logits.float().softmax(-1).to(h.dtype), h)
+                    wts = logits.float().softmax(-1)
+                    if getattr(self, '_pool_record', None) is not None: # diagnostics (eager): the image-averaged pooling weights
+                        self._pool_record[k] = wts.mean(0).detach().cpu()
+                    pooled = torch.einsum('bpn,bnd->bpd', wts.to(h.dtype), h)
                 if pool_cache is not None and self.kv_prefix_pool == 'static':
                     pool_cache['pooled'] = pooled
             out = out + pool_scale[:, j, None, None].to(out.dtype) * pooled
