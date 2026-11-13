@@ -101,8 +101,15 @@ class _Append(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, ghandle):
-        G = ctx.state.grad_buffer()
-        return torch.empty(0, device=G.device, dtype=G.dtype), G[ctx.s].view(ctx.shape), None, None
+        state = ctx.state
+        G = state.grad_buffer()
+        gv = G[ctx.s].view(ctx.shape)
+        if ctx.s == 0: # the last node of the backward (every mix depends on the first source): drop the state's references,
+            # breaking the cycle state -> handle -> graph nodes -> state, so the buffer, the sources and the graph are freed by
+            # reference counting now (the returned view keeps G[0] alive until autograd has used it)
+            state.release()
+        ctx.state = None
+        return torch.empty(0, device=G.device, dtype=G.dtype), gv, None, None
 
 
 class _PreMix(torch.autograd.Function):
@@ -175,6 +182,11 @@ def make_state(net, emb, c=None):
         def __init__(self, net, emb, c=None):
             self.flat, self.handle, self._G, self.rows = [], None, None, emb.shape[:-1]
             super().__init__(net, emb, c)
+
+        def release(self):
+            # after the backward: nothing of this forward pass stays referenced from the state
+            self.flat, self.handle, self._G, self._pre = [], None, None, None
+            self.sources, self.logits, self.partial = [], [], None
 
         def grad_buffer(self):
             # one slice per source, in the sources' dtype (bf16 under autocast, as autograd accumulates them), zeroed at the

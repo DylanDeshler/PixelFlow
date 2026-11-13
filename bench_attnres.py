@@ -19,6 +19,7 @@ $ python bench_attnres.py --only_tails=True --tails=2 --tail_heads=8 --tail_chec
 """
 
 import os
+import gc
 import time
 from contextlib import nullcontext
 
@@ -114,6 +115,7 @@ def bench(name, overrides, chunk=1):
             break
         except torch.OutOfMemoryError:
             opt.zero_grad(set_to_none=True)
+            gc.collect() # a forward without its backward leaves the fused AttnRes state's reference cycle to the collector
             assert micro > 1, 'out of memory at micro-batch 1'
             micro //= 2
             print(f'  {name}: out of memory, micro-batch {micro} x {batch_size // micro}', flush=True)
