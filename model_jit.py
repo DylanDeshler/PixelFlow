@@ -1179,6 +1179,7 @@ class JiT(nn.Module):
         dcae_kernel2=1,
         patch_overlap=0,
         head_overlap=0,
+        overlap_window='box',
         layernorm=False,
         skip_final_layer=False,
         skip_residual=False,
@@ -1255,6 +1256,17 @@ class JiT(nn.Module):
         assert not (patch_overlap and head_overlap), 'patch_overlap already overlaps the output; head_overlap is the output-only version'
         self.head_overlap = head_overlap
         self.out_overlap = patch_overlap or head_overlap
+        # overlap_window: the weights of the overlap-add blend. 'box': every contribution weighted equally (the mean of the
+        # overlapping predictions; a token's weight steps from 1 to 1/2 at the overlap edge). 'linear': each token's weight
+        # ramps linearly to zero across its 2 * overlap-px overlap strips (a trapezoid; adjacent ramps sum to 1), so its
+        # contribution fades in instead of switching on. Normalized by the summed weights either way (image borders)
+        assert overlap_window in ('box', 'linear'), overlap_window
+        self.overlap_window = overlap_window
+        if self.out_overlap:
+            o, k = self.out_overlap, patch_size + 2 * self.out_overlap
+            u = torch.arange(k, dtype=torch.float32)
+            w = torch.ones(k) if overlap_window == 'box' else ((torch.minimum(u, k - 1 - u) + 0.5) / (2 * o)).clamp(max=1.0)
+            self.register_buffer('overlap_weight', (w[:, None] * w[None, :]).flatten(), persistent=False) # [k * k]
         self.layernorm = layernorm
         assert not skip_final_layer or skip_pathway, 'skip_final_layer needs skip_pathway'
         self.has_skip_final_layer = skip_final_layer
@@ -1849,9 +1861,10 @@ class JiT(nn.Module):
         if self.out_overlap:
             o, p = self.out_overlap, self.patch_size
             k, size = p + 2 * o, self.input_size
-            cols = x.transpose(1, 2).float() # [N, C * k * k, L], channel-major patches as F.fold expects
+            w = self.overlap_weight.repeat(self.out_channels)[None, :, None] # [1, C * k * k, 1], channel-major like cols
+            cols = x.transpose(1, 2).float() * w # [N, C * k * k, L], channel-major patches as F.fold expects
             img = F.fold(cols, size, kernel_size=k, stride=p, padding=o)
-            count = F.fold(torch.ones_like(cols[:1]), size, kernel_size=k, stride=p, padding=o)
+            count = F.fold(w.expand(1, -1, cols.shape[-1]), size, kernel_size=k, stride=p, padding=o)
             img = (img / count).to(x.dtype)
         else:
             img = self.unpatchify(x, self.patch_size)

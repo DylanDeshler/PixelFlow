@@ -140,6 +140,7 @@ dcae_kernel2 = 1 # kernel of each DC-AE branch's second conv (the first is 3x3)
 layernorm = False # every RMSNorm in the network (block pre-norms, QK-norm, final layer, AttnRes keys, DC-AE branches) becomes a LayerNorm
 patch_overlap = 0 # pixels each patch overlaps its neighbours on every side, in the patch embedding and the output (overlap-add)
 head_overlap = 0 # the output side only: each token predicts a (patch + 2 * head_overlap)^2 patch, overlap-added (a transposed conv with stride patch)
+overlap_window = 'box' # overlap-add blend weights (patch_overlap / head_overlap): 'box' = mean of the overlapping predictions, 'linear' = each token's weight ramps to 0 across its overlap strips (trapezoid, partition of unity)
 skip_pathway = False # full-rank input patches merged into the trunk's output before the final layer, behind a gate from the conditioning (zero-init)
 skip_head_blocks = 0 # skip_pathway only: JiT blocks after the merge, so input detail can be combined with trunk features
 skip_residual = False # with skip_final_layer: the with-skip prediction = trunk prediction (detached) + a correction from the skip branch's final layer
@@ -368,7 +369,7 @@ check_prepared(data_dir, diag)
 is_pixeldit = model.startswith('PixelDiT')
 if is_pixeldit: # the JiT-specific options don't exist in PixelDiT
     jit_only = dict(bottleneck_dim=bottleneck_dim < 0, attn_res=attn_res == 'none', adaln_single=not adaln_single, gated_bottleneck=not gated_bottleneck,
-                    skip_pathway=not skip_pathway, dcae_stem=not dcae_stem, dcae_head=not dcae_head, patch_overlap=patch_overlap == 0, head_overlap=head_overlap == 0,
+                    skip_pathway=not skip_pathway, dcae_stem=not dcae_stem, dcae_head=not dcae_head, patch_overlap=patch_overlap == 0, head_overlap=head_overlap == 0, overlap_window=overlap_window == 'box',
                     layernorm=not layernorm, gate_init=gate_init == 'zero', attn_res_adaln=not attn_res_adaln,
                     in_context_len=in_context_len <= 0, masking=mask_ratio == 0)
     bad = [k for k, ok in jit_only.items() if not ok]
@@ -382,7 +383,7 @@ GAUSS_FLAGS = dict(extent=gauss_extent, basis=gauss_basis, max_offset=gauss_max_
                    fused=gauss_fused)
 if is_gauss: # like QuadJiT: the JiT backbone options it needs, none of the input / output paths
     jit_only = dict(attn_res_adaln=not attn_res_adaln, gated_bottleneck=not gated_bottleneck, skip_pathway=not skip_pathway, dcae_stem=not dcae_stem,
-                    dcae_head=not dcae_head, patch_overlap=patch_overlap == 0, head_overlap=head_overlap == 0, gate_init=gate_init == 'zero',
+                    dcae_head=not dcae_head, patch_overlap=patch_overlap == 0, head_overlap=head_overlap == 0, overlap_window=overlap_window == 'box', gate_init=gate_init == 'zero',
                     in_context_len=in_context_len <= 0, masking=mask_ratio == 0, repa=not repa_encoder)
     bad = [k for k, ok in jit_only.items() if not ok]
     assert not bad, f'not available for GaussJiT: {bad}'
@@ -390,7 +391,7 @@ else:
     assert all(GAUSS_FLAGS[k] == GAUSS_DEFAULTS[k] for k in GAUSS_FLAGS), 'gauss_* options are GaussJiT options'
 if is_quadtree: # the quadtree model has the JiT backbone options it needs (attn_res, adaln_single, layernorm) and none of the input / output paths
     jit_only = dict(attn_res_adaln=not attn_res_adaln, gated_bottleneck=not gated_bottleneck, skip_pathway=not skip_pathway, dcae_stem=not dcae_stem,
-                    dcae_head=not dcae_head, patch_overlap=patch_overlap == 0, head_overlap=head_overlap == 0, gate_init=gate_init == 'zero',
+                    dcae_head=not dcae_head, patch_overlap=patch_overlap == 0, head_overlap=head_overlap == 0, overlap_window=overlap_window == 'box', gate_init=gate_init == 'zero',
                     in_context_len=in_context_len <= 0, masking=mask_ratio == 0, repa=not repa_encoder)
     bad = [k for k, ok in jit_only.items() if not ok]
     assert not bad, f'not available for QuadJiT: {bad}'
@@ -432,7 +433,8 @@ model_name, arch = resolve_arch(model, **{k: (None if v < 0 else v) for k, v in 
     skip_decoder_attnres=skip_decoder_attnres if skip_decoder != 'linear' and skip_decoder_attnres else None,
     skip_decoder_modulation=False if skip_decoder != 'linear' and not skip_decoder_modulation else None,
     dcae_stem=dcae_stem or None, dcae_head=dcae_head or None, dcae_trunk_head=dcae_trunk_head or None,
-    patch_overlap=patch_overlap or None, head_overlap=head_overlap or None, layernorm=layernorm or None, gate_init=None if gate_init == 'zero' else gate_init,
+    patch_overlap=patch_overlap or None, head_overlap=head_overlap or None,
+    overlap_window=overlap_window if (patch_overlap or head_overlap) and overlap_window != 'box' else None, layernorm=layernorm or None, gate_init=None if gate_init == 'zero' else gate_init,
     dcae_width=dcae_width if (dcae_stem or dcae_head or dcae_trunk_head) and dcae_width != 128 else None,
     dcae_kernel2=dcae_kernel2 if (dcae_stem or dcae_head or dcae_trunk_head) and dcae_kernel2 != 1 else None,
     dcae_norm=dcae_norm if (dcae_stem or dcae_head or dcae_trunk_head) and dcae_norm != 'channel' else None)
