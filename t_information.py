@@ -91,7 +91,8 @@ def read(x):
     x = F.interpolate(((x.float() + 1) / 2 - MEAN) / STD, size=(grid * 14, grid * 14), mode='bicubic', align_corners=False)
     with ctx:
         f = reader.forward_features(x)
-    return f['x_norm_clstoken'].float(), F.normalize(f['x_norm_patchtokens'].float(), dim=-1) # [B, D], [B, grid^2, D]
+    # (clone: the CLS feature is a view into the whole token tensor, which a stored view would keep alive)
+    return f['x_norm_clstoken'].float().clone(), F.normalize(f['x_norm_patchtokens'].float(), dim=-1) # [B, D], [B, grid^2, D]
 
 def to_x(u8):
     return torch.from_numpy(np.asarray(u8)).to(device).permute(0, 3, 1, 2).float() / 127.5 - 1
@@ -195,15 +196,17 @@ def per_image_ce(cls_f, patch_ce):
 
 # 3. per-image cross-entropies at each noise level, from the model's null-label prediction
 t_list = [float(v) for v in ts.split(',') if v.strip()] if ts else (1 / (1 + np.exp(-np.linspace(-4, 4.5, 31)))).tolist()
-g = torch.Generator(device=device).manual_seed(seed)
-noise = [torch.randn((min(batch, len(va_idx) - i), 3, val.img_size, val.img_size), generator=g, device=device) for i in range(0, len(va_idx), batch)]
+def noise_for(n_, size):
+    # the same noise for batch n_ at every t, regenerated per batch instead of held for all images
+    g = torch.Generator(device=device).manual_seed(seed * 100003 + n_)
+    return torch.randn((size, 3, val.img_size, val.img_size), generator=g, device=device)
 ce_t = {k: [] for k in LEVELS} # per level: [len(t_list)] tensors of [N] bits
 ACC = {k: [] for k in LEVELS} # per level: per-image top-1 correctness at each t (then the clean images last)
 for t in bar(t_list, f'information at {len(t_list)} noise levels x {len(va_idx)} images'):
     cf, pce = [], []
     for n_, i in enumerate(range(0, len(va_idx), batch)):
         x = to_x(val.images[va_idx[i:i + batch]])
-        z = t * x + (1 - t) * s * noise[n_]
+        z = t * x + (1 - t) * s * noise_for(n_, len(x))
         with torch.no_grad(), ctx:
             x_hat = net(z, torch.full((len(x),), t, device=device), torch.full((len(x),), null, device=device, dtype=torch.long))
         c, p = read(x_hat.float().clamp(-1, 1))
