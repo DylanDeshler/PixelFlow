@@ -6,11 +6,13 @@ class with one fixed noise draw each. No model involved.
 Writes to {out}/:
   grid.gif              every sample at once (rows = classes, columns = samples), t sweeping 0 -> 1, with the t of each frame
   {class}_{i}.gif       one GIF per sample
-  strip.png             each sample at a few fixed t (columns), with the share of training draws below each t under
-                        JiT's logit-normal t sampling (P_mean, P_std), i.e. how often training sees noise at least that heavy
+  strip.png             each sample at strip_columns noise levels (columns), labelled with t and the share of training draws
+                        at that t or noisier under JiT's logit-normal t sampling (P_mean, P_std)
 
-t_spacing='uniform' steps t evenly; 'training' spaces frames by the training t distribution's quantiles, so the GIF lingers
-where training spends its samples.
+Both the GIF frames and the strip columns are evenly spaced under t_spacing: 'uniform' = even steps in t; 'training' =
+even steps in the training distribution's CDF (quantiles), so every frame / column stands for the same share of training
+draws and the visualization lingers where training spends its samples. Either way the first and last are t = 0 (noise)
+and t = 1 (data); the levels between are the midpoint quantiles (i + 0.5) / (n - 2).
 
 $ python viz_trajectories.py --data_dir=/data/in1k_128
 $ python viz_trajectories.py --data_dir=/data/in1k_128 --classes=1,207,388,980 --per_class=3 --t_spacing=training
@@ -34,7 +36,7 @@ P_mean = -0.8 # training t distribution (logit-normal), for the strip's annotati
 P_std = 0.8
 frames = 48 # GIF frames from t = 0 to t = 1
 t_spacing = 'uniform' # 'uniform' or 'training'
-strip_ts = '0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1'
+strip_columns = 11 # noise levels in strip.png (evenly spaced under t_spacing, including t = 0 and 1)
 fps = 12
 hold = 1.0 # seconds to hold the first (noise) and last (data) frames
 upscale = 2 # nearest-neighbour upscaling of the GIFs for viewing
@@ -96,10 +98,13 @@ def frame(x, e, t):
 def big(a):
     return np.kron(a, np.ones((upscale, upscale, 1), dtype=np.uint8)) if upscale > 1 else a
 
-if t_spacing == 'uniform':
-    ts = np.linspace(0, 1, frames).tolist()
-else: # quantiles of the training distribution, with the exact end points
-    ts = [0.0] + [train_quantile((i + 0.5) / (frames - 2)) for i in range(frames - 2)] + [1.0]
+def spaced_ts(n):
+    # n noise levels evenly spaced under t_spacing, from t = 0 to t = 1
+    if t_spacing == 'uniform':
+        return np.linspace(0, 1, n).tolist()
+    return [0.0] + [train_quantile((i + 0.5) / (n - 2)) for i in range(n - 2)] + [1.0] # midpoint quantiles + the exact ends
+
+ts = spaced_ts(frames)
 durations = [int(1000 / fps)] * len(ts)
 durations[0] = durations[-1] = int(1000 * hold)
 
@@ -136,7 +141,7 @@ for k, (c, name, x, e) in enumerate(samples):
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-st = [float(v) for v in strip_ts.split(',') if v.strip()]
+st = spaced_ts(strip_columns)
 fig, axes = plt.subplots(len(samples), len(st), figsize=(1.3 * len(st), 1.3 * len(samples) + 0.6), squeeze=False)
 for k, (c, name, x, e) in enumerate(samples):
     for j, t in enumerate(st):
@@ -146,11 +151,12 @@ for k, (c, name, x, e) in enumerate(samples):
         for sp in ax.spines.values():
             sp.set_visible(False)
         if k == 0:
-            ax.set_title(f't={t:g}\n{100 * train_cdf(t):.0f}% below', fontsize=7)
+            ax.set_title(f't={t:.3f}\n{100 * train_cdf(t):.1f}% below', fontsize=7)
         if j == 0:
             ax.set_ylabel(name[:18], fontsize=7)
-fig.suptitle(f'training trajectories z_t = t x + (1 - t) {s:g} e  (t = data fraction; "% below": share of training draws at '
-             f'that t or noisier, logit-normal({P_mean}, {P_std}))', fontsize=8)
+fig.suptitle(f'training trajectories z_t = t x + (1 - t) {s:g} e, columns evenly spaced in ' +
+             ('t' if t_spacing == 'uniform' else f'training quantile') +
+             f'  (t = data fraction; "% below": share of training draws at that t or noisier, logit-normal({P_mean}, {P_std}))', fontsize=8)
 fig.tight_layout()
 fig.savefig(os.path.join(out, 'strip.png'), dpi=150)
 print(f'wrote {out}/grid.gif ({len(samples)} samples, {len(ts)} frames, t spacing {t_spacing}), {len(samples)} per-sample GIFs '
