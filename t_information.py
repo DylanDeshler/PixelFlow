@@ -13,8 +13,9 @@ is needed and image-space readers apply directly (no attention confound of hidde
               one cluster (so I(class) = I(coarse) + I(class | coarse): the coarse curve is part of the class curve)
   patch       each DINOv2 patch of the clean image gets one of --patch_codes content codes (k-means of clean patch
               features); q = softmax(kappa * cosine to the codes) of the same patch of x_hat, kappa refit per t
-I_Y(t) is made non-decreasing in t (the true one is) and normalized by its clean value I_Y(1) (the probe on the clean
-image). Its increments over the sampler's uniform steps give each variable's information-gain density over t; the
+I_Y(t) is made non-decreasing in t (the true one is) and normalized by its value at the cleanest measured t (what the
+model's prediction reveals at most; the reader on the clean image is reported alongside but not used: the gap is the
+prediction's floor near t = 1, not information revealed at t = 1). Its increments over the sampler's uniform steps give each variable's information-gain density over t; the
 proposed training distribution mixes the class and patch densities, (1 - patch_weight) x class + patch_weight x patch,
 and the closest split logit-normal (m, sl, sr) to it is reported (train_jit.py --P_mean / --P_std / --P_std_right).
 
@@ -220,11 +221,16 @@ edges = np.linspace(0, 1, sampling_steps + 1)
 y_cpu = y_va.cpu().numpy()
 
 def curve(ce_list, ce_cl, Hk, mask=None):
-    # bits revealed at each t (mean over the masked images): H - CE, clipped at 0, clean value at t = 1
+    # bits revealed at each t (mean over the masked images): H - CE, clipped at 0. Normalized by the most the model's
+    # prediction reveals (its value at the cleanest measured t), not by the reader on the clean image: the clean image is
+    # not a noise level the model sees, and the gap between the two (the prediction never reproducing the clean patch
+    # codes exactly: the bottleneck floor near t = 1) would otherwise show up as a spike of 'information' at t = 1.
+    # The clean value is returned separately (third value) for reference.
     sel = (lambda v: v[mask]) if mask is not None else (lambda v: v)
     bits = [max(Hk - float(sel(v).mean()), 0.0) for v in ce_list]
-    top = max(Hk - float(sel(ce_cl).mean()), max(bits), 1e-9)
-    return np.maximum.accumulate(np.array([0.0] + bits + [top]) / top), bits, top
+    top = max(max(bits), 1e-9)
+    clean_bits = Hk - float(sel(ce_cl).mean())
+    return np.maximum.accumulate(np.array([0.0] + bits + [top]) / top), bits, clean_bits
 
 def step_shares(I):
     d = np.diff(np.interp(edges, T, I))
@@ -260,7 +266,7 @@ def label_stats(k):
     for j in labels:
         m_ = lab == j
         n = int(m_.sum())
-        top = max(info[-1, m_].mean(), 1e-9)
+        top = max(info[-2, m_].mean(), 1e-9) # the cleanest measured t (as curve())
         mean = info[:, m_].mean(1) / top
         se = info[:, m_].std(1, ddof=1) / math.sqrt(n) / top if n > 1 else np.full(len(mean), np.nan)
         a = acc[:, m_].mean(1)
