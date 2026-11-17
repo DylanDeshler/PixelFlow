@@ -3,10 +3,11 @@ Training-data trajectories: the noise -> data paths the model is trained on, z_t
 0 = pure noise, as train_jit.py; s = noise_scale, JiT's img_size / 256 by default), for a few real training images per
 class with one fixed noise draw each. No model involved.
 
-Writes to {out}/:
-  grid.gif              every sample at once (rows = classes, columns = samples), t sweeping 0 -> 1, with the t of each frame
-  {class}_{i}.gif       one GIF per sample
-  strip.png             each sample at strip_columns noise levels (columns), labelled with t
+Writes to {out}/ (default trajectories/), file names carrying the settings, e.g. grid_logitnorm-0.8_0.8_noise0.5_c4x2_f48.gif:
+  grid_{settings}.gif   every sample at once (rows = classes, columns = samples), t sweeping 0 -> 1, with the t of each frame
+  strip_{settings}.png  each sample at strip_columns noise levels (columns), labelled with t
+settings: t_spacing, noise scale, classes (explicit list, else count) x images per class, split / seed when not the
+default, and the frame count (GIF) or column count (strip).
 
 t_spacing is a distribution over t in [0, 1]; the GIF frames and strip columns sit at its quantiles i / (n - 1), i.e.
 evenly spaced in its CDF (the first is t = 0, pure noise, the last t = 1, data). Supported:
@@ -18,6 +19,7 @@ line in DENSITIES.
 
 $ python viz_trajectories.py --data_dir=/data/in1k_128
 $ python viz_trajectories.py --data_dir=/data/in1k_128 --classes=1,207,388,980 --per_class=3 --t_spacing='logitnorm(-0.8, 0.8)'
+  -> trajectories/grid_logitnorm-0.8_0.8_noise0.5_c1-207-388-980x3_f48.gif, trajectories/strip_logitnorm-0.8_0.8_noise0.5_c1-207-388-980x3_n11.png
 """
 
 import os
@@ -41,7 +43,7 @@ fps = 12
 hold = 1.0 # seconds to hold the first (noise) and last (data) frames
 upscale = 2 # nearest-neighbour upscaling of the GIFs for viewing
 seed = 0
-out = 'trajectories'
+out = 'trajectories' # output directory
 # -----------------------------------------------------------------------------
 config_keys = [k for k, v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'configurator.py')).read())
@@ -109,6 +111,12 @@ durations = [int(1000 / fps)] * len(ts)
 durations[0] = durations[-1] = int(1000 * hold)
 
 os.makedirs(out, exist_ok=True)
+# file-name settings: t_spacing ('logitnorm(-0.8, 0.8)' -> 'logitnorm-0.8_0.8'), noise scale, classes x per class, split / seed if changed
+_sp = t_spacing.replace(' ', '')
+_name, _, _rest = _sp.partition('(')
+tag = '_'.join([_name + ''.join(_rest.rstrip(')').split(',')[:1]) + ''.join('_' + v for v in _rest.rstrip(')').split(',')[1:]) if _rest else _name,
+                f'noise{s:g}', (f"c{'-'.join(map(str, cls))}" if classes else f'c{len(cls)}') + f'x{per_class}']
+               + ([split] if split != 'train' else []) + ([f'seed{seed}'] if seed else []))
 pad, label_h = 4, 16
 def save_gif(path, imgs):
     imgs[0].save(path, save_all=True, append_images=imgs[1:], duration=durations, loop=0)
@@ -129,13 +137,8 @@ for t in ts:
             d.text((x0, y0 + 1), f'{c}: {name}'[:48], fill=(0, 0, 0))
         canvas.paste(Image.fromarray(big(frame(x, e, t))), (x0, y0 + label_h))
     grid_frames.append(canvas)
-save_gif(os.path.join(out, 'grid.gif'), grid_frames)
-
-# one GIF per sample
-for k, (c, name, x, e) in enumerate(samples):
-    i = k % per_class
-    safe = ''.join(ch if ch.isalnum() else '-' for ch in name)[:32]
-    save_gif(os.path.join(out, f'{c:04d}-{safe}_{i}.gif'), [Image.fromarray(big(frame(x, e, t))) for t in ts])
+grid_path = os.path.join(out, f'grid_{tag}_f{len(ts)}.gif')
+save_gif(grid_path, grid_frames)
 
 # strip: samples x the quantiles of t_spacing
 import matplotlib
@@ -156,6 +159,7 @@ for k, (c, name, x, e) in enumerate(samples):
             ax.set_ylabel(name[:18], fontsize=7)
 fig.suptitle(f'training trajectories z_t = t x + (1 - t) {s:g} e  (t = data fraction, 1 = clean), columns at quantiles of {t_spacing}', fontsize=8)
 fig.tight_layout()
-fig.savefig(os.path.join(out, 'strip.png'), dpi=150)
-print(f'wrote {out}/grid.gif ({len(samples)} samples, {len(ts)} frames, t spacing {t_spacing}), {len(samples)} per-sample GIFs '
-      f'and {out}/strip.png (noise scale {s:g}, classes {cls})')
+strip_path = os.path.join(out, f'strip_{tag}_n{len(st)}.png')
+fig.savefig(strip_path, dpi=150)
+print(f'wrote {grid_path} ({len(samples)} samples, {len(ts)} frames) and {strip_path} ({len(st)} columns); '
+      f't spacing {t_spacing}, noise scale {s:g}, classes {cls}')
