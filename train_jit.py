@@ -196,6 +196,7 @@ proj_dropout = 0.0
 # flow matching
 P_mean = -0.8
 P_std = 0.8
+P_std_right = 0.0 # > 0: split logit-normal t, std P_std on the noisy side of the mode and P_std_right on the clean side (0 = symmetric)
 t_eps = 5e-2
 input_perturb = 0.0 # DDPM-IP: the training input's noise gets an extra Gaussian of this relative size (target unchanged), so the model
                     # learns to correct slightly-off inputs like its own sampling steps produce (exposure bias); 0 = off, paper ~0.1
@@ -501,7 +502,9 @@ denoiser_args = dict(
     label_drop_prob=label_drop_prob, P_mean=P_mean, P_std=P_std, t_eps=t_eps, noise_scale=noise_scale,
     ema_decay1=ema_decay1, ema_decay2=ema_decay2, sampling_method=sampling_method,
     num_sampling_steps=num_sampling_steps, cfg=fid_cfg, interval_min=fid_interval_min, interval_max=fid_interval_max,
+    **({'P_std_right': P_std_right} if P_std_right > 0 else {}),
 )
+assert not (P_std_right > 0 and token_sizes), 'P_std_right: the two-size allocator assumes a symmetric logit-normal (alloc.t_dist)'
 denoiser = build_denoiser(**denoiser_args).to(device)
 denoiser.ema_warmup = ema_warmup
 assert skip_pathway_drop_prob == 0 or skip_pathway, 'skip_pathway_drop_prob needs skip_pathway'

@@ -14,6 +14,7 @@ evenly spaced in its CDF (the first is t = 0, pure noise, the last t = 1, data).
   uniform              even steps in t
   logitnorm(m, s)      t = sigmoid(N(m, s)); JiT trains with logitnorm(-0.8, 0.8)
   beta(a, b)           Beta(a, b)
+  splitlogitnorm(m, sl, sr)  two-piece logit-normal: std sl on the noisy side of the mode, sr on the clean side
   spectral             even steps in how much of the image is visible, from the dataset's own power spectrum: frequency f
                        (cycles / image) emerges from the noise when its SNR t^2 P(f) / ((1 - t)^2 s^2) reaches 1, at
                        t = s / (s + sqrt(P(f))); the levels put that cutoff at log-spaced frequencies from 1 cycle per image
@@ -81,12 +82,14 @@ DENSITIES = {
     'uniform': lambda t: np.ones_like(t),
     'logitnorm': lambda t, m, sd: np.exp(-0.5 * ((np.log(t / (1 - t)) - m) / sd) ** 2) / (sd * math.sqrt(2 * math.pi) * t * (1 - t)),
     'beta': lambda t, a, b: t ** (a - 1) * (1 - t) ** (b - 1),
+    # two-piece logit-normal: std sl left of the mode m (noisier), sr right of it (cleaner); train_jit.py --P_std / --P_std_right
+    'splitlogitnorm': lambda t, m, sl, sr: np.exp(-0.5 * ((np.log(t / (1 - t)) - m) / np.where(np.log(t / (1 - t)) <= m, sl, sr)) ** 2) / (t * (1 - t)),
 }
 
 def parse_spacing(spec):
     spec = spec.replace(' ', '')
     name, _, rest = spec.partition('(')
-    assert name in DENSITIES or name == 'spectral', f"t_spacing: unknown distribution {name!r} (supported: uniform, logitnorm(m, s), beta(a, b), spectral)"
+    assert name in DENSITIES or name == 'spectral', f"t_spacing: unknown distribution {name!r} (supported: uniform, logitnorm(m, s), splitlogitnorm(m, sl, sr), beta(a, b), spectral)"
     params = [float(v) for v in rest.rstrip(')').split(',') if v] if rest else []
     return name, params
 

@@ -183,7 +183,7 @@ class FastDenoiser(Denoiser):
           uniform         JiT's grid, linspace(0, 1)
           shift           FLUX / SD3-style: the uniform grid shifted by the training logit-normal mean,
                           logit(t') = logit(t) + P_mean (SD3's shift map with s = exp(-P_mean))
-          train_quantile  quantiles of the training distribution, logit(t) = P_mean + P_std * Phi^-1(u)
+          train_quantile  quantiles of the training distribution, logit(t) = P_mean + P_std * Phi^-1(u) (split: per side)
         """
         u = torch.linspace(0.0, 1.0, self.steps + 1, device=device, dtype=torch.float64)
         if self.time_schedule == 'uniform':
@@ -191,7 +191,12 @@ class FastDenoiser(Denoiser):
         elif self.time_schedule == 'shift':
             t = torch.sigmoid(torch.logit(u.clamp(1e-12, 1 - 1e-12)) + self.P_mean)
         elif self.time_schedule == 'train_quantile':
-            t = torch.sigmoid(self.P_mean + self.P_std * torch.special.ndtri(u.clamp(1e-12, 1 - 1e-12)))
+            sl, sr = self.P_std, getattr(self, 'P_std_right', self.P_std)
+            wl = sl / (sl + sr) # mass left of the mode
+            uc = u.clamp(1e-12, 1 - 1e-12)
+            z = torch.where(uc <= wl, sl * torch.special.ndtri((uc / (2 * wl)).clamp(1e-12, 0.5)),
+                            sr * torch.special.ndtri((0.5 + (uc - wl) / (2 * (1 - wl))).clamp(0.5, 1 - 1e-12)))
+            t = torch.sigmoid(self.P_mean + z)
         else:
             raise ValueError(f"unknown time_schedule {self.time_schedule}")
         t[0], t[-1] = 0.0, 1.0
@@ -319,7 +324,7 @@ def model_cost(net, img_size, num_classes, device='cpu'):
 
 def build_denoiser(model, img_size, num_classes, attn_dropout=0.0, proj_dropout=0.0, label_drop_prob=0.1,
                    P_mean=-0.8, P_std=0.8, t_eps=5e-2, noise_scale=1.0, ema_decay1=0.9999, ema_decay2=0.9996,
-                   sampling_method='heun', num_sampling_steps=50, cfg=1.0, interval_min=0.0, interval_max=1.0, arch=None):
+                   sampling_method='heun', num_sampling_steps=50, cfg=1.0, interval_min=0.0, interval_max=1.0, arch=None, P_std_right=0.0):
     """
     arch: full architecture dict (from resolve_arch) for non-preset models; stored in checkpoints so eval can rebuild them.
     """
@@ -327,7 +332,7 @@ def build_denoiser(model, img_size, num_classes, attn_dropout=0.0, proj_dropout=
         _register(model, arch)
     args = SimpleNamespace(
         model=model, img_size=img_size, class_num=num_classes, attn_dropout=attn_dropout, proj_dropout=proj_dropout,
-        label_drop_prob=label_drop_prob, P_mean=P_mean, P_std=P_std, t_eps=t_eps, noise_scale=noise_scale,
+        label_drop_prob=label_drop_prob, P_mean=P_mean, P_std=P_std, P_std_right=P_std_right, t_eps=t_eps, noise_scale=noise_scale,
         ema_decay1=ema_decay1, ema_decay2=ema_decay2, sampling_method=sampling_method,
         num_sampling_steps=num_sampling_steps, cfg=cfg, interval_min=interval_min, interval_max=interval_max,
     )
@@ -612,7 +617,7 @@ _ARCH_SHORT = {'depth': 'd', 'hidden_size': 'w', 'num_heads': 'h', 'patch_size':
 _NAME_TOKENS = {
     'optimizer_type': '', 'muon_adjust_lr': 'muon-', 'muon_lr': 'muonlr', 'muon_weight_decay': 'muonwd',
     'muon_momentum': 'muonmom', 'muon_ns_steps': 'muonns', 'muon_split_fused': 'muonsplit', 'muon_adaln': 'muonadaln',
-    'noise_scale': 'noise', 'P_mean': 'pmean', 'token_sizes': 'tok-', 'fine_frac': 'fine', 'alloc_floor': 'allocfloor', 'alloc_gain': 'allocgain-', 'tail_blocks': 'tail', 'tail_query_patch': 'tailq', 'tail_dim': 'taildim', 'tail_heads': 'tailheads', 'tail_head_dim': 'tailhd', 'tail_query_pos': 'tailpos-', 'attn_gate': 'attngate-', 'in_context_cond': 'iclcond', 'kv_prefix_len': 'kvprefix', 'kv_prefix_start': 'kvprefixstart', 'kv_prefix_depth': 'kvprefixdepth', 'kv_prefix_pool': 'kvpool-', 'kv_prefix_pool_mode': 'kvpoolmode-', 'kv_prefix_pool_init': 'kvpoolinit', 'kv_prefix_mlp': 'kvprefixmlp', 'tail_mlp_ratio': 'tailmlp', 'tail_keys': 'tailkeys-', 'loss_freq_weight': 'lossf-', 'loss_freq_table': 'lossftable-', 'loss_t_weight': 'losst-', 'loss_weight_normalize': 'lossnorm', 'P_std': 'pstd', 't_eps': 'teps', 'input_perturb': 'ip', 'label_drop_prob': 'labeldrop',
+    'noise_scale': 'noise', 'P_mean': 'pmean', 'token_sizes': 'tok-', 'fine_frac': 'fine', 'alloc_floor': 'allocfloor', 'alloc_gain': 'allocgain-', 'tail_blocks': 'tail', 'tail_query_patch': 'tailq', 'tail_dim': 'taildim', 'tail_heads': 'tailheads', 'tail_head_dim': 'tailhd', 'tail_query_pos': 'tailpos-', 'attn_gate': 'attngate-', 'in_context_cond': 'iclcond', 'kv_prefix_len': 'kvprefix', 'kv_prefix_start': 'kvprefixstart', 'kv_prefix_depth': 'kvprefixdepth', 'kv_prefix_pool': 'kvpool-', 'kv_prefix_pool_mode': 'kvpoolmode-', 'kv_prefix_pool_init': 'kvpoolinit', 'kv_prefix_mlp': 'kvprefixmlp', 'tail_mlp_ratio': 'tailmlp', 'tail_keys': 'tailkeys-', 'loss_freq_weight': 'lossf-', 'loss_freq_table': 'lossftable-', 'loss_t_weight': 'losst-', 'loss_weight_normalize': 'lossnorm', 'P_std': 'pstd', 'P_std_right': 'pstdr', 't_eps': 'teps', 'input_perturb': 'ip', 'label_drop_prob': 'labeldrop',
     'blr': 'blr', 'lr_schedule': 'lr-', 'min_lr': 'minlr', 'warmup_epochs': 'warmup', 'weight_decay': 'wd',
     'beta1': 'beta1-', 'beta2': 'beta2-', 'grad_clip': 'clip', 'ema_decay1': 'ema', 'ema_decay2': 'ema2-', 'ema_warmup': 'emawarmup',
     'attn_dropout': 'attndrop', 'proj_dropout': 'projdrop', 'attn_res': 'attnres-', 'attn_res_block_size': 'attnresbs',

@@ -23,6 +23,8 @@ class Denoiser(nn.Module):
         self.label_drop_prob = args.label_drop_prob
         self.P_mean = args.P_mean
         self.P_std = args.P_std
+        # split (two-piece) logit-normal: std P_std left of the mode (noisier), P_std_right right of it (cleaner); 0 = symmetric
+        self.P_std_right = getattr(args, 'P_std_right', 0.0) or args.P_std
         self.t_eps = args.t_eps
         self.noise_scale = args.noise_scale
 
@@ -44,7 +46,12 @@ class Denoiser(nn.Module):
         return out
 
     def sample_t(self, n: int, device=None):
-        z = torch.randn(n, device=device) * self.P_std + self.P_mean
+        if self.P_std_right == self.P_std:
+            z = torch.randn(n, device=device) * self.P_std + self.P_mean
+        else: # two-piece normal in logit space: a half-normal on each side of the mode, sides drawn in proportion to their std
+            h = torch.randn(n, device=device).abs()
+            right = torch.rand(n, device=device) < self.P_std_right / (self.P_std + self.P_std_right)
+            z = self.P_mean + torch.where(right, h * self.P_std_right, -h * self.P_std)
         return torch.sigmoid(z)
 
     def forward(self, x, labels):
