@@ -5,7 +5,10 @@ class with one fixed noise draw each. No model involved.
 
 Writes to {out}/ (default trajectories/), file names carrying the settings, e.g. grid_logitnorm-0.8_0.8_noise0.5_c4x2_f48.gif:
   grid_{settings}.gif   every sample at once (rows = classes, columns = samples), t sweeping 0 -> 1, with the t of each frame
-  strip_{settings}.png  each sample at strip_columns noise levels (columns), labelled with t
+  strip_{settings}.png  each sample at strip_columns noise levels (columns), labelled with t, and below them the share of
+                        t_spacing's mass in each step of the sampler's grid (sampling_steps uniform steps, JiT's Heun grid)
+                        against the matched level 1 / sampling_steps: where the sampler runs on noise levels the
+                        distribution (as a training distribution) rarely covers
 settings: t_spacing, noise scale, classes (explicit list, else count) x images per class, split / seed when not the
 default, and the frame count (GIF) or column count (strip).
 
@@ -46,6 +49,7 @@ frames = 48 # GIF frames from t = 0 to t = 1
 t_spacing = 'uniform' # distribution whose quantiles place the frames / columns: 'uniform', 'logitnorm(m, s)', 'beta(a, b)'
 strip_columns = 11 # noise levels in strip.png (quantiles of t_spacing, including t = 0 and 1)
 spectrum_images = 2000 # t_spacing='spectral': images for the power spectrum
+sampling_steps = 50 # the sampler's uniform t grid, for the strip's coverage panel
 fps = 12
 hold = 1.0 # seconds to hold the first (noise) and last (data) frames
 upscale = 2 # nearest-neighbour upscaling of the GIFs for viewing
@@ -133,6 +137,22 @@ def power_spectrum():
               f'slope {np.polyfit(np.log(r), np.log(P), 1)[0]:.2f} (natural images ~ -2)')
     return _spectrum
 
+def step_shares(steps):
+    # mass of t_spacing in each of the sampler's uniform steps [i / steps, (i + 1) / steps)
+    name, params = parse_spacing(t_spacing)
+    if name == 'uniform':
+        return np.full(steps, 1 / steps)
+    if name == 'spectral': # no density: the levels' empirical spread (fine quantiles)
+        q = np.array(quantiles(20001)[1:-1])
+        return np.histogram(q, bins=steps, range=(0, 1))[0] / len(q)
+    t = 1 / (1 + np.exp(-np.linspace(-30, 30, 400001)))
+    t = t[(t > 0) & (t < 1)]
+    pdf = DENSITIES[name](t, *params)
+    cdf = np.concatenate([[0.0], np.cumsum(0.5 * (pdf[1:] + pdf[:-1]) * np.diff(t))])
+    cdf /= cdf[-1]
+    edges = np.interp(np.linspace(0, 1, steps + 1), np.concatenate([[0], t, [1]]), np.concatenate([[0], cdf, [1]]))
+    return np.diff(edges)
+
 def frame(x, e, t):
     z = t * x + (1 - t) * s * e
     return (np.clip((z + 1) / 2, 0, 1) * 255).round().astype(np.uint8)
@@ -179,7 +199,9 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 st = quantiles(strip_columns)
-fig, axes = plt.subplots(len(samples), len(st), figsize=(1.3 * len(st), 1.3 * len(samples) + 0.6), squeeze=False)
+fig = plt.figure(figsize=(1.3 * len(st), 1.3 * len(samples) + 2.2))
+gs = fig.add_gridspec(len(samples) + 1, len(st), height_ratios=[1] * len(samples) + [1.3])
+axes = np.array([[fig.add_subplot(gs[k, j]) for j in range(len(st))] for k in range(len(samples))])
 for k, (c, name, x, e) in enumerate(samples):
     for j, t in enumerate(st):
         ax = axes[k, j]
@@ -191,6 +213,21 @@ for k, (c, name, x, e) in enumerate(samples):
             ax.set_title(f't={t:.3f}', fontsize=7)
         if j == 0:
             ax.set_ylabel(name[:18], fontsize=7)
+# coverage panel: t_spacing's share per sampler step vs the matched 1 / steps
+ax = fig.add_subplot(gs[len(samples), :])
+sh = step_shares(sampling_steps)
+centers = (np.arange(sampling_steps) + 0.5) / sampling_steps
+low = sh < 0.25 / sampling_steps
+ax.bar(centers, 100 * sh, width=0.9 / sampling_steps, color=np.where(low, '#c0392b', '#4a6fa5'))
+ax.axhline(100 / sampling_steps, color='k', lw=0.8, ls='--')
+for t in st:
+    ax.axvline(t, color='0.6', lw=0.6, ls=':')
+ax.set_xlim(0, 1)
+ax.set_xlabel(f't (dotted: the strip columns)', fontsize=7)
+ax.set_ylabel('% per step', fontsize=7)
+ax.tick_params(labelsize=7)
+ax.set_title(f'share of {t_spacing} in each of the sampler\'s {sampling_steps} uniform steps (dashed: matched, {100 / sampling_steps:g}%; '
+             f'red: under a quarter of that, {int(low.sum())}/{sampling_steps} steps)', fontsize=7)
 fig.suptitle(f'training trajectories z_t = t x + (1 - t) {s:g} e  (t = data fraction, 1 = clean), columns at quantiles of {t_spacing}', fontsize=8)
 fig.tight_layout()
 strip_path = os.path.join(out, f'strip_{tag}_n{len(st)}.png')
