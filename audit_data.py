@@ -7,7 +7,7 @@ Reports:
                     (short side < img_size), i.e. trained on as bicubic-interpolated blur
   JPEG quality      estimated IJG quality from each file's luminance quantization table (low quality = blocking
                     artifacts the model learns); a re-encoded copy (prepare_imagenet --short_side) shows up as a
-                    spike at one quality value
+                    spike at one quality value together with a capped short side
   consistency       memmap image / label counts vs the source, per-class counts, FID reference stats and the
                     Inception feature file built from the same memmap
 Writes {out}.json with per-image short side and quality (index-aligned with the memmap) for later filtering.
@@ -114,7 +114,11 @@ if __name__ == '__main__':
         vals, cnts = np.unique(qv, return_counts=True)
         top = np.argsort(-cnts)[:5]
         print(f'  most common values: {", ".join(f"q{vals[i]} {100 * cnts[i] / len(qv):.1f}%" for i in top)}'
-              f'{"  <- one value dominates: likely re-encoded copies (prepare_imagenet --short_side)" if cnts.max() > 0.5 * len(qv) else ""}')
+              f'{"  <- one value dominates" if cnts.max() > 0.5 * len(qv) else ""}')
+        # re-encoded copies (prepare_imagenet --short_side=N) would also cap the short side at N: judge by both
+        smax = int(np.percentile(short[short > 0], 99.9))
+        print(f'  99.9th percentile short side {smax}: ' + ('consistent with resized copies' if smax <= 512 and cnts.max() > 0.5 * len(qv)
+              else 'original-resolution files (not resized copies)'))
     with open(args.out + '.json', 'w') as f:
         json.dump({'split': args.split, 'img_size': R, 'short_side': short.tolist(), 'quality': qual.tolist()}, f)
     print(f'\nwrote {args.out}.json (per-image short side / quality, memmap order)')

@@ -15,6 +15,16 @@ Recipes (--recipe; any setting can still be overridden):
        (-0.8, 0.8), gradient clipping 1.0: compares with runs/in1k_128/jit-b16_icl0/muon (FID-10k 81.0 at 20 epochs)
   sit  SiT's: AdamW lr 1e-4 (SiT's value at batch 256, not rescaled), betas (0.9, 0.999), constant from the start, t uniform,
        no clipping
+Row-7 stack (as train_jit.py, same flags): --attn_res=full --adaln_single=True --attn_res_chunk=8 --kv_prefix_len=32
+--attn_gate=head --loss_t_weight=learned --warmup_epochs=1 --grad_clip=0. The KV prefix starts at block 4 (JiT-B/16's
+in_context_start) unless --kv_prefix_start is given.
+Model size: --depth / --hidden_size / --num_heads (L: 24 / 1024 / 16, H: 32 / 1280 / 16), as JiT's presets.
+Pipeline cost for comparing with pixel runs (config.json 'resolved', read by plot_runs_html.py / plot_scaling.py):
+  training   train_pflops_offset = the VAE's own training compute (vae_cost.py: its published training stages, FLOPs per
+             image measured on the VAE + loss networks), so training compute = VAE training + images x 3 x trunk forward.
+             The one-off dataset encoding (cached_encoding_pflops) is recorded but not added (~0.1% of the VAE's training)
+  sampling   sample_gflops = network calls (the eval's sampler) x trunk forward + VAE decoder forward (generation never encodes)
+  params     pipeline_params = trunk + VAE encoder + decoder
 Both: label dropout 0.1, EMA 0.9999 / 0.9996 (with train_jit.py's warm-up), noise scale 1 (the scaled latents have about
 unit variance), batch 1024.
 Dispersive Loss (Wang & He 2025) via repa.DispCapture / dispersive_loss with --disp_weight > 0; the defaults are the paper's
@@ -28,6 +38,8 @@ $ python prepare_latents.py --data_dir=/data/in1k_128
 $ python train_latent.py --data_dir=/data/in1k_128                                  # recipe jit, 20 epochs
 $ python train_latent.py --data_dir=/data/in1k_128 --disp_weight=0.5                # + Dispersive Loss, the paper's settings
 $ python train_latent.py --data_dir=/data/in1k_128 --recipe=sit
+$ python train_latent.py --data_dir=/data/in1k_128 --attn_res=full --adaln_single=True --attn_res_chunk=8 --kv_prefix_len=32 --attn_gate=head \
+      --loss_t_weight=learned --warmup_epochs=1 --grad_clip=0                    # the row-7 stack in latent space
 """
 
 import os
@@ -44,9 +56,11 @@ import torch
 warnings.filterwarnings('ignore', message=r'\s*Online softmax is disabled') # torch.compile's note that it skipped one softmax fusion: harmless, and printed for every compiled graph
 
 from data_jit import MemmapImages, EpochSampler
-from jit_common import generate_and_score
+from jit_common import generate_and_score, sampling_nfe
 from fid import InceptionMetrics, load_ref_stats
 from model_jit import JiT
+from loss_weighting import LossWeighting
+from vae_cost import vae_training_cost
 from muon import Muon, CombinedOptimizer
 from repa import DispCapture, dispersive_loss
 import diagnostics as diag_lib
@@ -58,7 +72,7 @@ sys.stdout.reconfigure(line_buffering=True) # logs redirected to a file show eac
 data_dir = '' # the prepared pixel dataset (FID reference stats, labels, class count); latents in latent_dir
 latent_dir = '' # default: {data_dir}/latents_sdvae-ft-ema
 runs_root = 'runs'
-out_dir = '' # default: {runs_root}/{dataset}/latent-b2/{recipe}{_changes}
+out_dir = '' # default: {runs_root}/{dataset}/latent-b2[_d.._w.._h..]/{recipe}{_changes}
 init_from = 'scratch' # 'scratch' or 'resume'
 recipe = 'jit' # 'jit' or 'sit' (see above); settings left at their sentinel take the recipe's value
 epochs = 20
@@ -88,6 +102,13 @@ bottleneck_dim = 128
 attn_res = 'none' # as train_jit.py ('full' / 'block'), off for the baseline
 adaln_single = False
 attn_res_chunk = 1
+attn_gate = 'none' # as train_jit.py: 'head' / 'elem' gated attention
+kv_prefix_len = 0 # as train_jit.py: class + learned K/V-only prefix tokens
+kv_prefix_start = -1 # -1: block 4 (JiT-B/16's in_context_start, as the pixel runs)
+in_context_start = 4 # only the KV prefix's default start (no in-context tokens here)
+loss_t_weight = 'none' # as train_jit.py: 'learned' = EDM2-style learned per-noise-level weight (loss L / e^u(t) + u(t))
+loss_weight_normalize = False
+loss_weight_lr_mult = 50.0
 # Dispersive Loss (off unless disp_weight > 0); defaults = the paper's
 disp_weight = 0.0
 disp_temp = 0.5
@@ -136,14 +157,17 @@ latent_dir = latent_dir or os.path.join(data_dir, 'latents_sdvae-ft-ema')
 lmeta = json.load(open(os.path.join(latent_dir, 'meta.json')))
 C, H, W = lmeta['latent_shape']
 dataset = os.path.basename(os.path.normpath(data_dir))
-if not out_dir:
-    changed = [f'{k}{v:g}' if isinstance(v, float) else f'{k}{v}' for k, v in config.items()
-               if k not in ('data_dir', 'latent_dir', 'runs_root', 'out_dir', 'init_from', 'recipe', 'epochs', 'eval_every_epochs',
+if not out_dir: # pixel runs' naming (jit_common's short tokens); size in the model directory, as JiT's d / w / h
+    from jit_common import _name_token
+    ARCH = {'depth': ('d', 12), 'hidden_size': ('w', 768), 'num_heads': ('h', 12), 'patch_size': ('p', 2)}
+    model_dir = 'latent-b2' + ''.join(f'_{a}{config[k]}' for k, (a, d) in ARCH.items() if config[k] != d)
+    changed = [_name_token(k, v) for k, v in config.items()
+               if k not in tuple(ARCH) + ('data_dir', 'latent_dir', 'runs_root', 'out_dir', 'init_from', 'recipe', 'epochs', 'eval_every_epochs',
                             'save_every_epochs', 'log_interval', 'device', 'dtype', 'compile', 'decode', 'attn_res_chunk', 'gen_batch_size',
                             'fid_num_images', 'fid_cfg', 'fid_interval_min', 'fid_interval_max', 'num_sampling_steps', 'probe_blocks',
                             'probe_ts', 'probe_train_images', 'probe_val_images', 'eval_loss_images', 'seed') # (evaluation / system settings)
                and v != dict(_defaults, **RECIPES[recipe])[k]] # settings that differ from the recipe's (or the script's) values
-    out_dir = os.path.join(runs_root, dataset, 'latent-b2', '_'.join([recipe] + changed))
+    out_dir = os.path.join(runs_root, dataset, model_dir, '_'.join([recipe] + changed))
 os.makedirs(os.path.join(out_dir, 'diagnostics'), exist_ok=True)
 print(f"data: {data_dir} (latents {latent_dir}: {C} x {H} x {W}, {lmeta['vae']})\nrun:  {out_dir}")
 with open(os.path.join(out_dir, 'config.json'), 'w') as f:
@@ -187,11 +211,64 @@ print(f"recipe {recipe}: {optimizer_type}, lr {lr:.2e}, betas ({beta1}, {beta2})
 
 # network: v-prediction (the output is the velocity)
 net = JiT(input_size=H, patch_size=patch_size, in_channels=C, hidden_size=hidden_size, depth=depth, num_heads=num_heads,
-          num_classes=num_classes, bottleneck_dim=bottleneck_dim, in_context_len=0, in_context_start=0, attn_res=attn_res,
-          adaln_single=adaln_single).to(device)
+          num_classes=num_classes, bottleneck_dim=bottleneck_dim, in_context_len=0, in_context_start=in_context_start, attn_res=attn_res,
+          adaln_single=adaln_single, attn_gate=attn_gate, kv_prefix_len=kv_prefix_len, kv_prefix_start=kv_prefix_start).to(device)
 net.attn_res_chunk = attn_res_chunk
 print(f"network: JiT blocks, {depth} x {hidden_size}, {(H // patch_size) * (W // patch_size)} tokens of {patch_size}x{patch_size}x{C} latent patches, "
       f"{sum(p.numel() for p in net.parameters()) / 1e6:.1f}M params")
+loss_weighter = LossWeighting(noise_scale, t_weight='learned', normalize_learned=loss_weight_normalize).to(device) if loss_t_weight == 'learned' else None
+assert loss_t_weight in ('none', 'learned'), f"loss_t_weight must be 'none' or 'learned', got {loss_t_weight}"
+
+# pipeline cost, recorded in config.json like train_jit.py's (FLOP counter on one sample; FLOPs = 2 x multiply-adds)
+from torch.utils.flop_counter import FlopCounterMode
+def _flops(fn):
+    with torch.no_grad(), FlopCounterMode(display=False) as fc:
+        fn()
+    return fc.get_total_flops() / 1e9
+_was = net.training
+net.eval()
+fwd_gflops = _flops(lambda: net(torch.randn(1, C, H, W, device=device), torch.full((1,), 0.5, device=device), torch.zeros(1, dtype=torch.long, device=device)))
+net.train(_was)
+SCALE = lmeta['scale']
+vae = None
+if decode == 'vae':
+    from diffusers.models import AutoencoderKL
+    vae = AutoencoderKL.from_pretrained(lmeta['vae']).to(device).eval()
+img_size_px = lmeta.get('img_size', pix.img_size)
+if vae is not None:
+    _x = torch.randn(1, 3, img_size_px, img_size_px, device=device)
+    vae_cost = dict(vae_encoder_params=sum(p.numel() for n, p in vae.named_parameters() if n.startswith(('encoder', 'quant_conv'))),
+                    vae_decoder_params=sum(p.numel() for n, p in vae.named_parameters() if n.startswith(('decoder', 'post_quant_conv'))),
+                    vae_encode_gflops=_flops(lambda: vae.encode(_x).latent_dist.mean),
+                    vae_decode_gflops=_flops(lambda: vae.decode(torch.randn(1, C, H, W, device=device))))
+else:
+    vae_cost = dict(vae_encoder_params=0, vae_decoder_params=0, vae_encode_gflops=0.0, vae_decode_gflops=0.0)
+n_encoded = (len(train_data) + len(val_data)) * 2 # prepare_latents.py encodes both flips of train and val
+trunk_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
+vae_train = vae_training_cost(vae, lmeta['vae'], device) if vae is not None else None
+assert vae_train is not None or vae is None, f"no training record for {lmeta['vae']} in vae_cost.VAE_TRAINING: add its stages (model card / paper)"
+vae_train = vae_train or {'vae_train_pflops': 0.0, 'vae_train_stages': []}
+sample_nfe = sampling_nfe(num_sampling_steps, 'heun', fid_cfg, (fid_interval_min, fid_interval_max))
+config['resolved'] = dict(model_name=f'latent-{depth}x{hidden_size}/{patch_size}', img_size=img_size_px, num_classes=num_classes,
+                          effective_batch_size=batch_size, iters_per_epoch=iters_per_epoch, max_iters=max_iters, train_images=len(train_data),
+                          lr=lr, params=trunk_params, fwd_gflops=fwd_gflops, **vae_cost,
+                          pipeline_params=trunk_params + vae_cost['vae_encoder_params'] + vae_cost['vae_decoder_params'],
+                          train_pflops_offset=vae_train['vae_train_pflops'], **vae_train,
+                          cached_encoding_pflops=n_encoded * vae_cost['vae_encode_gflops'] / 1e6,
+                          sample_nfe=sample_nfe, sample_gflops=sample_nfe * fwd_gflops + vae_cost['vae_decode_gflops'],
+                          latent_shape=[C, H, W], vae=lmeta['vae'])
+with open(os.path.join(out_dir, 'config.json'), 'w') as f:
+    json.dump(config, f, indent=2)
+print(f"cost: trunk {trunk_params / 1e6:.2f}M params, {fwd_gflops:.2f} forward GFLOPs per image; VAE encoder "
+      f"{vae_cost['vae_encoder_params'] / 1e6:.1f}M / {vae_cost['vae_encode_gflops']:.1f} GFLOPs, decoder {vae_cost['vae_decoder_params'] / 1e6:.1f}M / "
+      f"{vae_cost['vae_decode_gflops']:.1f} GFLOPs; sampling {sample_nfe} calls + VAE decoder = {config['resolved']['sample_gflops']:.0f} GFLOPs per image")
+_trunk_pf = max_iters * batch_size * 3 * fwd_gflops / 1e6
+for st in vae_train['vae_train_stages']:
+    print(f"  VAE training: {st['name']}: {st['steps']:,} steps x {st['batch']} at {st['res']}px, {st['trains']}, "
+          f"{st['gflops_per_image']:.0f} GFLOPs/image = {st['pflops']:,.0f} PFLOPs ({st['note']})")
+print(f"  training compute: VAE {vae_train['vae_train_pflops']:,.0f} + trunk {_trunk_pf:,.0f} PFLOPs over this run "
+      f"(cached dataset encoding {config['resolved']['cached_encoding_pflops']:,.0f} PFLOPs, not counted)")
+
 disp_captures = []
 if disp_weight > 0:
     idx = list(range(1, depth + 1)) if disp_blocks == 'all' else [int(b) for b in disp_blocks.split(',')] if disp_blocks else [max(1, depth // 4)]
@@ -203,7 +280,8 @@ def muon_split(name):
     if not muon_split_fused:
         return 1
     return 3 if name.endswith('attn.qkv.weight') else 2 if name.endswith('mlp.w12.weight') else \
-        6 if (name.endswith('adaLN_modulation.1.weight') or name.endswith('t_block.1.weight')) else 1
+        6 if (name.endswith('adaLN_modulation.1.weight') or name.endswith('t_block.1.weight')) else \
+        2 if (name.endswith('attn_res_modulation.1.weight') or name.endswith('.kv.weight')) else 1 # (as train_jit.py)
 muon_named = {id(p): n for n, p in net.blocks.named_parameters() if optimizer_type == 'muon' and p.ndim >= 2 and 'scale_shift_table' not in n}
 if optimizer_type == 'muon' and adaln_single:
     muon_named[id(net.t_block[1].weight)] = 't_block.1.weight'
@@ -213,7 +291,9 @@ for n, p in net.named_parameters():
         muon_params.setdefault(muon_split(muon_named[id(p)]), []).append(p)
     else:
         (no_decay if p.ndim == 1 or n.endswith('.bias') or 'scale_shift_table' in n else decay).append(p)
-adamw = torch.optim.AdamW([{'params': no_decay, 'weight_decay': 0.0, 'peak_lr': lr}, {'params': decay, 'weight_decay': weight_decay, 'peak_lr': lr}],
+weighter_params = list(loss_weighter.parameters()) if loss_weighter is not None else [] # own group, as train_jit.py
+adamw = torch.optim.AdamW([{'params': no_decay, 'weight_decay': 0.0, 'peak_lr': lr}, {'params': decay, 'weight_decay': weight_decay, 'peak_lr': lr}]
+                          + ([{'params': weighter_params, 'weight_decay': 0.0, 'peak_lr': lr * loss_weight_lr_mult, 'lr': lr * loss_weight_lr_mult}] if weighter_params else []),
                           lr=lr, betas=(beta1, beta2), fused=device_type == 'cuda')
 if optimizer_type == 'muon':
     muon = Muon([{'params': ps, 'split': k, 'peak_lr': lr} for k, ps in sorted(muon_params.items())], lr=lr, momentum=muon_momentum,
@@ -231,6 +311,8 @@ if init_from == 'resume':
     ema1 = [ck['ema1'][n].to(device) for n, _ in net.named_parameters()]
     ema2 = [ck['ema2'][n].to(device) for n, _ in net.named_parameters()]
     optimizer.load_state_dict(ck['optimizer'])
+    if loss_weighter is not None and ck.get('loss_weighting') is not None:
+        loss_weighter.load_state_dict(ck['loss_weighting'])
     iter_num, best_fid, train_seconds = ck['iter_num'], ck['best_fid'], ck.get('train_seconds', 0.0)
     print(f"resumed at iter {iter_num} (epoch {iter_num / iters_per_epoch:.2f})")
     del ck
@@ -262,10 +344,7 @@ def ema_weights(which):
                 p.copy_(b)
 
 # decoding latents to images for FID
-SCALE = lmeta['scale']
 if decode == 'vae':
-    from diffusers.models import AutoencoderKL
-    vae = AutoencoderKL.from_pretrained(lmeta['vae']).to(device).eval()
     def to_images(z):
         with ctx:
             return vae.decode(z / SCALE).sample.float().clamp(-1, 1)
@@ -376,6 +455,8 @@ def evaluate(step):
         net.train()
     probes = diag_lib.run_probes(tr, torch.from_numpy(probe_train[1]).to(device), va, torch.from_numpy(probe_val[1]).to(device), num_classes)
     log.update({'val/fid': out['fid'], 'val/is': out['is']})
+    if loss_weighter is not None:
+        log.update({f'loss_weight/{k}': v for k, v in loss_weighter.summary().items()})
     for (b, t), r in probes.items():
         log[f'probe/knn_block{b:02d}_t{t:.2f}'] = r['knn']
         log[f'probe/linear_block{b:02d}_t{t:.2f}'] = r['linear']
@@ -390,7 +471,7 @@ def evaluate(step):
 def save_checkpoint():
     names = [n for n, _ in net.named_parameters()]
     torch.save({'model': net.state_dict(), 'ema1': dict(zip(names, [e.cpu() for e in ema1])), 'ema2': dict(zip(names, [e.cpu() for e in ema2])),
-                'optimizer': optimizer.state_dict(), 'iter_num': iter_num, 'best_fid': best_fid, 'train_seconds': train_seconds,
+                'optimizer': optimizer.state_dict(), 'loss_weighting': loss_weighter.state_dict() if loss_weighter is not None else None, 'iter_num': iter_num, 'best_fid': best_fid, 'train_seconds': train_seconds,
                 'config': config}, os.path.join(out_dir, 'ckpt.pt.tmp'))
     os.replace(os.path.join(out_dir, 'ckpt.pt.tmp'), os.path.join(out_dir, 'ckpt.pt'))
 
@@ -423,7 +504,10 @@ while True:
     e = torch.randn_like(x) * noise_scale
     with ctx:
         v_hat = net(t * x + (1 - t) * e, t.flatten(), y)
-        loss = (x - e - v_hat.float()).pow(2).mean() # ||v - v_hat||^2, v = x - s e
+        if loss_weighter is not None: # learned per-level weight on the per-sample v-loss (train_jit.py's residual is the same v - v_hat)
+            loss = loss_weighter(x - e - v_hat.float(), t.flatten())
+        else:
+            loss = (x - e - v_hat.float()).pow(2).mean() # ||v - v_hat||^2, v = x - s e
         loss_disp = (sum(dispersive_loss(c.out, disp_temp, disp_kind, pool=disp_pool, group=disp_group) for c in disp_captures)
                      / len(disp_captures)) if disp_captures else None
         total = loss + disp_weight * loss_disp if disp_captures else loss

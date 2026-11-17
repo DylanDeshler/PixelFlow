@@ -5,7 +5,8 @@ FID vs images seen, vs training compute and vs parameters across runs: hardware-
 For each run: the in-loop FID-10k at every eval (diagnostics/diag_<iter>.json), images seen (iter x effective batch), and
 the model's trainable parameters and forward GFLOPs per image: from config.json (recorded by train_jit.py since
 2026-11-05) or, for older runs, measured by rebuilding the model from its saved architecture (jit_common.model_cost, one
-image on CPU). Training compute = images x 3 x forward FLOPs (backward ~2x forward; implementation-only recompute such as
+image on CPU). Latent runs (train_latent.py) add the VAE's own training compute (train_pflops_offset, vae_cost.py) and count the
+VAE's params (pipeline_params). Training compute = images x 3 x forward FLOPs (backward ~2x forward; implementation-only recompute such as
 --tail_checkpoint is not counted, it changes nothing about the model).
   images  FID vs images seen (every eval, one line per run): sample efficiency
   flops   FID vs training PFLOPs (every eval): compute efficiency, the fair axis for designs that cost more per image
@@ -63,8 +64,10 @@ rows = []
 for d, name in zip(dirs, names):
     cfg = json.load(open(os.path.join(d, 'config.json')))
     res = cfg.get('resolved', {})
-    if 'fwd_gflops' in res:
-        cost = {k: res[k] for k in ('params', 'fwd_gflops') if k in res}
+    if 'fwd_gflops' in res: # latent runs (train_latent.py): params of the whole pipeline (trunk + VAE encoder + decoder)
+        cost = {'params': res.get('pipeline_params', res.get('params')), 'fwd_gflops': res['fwd_gflops']}
+        if 'sample_gflops' in res:
+            cost['sample_gflops'] = res['sample_gflops']
     else: # rebuild the network from its saved architecture and count (CPU, one image)
         net = build_denoiser(res['model_name'], res.get('img_size', img_size), res.get('num_classes', num_classes),
                              noise_scale=res.get('noise_scale', 1.0), arch=res.get('arch')).net
@@ -87,7 +90,7 @@ for d, name in zip(dirs, names):
     if os.path.exists(log): # median img/s after the first half epoch (hardware-dependent, for reference)
         v = sorted(r['imgs_per_sec'] for r in map(json.loads, open(log)) if 'imgs_per_sec' in r and r.get('epoch', 0) > 0.5)
         ips = v[len(v) // 2] if v else None
-    pts = [{'iter': it, 'epoch': it / ipe, 'images': it * batch, 'train_pflops': it * batch * 3 * cost['fwd_gflops'] / 1e6, 'fid': fid}
+    pts = [{'iter': it, 'epoch': it / ipe, 'images': it * batch, 'train_pflops': res.get('train_pflops_offset', 0.0) + it * batch * 3 * cost['fwd_gflops'] / 1e6, 'fid': fid}
            for it, fid in evals]
     near = min(pts, key=lambda p: abs(p['epoch'] - at_epoch)) if pts else None
     rows.append({'run': d, 'label': name, **cost, 'img_per_sec': ips, 'evals': pts,
@@ -95,10 +98,10 @@ for d, name in zip(dirs, names):
 
 assert rows, 'no run has evals yet'
 assert len(rows) <= len(ps.CATEGORICAL), f'{len(rows)} runs: at most {len(ps.CATEGORICAL)} per chart (split them into several charts)'
-print(f"{'run':<28} {'params':>8} {'GFLOP/img':>10} {'img/s':>7} " + f"{'FID@' + format(at_epoch, 'g') + 'ep':>10}  evals (epoch: FID)")
+print(f"{'run':<28} {'params':>8} {'GFLOP/img':>10} {'GF/sample':>10} {'img/s':>7} " + f"{'FID@' + format(at_epoch, 'g') + 'ep':>10}  evals (epoch: FID)")
 for r in rows:
     fe = f"{r['fid_at_epoch']:.2f}" if r['fid_at_epoch'] is not None else '-'
-    print(f"{r['label'][:28]:<28} {r['params'] / 1e6:>7.2f}M {r['fwd_gflops']:>10.2f} {r['img_per_sec'] or float('nan'):>7.0f} {fe:>10}  "
+    print(f"{r['label'][:28]:<28} {r['params'] / 1e6:>7.2f}M {r['fwd_gflops']:>10.2f} {r.get('sample_gflops', 99 * r['fwd_gflops']):>10.0f} {r['img_per_sec'] or float('nan'):>7.0f} {fe:>10}  "
           + ', '.join(f"{p['epoch']:g}: {p['fid']:.2f}" for p in r['evals']))
 
 plt = ps.setup()

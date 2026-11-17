@@ -275,6 +275,20 @@ class FastDenoiser(Denoiser):
         torch._foreach_lerp_(self.ema_params1, params, 1 - d1) # ema = d * ema + (1 - d) * param
         torch._foreach_lerp_(self.ema_params2, params, 1 - d2)
 
+def sampling_nfe(steps=50, method='heun', cfg=1.0, interval=(0.0, 1.0)):
+    # network calls per sample on JiT's grid (t from 0 to 1 in `steps` equal steps): Heun 2 per step except the last (Euler),
+    # Euler / ancestral 1; a call inside the guidance interval with cfg != 1 runs conditional + unconditional (2 forwards)
+    ts = [i / steps for i in range(steps + 1)]
+    low, high = interval
+    def calls(t):
+        return 2 if cfg != 1.0 and t < high and (low == 0 or t > low) else 1
+    n = 0
+    for i in range(steps):
+        n += calls(ts[i])
+        if method == 'heun' and i < steps - 1:
+            n += calls(ts[i + 1])
+    return n
+
 def model_cost(net, img_size, num_classes, device='cpu'):
     """
     Size and compute of a JiT-family network, for comparing runs on FLOPs / parameters rather than hardware time:

@@ -93,6 +93,8 @@ for d in bar(dirs, f'reading {len(dirs)} runs'):
     batch = res.get('effective_batch_size') or cfg.get('batch_size', 0) * cfg.get('gradient_accumulation_steps', 1)
     if not ipe or not batch:
         continue
+    if 'vae' in res: # latent baselines (train_latent.py) are left out: they belong in the full-training comparison (plot_scaling.py)
+        continue
     params, gfl = measure(d, res, cache)
     evals = []
     for f in glob.glob(os.path.join(d, 'diagnostics', 'diag_*.json')):
@@ -125,7 +127,9 @@ for d in bar(dirs, f'reading {len(dirs)} runs'):
             ips = round(sum(top) / len(top))
     for e in evals: # training wall-clock at the typical throughput (evals and compilation excluded)
         e['hours'] = e['images'] * 1e6 / ips / 3600 if ips else None
-    runs.append({'path': os.path.relpath(d, runs_root), 'tokens': label_tokens(d, runs_root, res.get('arch')), 'params': params, 'gflops': gfl,
+    # sampling GFLOPs per image: recorded (network calls x forward), else the default eval sampler (Heun 50, CFG 1: 99 calls)
+    sgfl = res.get('sample_gflops') or (gfl * 99 if gfl else None)
+    runs.append({'path': os.path.relpath(d, runs_root), 'tokens': label_tokens(d, runs_root, res.get('arch')), 'params': params, 'gflops': gfl, 'sgflops': sgfl,
                  'ips': ips, 'evals': evals, 'max_epoch': evals[-1]['epoch'], 'default': evals[-1]['epoch'] >= min_epochs - 0.25})
 os.makedirs(os.path.dirname(out) or '.', exist_ok=True)
 with open(cache_path, 'w') as f:
@@ -285,7 +289,7 @@ function showTip(ev, r, e) {
   const mark = `<svg width="14" height="14" style="vertical-align:-2px;margin-right:5px"><path d="${markerPath(r.marker, 7, 7, 5)}" fill="${r.color}"/></svg>`;
   t.innerHTML = `${mark}<b>${r.label}</b><br><span class="muted">${r.path}</span><br>epoch ${fmt(e.epoch, 1)} &middot; ${fmt(e.images, 1)}M images` + (e.pflops != null ? ` &middot; ${fmt(e.pflops, 0)} PFLOPs` : '') +
     (e.hours != null ? ` &middot; ${fmt(e.hours, 2)} h` : '') + `<br>FID ${fmt(e.fid)}` + (e.is != null ? ` &middot; IS ${fmt(e.is)}` : '') + (e.precision != null ? ` &middot; precision ${fmt(e.precision, 3)} &middot; recall ${fmt(e.recall, 3)}` : '') +
-    `<br><span class="muted">${r.params ? (r.params / 1e6).toFixed(2) + 'M params' : 'params ?'} &middot; ${r.gflops ? r.gflops.toFixed(2) + ' GFLOP/img fwd' : 'FLOPs ?'}${r.ips ? ' &middot; ' + r.ips + ' img/s' : ''}</span>`;
+    `<br><span class="muted">${r.params ? (r.params / 1e6).toFixed(2) + 'M params' : 'params ?'} &middot; ${r.gflops ? r.gflops.toFixed(2) + ' GFLOP/img fwd' : 'FLOPs ?'}${r.sgflops ? ' &middot; ' + r.sgflops.toFixed(0) + ' GFLOP/sample' : ''}${r.ips ? ' &middot; ' + r.ips + ' img/s' : ''}</span>`;
   t.style.display = 'block';
   const x = Math.min(ev.clientX + 14, window.innerWidth - t.offsetWidth - 8), y = Math.min(ev.clientY + 14, window.innerHeight - t.offsetHeight - 8);
   t.style.left = x + 'px'; t.style.top = y + 'px';
@@ -316,8 +320,8 @@ function render() {
   }
   // table
   const eps = [...new Set(vis.flatMap(r => r.evals.map(e => Math.round(e.epoch))))].sort((a, b) => a - b);
-  let h = `<table><tr><th>run</th><th>params</th><th>GFLOP/img</th><th>img/s</th>${eps.map(e => `<th>${ylab} @${e}</th>`).join('')}</tr>`;
-  for (const r of vis) h += `<tr><td title="${r.path}">${r.label}</td><td>${r.params ? (r.params / 1e6).toFixed(2) + 'M' : '–'}</td><td>${fmt(r.gflops)}</td><td>${r.ips || '–'}</td>` +
+  let h = `<table><tr><th>run</th><th>params</th><th>GFLOP/img</th><th>GFLOP/sample</th><th>img/s</th>${eps.map(e => `<th>${ylab} @${e}</th>`).join('')}</tr>`;
+  for (const r of vis) h += `<tr><td title="${r.path}">${r.label}</td><td>${r.params ? (r.params / 1e6).toFixed(2) + 'M' : '–'}</td><td>${fmt(r.gflops)}</td><td>${r.sgflops ? r.sgflops.toFixed(0) : '–'}</td><td>${r.ips || '–'}</td>` +
     eps.map(ep => { const e = nearest(r, ep); return `<td>${e ? fmt(e[mk], mk === 'fid' || mk === 'is' ? 2 : 3) : ''}</td>`; }).join('') + '</tr>';
   $('table').innerHTML = h + '</table>';
 }

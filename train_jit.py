@@ -34,7 +34,7 @@ import torch
 warnings.filterwarnings('ignore', message=r'\s*Online softmax is disabled') # torch.compile's note that it skipped one softmax fusion: harmless, and printed for every compiled graph
 
 from data_jit import MemmapImages, EpochSampler, Prefetcher, to_model_input
-from jit_common import build_denoiser, resolve_arch, describe_arch, run_dir, legacy_run_dir, ema_state_dicts, ema_weights, generate_and_score, save_labeled_grid, save_layout_grids, save_geometry_grid, save_geometry_live, plot_geometry_vs_t, GAUSS_DEFAULTS, model_cost
+from jit_common import build_denoiser, resolve_arch, describe_arch, run_dir, legacy_run_dir, ema_state_dicts, ema_weights, generate_and_score, save_labeled_grid, save_layout_grids, save_geometry_grid, save_geometry_live, plot_geometry_vs_t, GAUSS_DEFAULTS, model_cost, sampling_nfe
 from fid import InceptionMetrics, load_ref_stats, precision_recall
 from repa import FrozenEncoder, Projector, MaskedTransformerAdapter, BlockCapture, DispCapture, repa_loss, mta_loss, dispersive_loss
 from balancer import GradientBalancer
@@ -545,7 +545,11 @@ try: # parameters and forward FLOPs per image, for FID vs compute / size across 
     with torch.compiler.set_stance('force_eager'):
         cost = model_cost(denoiser.net, img_size, num_classes, device=next(denoiser.net.parameters()).device)
     torch._dynamo.reset()
-    print(f"cost: {cost['params'] / 1e6:.2f}M trainable params, {cost['fwd_gflops']:.2f} forward GFLOPs per image")
+    # sampling compute per image with the eval's sampler (FID-10k settings): network calls x forward FLOPs
+    cost['sample_nfe'] = sampling_nfe(num_sampling_steps, sampling_method, fid_cfg, (fid_interval_min, fid_interval_max))
+    cost['sample_gflops'] = cost['sample_nfe'] * cost['fwd_gflops']
+    print(f"cost: {cost['params'] / 1e6:.2f}M trainable params, {cost['fwd_gflops']:.2f} forward GFLOPs per image; sampling "
+          f"{cost['sample_nfe']} calls = {cost['sample_gflops']:.0f} GFLOPs per image")
 except Exception as e: # (other model families' forwards may not fit the probe; plot_scaling.py can still rebuild them)
     cost = {}
     print(f"cost: not measured ({type(e).__name__}: {e})")
