@@ -14,6 +14,11 @@ evenly spaced in its CDF (the first is t = 0, pure noise, the last t = 1, data).
   uniform              even steps in t
   logitnorm(m, s)      t = sigmoid(N(m, s)); JiT trains with logitnorm(-0.8, 0.8)
   beta(a, b)           Beta(a, b)
+  spectral             even steps in how much of the image is visible, from the dataset's own power spectrum: frequency f
+                       (cycles / image) emerges from the noise when its SNR t^2 P(f) / ((1 - t)^2 s^2) reaches 1, at
+                       t = s / (s + sqrt(P(f))); the levels put that cutoff at log-spaced frequencies from 1 cycle per image
+                       to Nyquist (one octave of detail per step on a power-law spectrum). P(f): radially averaged
+                       |FFT|^2 (orthonormal, per channel) of spectrum_images training images in [-1, 1]
 Quantiles come from the density's CDF integrated numerically on a fine logit-spaced grid, so other densities are one
 line in DENSITIES.
 
@@ -39,6 +44,7 @@ noise_scale = 0.0 # 0 -> img_size / 256 (JiT's rule; 0.5 at 128px)
 frames = 48 # GIF frames from t = 0 to t = 1
 t_spacing = 'uniform' # distribution whose quantiles place the frames / columns: 'uniform', 'logitnorm(m, s)', 'beta(a, b)'
 strip_columns = 11 # noise levels in strip.png (quantiles of t_spacing, including t = 0 and 1)
+spectrum_images = 2000 # t_spacing='spectral': images for the power spectrum
 fps = 12
 hold = 1.0 # seconds to hold the first (noise) and last (data) frames
 upscale = 2 # nearest-neighbour upscaling of the GIFs for viewing
@@ -80,7 +86,7 @@ DENSITIES = {
 def parse_spacing(spec):
     spec = spec.replace(' ', '')
     name, _, rest = spec.partition('(')
-    assert name in DENSITIES, f"t_spacing: unknown distribution {name!r} (supported: uniform, logitnorm(m, s), beta(a, b))"
+    assert name in DENSITIES or name == 'spectral', f"t_spacing: unknown distribution {name!r} (supported: uniform, logitnorm(m, s), beta(a, b), spectral)"
     params = [float(v) for v in rest.rstrip(')').split(',') if v] if rest else []
     return name, params
 
@@ -89,6 +95,11 @@ def quantiles(n):
     name, params = parse_spacing(t_spacing)
     if name == 'uniform':
         return np.linspace(0, 1, n).tolist()
+    if name == 'spectral':
+        r, P = power_spectrum()
+        t_r = np.maximum.accumulate(s / (s + np.sqrt(P))) # emergence level per radius (monotone: power falls with frequency)
+        f = np.exp(np.linspace(0, np.log(r[-1]), n - 2)) # cutoffs log-spaced from 1 cycle / image to Nyquist
+        return [0.0] + np.interp(np.log(f), np.log(r), t_r).tolist() + [1.0]
     t = 1 / (1 + np.exp(-np.linspace(-30, 30, 400001)))
     t = t[(t > 0) & (t < 1)]
     pdf = DENSITIES[name](t, *params)
@@ -98,6 +109,26 @@ def quantiles(n):
     out = np.interp(q, cdf, t)
     out[0], out[-1] = 0.0, 1.0 # the exact ends: pure noise and data
     return out.tolist()
+
+_spectrum = None
+def power_spectrum():
+    # radially averaged power per frequency radius 1 .. R/2 (cycles / image), orthonormal FFT per channel, images in [-1, 1]
+    global _spectrum
+    if _spectrum is None:
+        idx = np.linspace(0, len(data) - 1, min(spectrum_images, len(data))).round().astype(int)
+        fy, fx = np.meshgrid(np.fft.fftfreq(R) * R, np.fft.fftfreq(R) * R, indexing='ij')
+        rad = np.sqrt(fx ** 2 + fy ** 2).round().astype(int)
+        acc = np.zeros((R, R))
+        for i in range(0, len(idx), 100):
+            x = data.images[np.sort(idx[i:i + 100])].astype(np.float32) / 127.5 - 1 # [B, R, R, 3]
+            acc += (np.abs(np.fft.fft2(x, axes=(1, 2), norm='ortho')) ** 2).mean(-1).sum(0)
+        acc /= len(idx)
+        r = np.arange(1, R // 2 + 1)
+        P = np.array([acc[rad == k].mean() for k in r])
+        _spectrum = (r, P)
+        print(f'power spectrum of {len(idx)} images: P(1) {P[0]:.3g}, P({R // 2}) {P[-1]:.3g}, '
+              f'slope {np.polyfit(np.log(r), np.log(P), 1)[0]:.2f} (natural images ~ -2)')
+    return _spectrum
 
 def frame(x, e, t):
     z = t * x + (1 - t) * s * e
