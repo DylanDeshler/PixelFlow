@@ -109,13 +109,18 @@ def flow_loss(denoiser, x, labels, masker=None, mask=None, weighting='effective_
             x_pred = denoiser.net(z, t.flatten(), labels, **kwargs)
 
     def v_loss(x_pred):
-        # v - v_pred = (x - x_pred) / (1 - t), with JiT's clamp
+        # v - v_pred = (x - x_pred) / (1 - t), with JiT's clamp. loss_space 'pm1': the residual in [-1, 1] units, so a
+        # non-default data space (data_jit) changes the noising but not how errors are weighted
+        diff = x - x_pred
+        if getattr(denoiser, 'loss_space', 'model') == 'pm1':
+            from data_jit import residual_to_pm1
+            diff = residual_to_pm1(diff)
         if weighter is not None:
-            return weighter((x - x_pred) / (1 - t).clamp_min(denoiser.t_eps), t.flatten())
-        err = ((x - x_pred) / (1 - t).clamp_min(denoiser.t_eps)) ** 2
+            return weighter(diff / (1 - t).clamp_min(denoiser.t_eps), t.flatten())
+        err = (diff / (1 - t).clamp_min(denoiser.t_eps)) ** 2
         if mask is not None and weighting == 'effective_t':
             pm = masker.pixel_mask(mask)
-            err = err * (1 - pm) + (x - x_pred) ** 2 * pm # masked patches weighted as t=0
+            err = err * (1 - pm) + diff ** 2 * pm # masked patches weighted as t=0
         return err.mean()
 
     if two:

@@ -326,19 +326,19 @@ def noise_level_pass(net, x, y, ts, noise_scale, t_eps, ctx, masks, seed=0, chun
             with ctx:
                 x_pred, stats, _ = instrumented_forward(net, z, t, yb, tile=tile, skip_on=skip_on)
             x_pred = x_pred.float()
-            v = (xb - z) / (1 - tt).clamp_min(t_eps)
-            v_pred = (x_pred - z) / (1 - tt).clamp_min(t_eps)
+            from data_jit import residual_to_pm1, denormalize # errors in [-1, 1] units whatever the data space
+            d = residual_to_pm1(xb - x_pred)
             w = len(xb) / len(x)
-            acc['v_loss'] += ((v - v_pred) ** 2).mean().item() * w
-            acc['x_mse'] += ((xb - x_pred) ** 2).mean().item() * w
+            acc['v_loss'] += ((d / (1 - tt).clamp_min(t_eps)) ** 2).mean().item() * w
+            acc['x_mse'] += (d ** 2).mean().item() * w
             for k, s in stats.items():
                 acc[k] = acc[k] + s.float() * w
-            err_power = err_power + band_power(x_pred - xb, masks)
-            x_power = x_power + band_power(xb, masks)
+            err_power = err_power + band_power(-d, masks)
+            x_power = x_power + band_power(denormalize(xb), masks)
             copy = z.float() / t_val
-            copy_power = copy_power + band_power(copy - xb, masks)
+            copy_power = copy_power + band_power(residual_to_pm1(copy - xb), masks)
             wiener = torch.fft.ifft2(torch.fft.fft2(copy) * gain).real
-            wiener_power = wiener_power + band_power(wiener - xb, masks)
+            wiener_power = wiener_power + band_power(residual_to_pm1(wiener - xb), masks)
         for k, val in acc.items():
             out[k].append(torch.as_tensor(val, device='cpu', dtype=torch.float32))
         out['freq_rel_err'].append((err_power / x_power).cpu())

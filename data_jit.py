@@ -156,40 +156,63 @@ class Prefetcher:
 # -----------------------------------------------------------------------------
 # data normalization: the space the model sees (noising, prediction, loss). 'pm1': pixels linearly in [-1, 1] (JiT);
 # 'imagenet': per-channel (x01 - mean) / std with ImageNet's statistics (unit std per channel, zero mean on ImageNet).
-# Set once per process (train_jit.py --data_norm, or from a checkpoint by jit_common.build_denoiser); every image
-# entering the model goes through normalize() (to_model_input, the Prefetcher), every image leaving it through
-# denormalize() (fid.to_uint8: samples, grids, FID).
+# 'whiten': a fixed per-pixel colour transform from the data's principal colour axes (PCA of [-1, 1] pixel colours, E,
+#           variances lam): model = diag(sqrt(lam_1 / lam_k)) E^T (x - mu). Luminance (axis 1) keeps its [-1, 1] scale, the
+#           colour axes are scaled up to its variance, so all three emerge from the noise together (color_snr.py).
+# Every space is model = A x + b per pixel (A 3 x 3). Set once per process (train_jit.py --data_norm, or from a checkpoint
+# by jit_common.build_denoiser); every image entering the model goes through normalize() (to_model_input, the
+# Prefetcher), every image leaving it through denormalize() (fid.to_uint8: samples, grids, FID); residual_to_pm1() maps a
+# difference of model-space images back to [-1, 1] units (losses / diagnostics comparable across spaces).
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 _DATA_NORM = 'pm1'
+_A = _B = _A_INV = None # numpy [3, 3], [3], [3, 3]
 
-def set_data_norm(name):
-    global _DATA_NORM
-    assert name in ('pm1', 'imagenet'), f"data_norm must be 'pm1' or 'imagenet', got {name}"
+def whitening_params(images_uint8):
+    # {'matrix', 'bias'} of the 'whiten' space from uint8 images [N, R, R, 3]
+    x = images_uint8.reshape(-1, 3).astype(np.float64) / 127.5 - 1
+    mu = x.mean(0)
+    lam, E = np.linalg.eigh(np.cov((x - mu).T))
+    order = np.argsort(lam)[::-1]
+    lam, E = lam[order], E[:, order]
+    A = np.diag(np.sqrt(lam[0] / lam)) @ E.T
+    return {'matrix': A.tolist(), 'bias': (-A @ mu).tolist(), 'variances': lam.tolist()}
+
+def set_data_norm(name, params=None):
+    global _DATA_NORM, _A, _B, _A_INV
+    assert name in ('pm1', 'imagenet', 'whiten'), f"data_norm must be 'pm1', 'imagenet' or 'whiten', got {name}"
     _DATA_NORM = name
+    if name == 'pm1':
+        _A = _B = _A_INV = None
+        return
+    if name == 'imagenet': # model = (x01 - mean) / std, x01 = (x + 1) / 2
+        std, mean = np.array(IMAGENET_STD), np.array(IMAGENET_MEAN)
+        A, b = np.diag(0.5 / std), (0.5 - mean) / std
+    else:
+        assert params is not None, "data_norm='whiten' needs its params (data_jit.whitening_params)"
+        A, b = np.array(params['matrix']), np.array(params['bias'])
+    _A, _B, _A_INV = A, b, np.linalg.inv(A)
 
 def get_data_norm():
     return _DATA_NORM
 
-def _affine(x):
-    # model = a * pm1 + b per channel: pm1 = 2 x01 - 1, model = (x01 - mean) / std
-    std = torch.tensor(IMAGENET_STD, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
-    mean = torch.tensor(IMAGENET_MEAN, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
-    return 0.5 / std, (0.5 - mean) / std
+def _apply(M, x, bias=None):
+    # per-pixel channel map: M [3, 3] numpy, x [B, 3, H, W]
+    Mt = torch.as_tensor(M, device=x.device, dtype=x.dtype)
+    y = torch.einsum('ij,bjhw->bihw', Mt, x)
+    return y if bias is None else y + torch.as_tensor(bias, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
 
 def normalize(x):
     # [-1, 1] images [B, 3, H, W] -> model space
-    if _DATA_NORM == 'pm1':
-        return x
-    a, b = _affine(x)
-    return x * a + b
+    return x if _DATA_NORM == 'pm1' else _apply(_A, x, _B)
 
 def denormalize(x):
     # model space -> [-1, 1]
-    if _DATA_NORM == 'pm1':
-        return x
-    a, b = _affine(x)
-    return (x - b) / a
+    return x if _DATA_NORM == 'pm1' else _apply(_A_INV, x - torch.as_tensor(_B, device=x.device, dtype=x.dtype).view(1, 3, 1, 1))
+
+def residual_to_pm1(r):
+    # a model-space difference (e.g. x - x_pred) in [-1, 1] units (linear: the bias cancels)
+    return r if _DATA_NORM == 'pm1' else _apply(_A_INV, r)
 
 def to_model_input(x_uint8, flip, device):
     """

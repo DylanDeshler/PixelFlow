@@ -325,13 +325,13 @@ def model_cost(net, img_size, num_classes, device='cpu'):
 def build_denoiser(model, img_size, num_classes, attn_dropout=0.0, proj_dropout=0.0, label_drop_prob=0.1,
                    P_mean=-0.8, P_std=0.8, t_eps=5e-2, noise_scale=1.0, ema_decay1=0.9999, ema_decay2=0.9996,
                    sampling_method='heun', num_sampling_steps=50, cfg=1.0, interval_min=0.0, interval_max=1.0, arch=None, P_std_right=0.0,
-                   data_norm='pm1'):
+                   data_norm='pm1', data_norm_params=None):
     """
     arch: full architecture dict (from resolve_arch) for non-preset models; stored in checkpoints so eval can rebuild them.
     data_norm: the data space (data_jit.set_data_norm), set process-wide so loading a checkpoint restores it.
     """
     from data_jit import set_data_norm
-    set_data_norm(data_norm)
+    set_data_norm(data_norm, data_norm_params)
     if arch is not None:
         _register(model, arch)
     args = SimpleNamespace(

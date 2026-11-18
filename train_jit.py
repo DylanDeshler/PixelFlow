@@ -196,9 +196,12 @@ proj_dropout = 0.0
 # flow matching
 P_mean = -0.8
 P_std = 0.8
-data_norm = 'pm1' # data space the model works in: 'pm1' (pixels in [-1, 1], JiT) or 'imagenet' (per-channel (x - mean) / std:
+data_norm = 'pm1' # data space the model works in: 'pm1' (pixels in [-1, 1], JiT); 'imagenet' (per-channel (x - mean) / std:
                   # ~2.2x the data scale of pm1, so at the same noise_scale the SNR rises ~4.9x; --noise_scale=1.106 keeps
-                  # the average SNR of pm1's 0.5 at 128px: 0.5 / (2 x 0.226))
+                  # the average SNR of pm1's 0.5 at 128px: 0.5 / (2 x 0.226)); 'whiten' (decorrelated colour axes scaled to
+                  # luminance's variance, measured from the training data: luminance as in pm1, colour emerges with it)
+loss_space = 'model' # 'model': the v-loss in the data space; 'pm1': the residual mapped back to [-1, 1] units first (with
+                     # data_norm != 'pm1': changes the noising only, errors weighted as in pm1)
 P_std_right = 0.0 # > 0: split logit-normal t, std P_std on the noisy side of the mode and P_std_right on the clean side (0 = symmetric)
 t_eps = 5e-2
 input_perturb = 0.0 # DDPM-IP: the training input's noise gets an extra Gaussian of this relative size (target unchanged), so the model
@@ -370,8 +373,15 @@ def check_prepared(data_dir, diag):
                                 '\nrun:\n  ' + '\n  '.join(steps) + ('\nor pass --diag=False to train without diagnostics (needs only fid.py)' if diag else ''))
 
 check_prepared(data_dir, diag)
-from data_jit import set_data_norm
-set_data_norm(data_norm) # before any image enters the model space (build_denoiser sets it again from denoiser_args)
+from data_jit import set_data_norm, whitening_params
+data_norm_params = None
+if data_norm == 'whiten': # the colour basis from 20k training images (evenly spaced), stored in the checkpoint
+    _wd = MemmapImages(data_dir)
+    data_norm_params = whitening_params(np.asarray(_wd.images[np.linspace(0, len(_wd) - 1, 20000).astype(int)]))
+    print(f"whitened colour space: axis variances {np.round(data_norm_params['variances'], 4).tolist()}, colour axes scaled by "
+          f"{np.round(np.sqrt(data_norm_params['variances'][0] / np.array(data_norm_params['variances'])), 2).tolist()}")
+set_data_norm(data_norm, data_norm_params) # before any image enters the model space (build_denoiser sets it again from denoiser_args)
+assert loss_space in ('model', 'pm1'), f'loss_space must be model or pm1, got {loss_space}'
 assert data_norm == 'pm1' or (not repa_encoder and model.startswith('JiT')), \
     "data_norm='imagenet': JiT models without REPA only (the frozen encoders and the other families' drawing code expect [-1, 1])"
 is_pixeldit = model.startswith('PixelDiT')
@@ -511,6 +521,7 @@ denoiser_args = dict(
     num_sampling_steps=num_sampling_steps, cfg=fid_cfg, interval_min=fid_interval_min, interval_max=fid_interval_max,
     **({'P_std_right': P_std_right} if P_std_right > 0 else {}),
     **({'data_norm': data_norm} if data_norm != 'pm1' else {}),
+    **({'data_norm_params': data_norm_params} if data_norm_params is not None else {}),
 )
 assert not (P_std_right > 0 and token_sizes), 'P_std_right: the two-size allocator assumes a symmetric logit-normal (alloc.t_dist)'
 denoiser = build_denoiser(**denoiser_args).to(device)
@@ -535,6 +546,8 @@ assert time_schedule in ('uniform', 'shift', 'train_quantile'), f'unknown time_s
 assert sampling_method in ('heun', 'euler', 'ancestral'), f'unknown sampling_method {sampling_method}'
 denoiser.time_schedule = time_schedule
 denoiser.input_perturb = input_perturb # training inputs only (masking.perturbed)
+denoiser.loss_space = loss_space # masking.flow_loss: v-loss in the data space or in [-1, 1] units
+assert loss_space == 'model' or not token_sizes, 'loss_space=pm1: single token size only'
 summary(denoiser)
 print(describe_arch(model, arch))
 if is_quadtree:
