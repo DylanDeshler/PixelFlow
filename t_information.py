@@ -44,7 +44,7 @@ import torch
 import torch.nn.functional as F
 
 from jit_common import load_denoiser
-from data_jit import MemmapImages
+from data_jit import MemmapImages, normalize, denormalize
 from util.progress import bar
 
 # -----------------------------------------------------------------------------
@@ -206,10 +206,10 @@ for t in bar(t_list, f'information at {len(t_list)} noise levels x {len(va_idx)}
     cf, pce = [], []
     for n_, i in enumerate(range(0, len(va_idx), batch)):
         x = to_x(val.images[va_idx[i:i + batch]])
-        z = t * x + (1 - t) * s * noise_for(n_, len(x))
+        z = t * normalize(x) + (1 - t) * s * noise_for(n_, len(x)) # noised in the model's data space (checkpoint's data_norm)
         with torch.no_grad(), ctx:
             x_hat = net(z, torch.full((len(x),), t, device=device), torch.full((len(x),), null, device=device, dtype=torch.long))
-        c, p = read(x_hat.float().clamp(-1, 1))
+        c, p = read(denormalize(x_hat.float()).clamp(-1, 1)) # the reader sees [-1, 1] images
         cf.append(c)
         pce.append(patch_ce_per_image(p, code_va[i:i + batch]))
     for k, v in per_image_ce(torch.cat(cf), torch.cat(pce)).items():

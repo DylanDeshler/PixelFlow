@@ -151,15 +151,54 @@ class Prefetcher:
         if self.flip:
             mask = torch.rand(x.shape[0], device=self.device) < 0.5
             x = torch.where(mask.view(-1, 1, 1, 1), x.flip(-1), x)
-        return x.float().div_(255).mul_(2).sub_(1), y
+        return normalize(x.float().div_(255).mul_(2).sub_(1)), y
+
+# -----------------------------------------------------------------------------
+# data normalization: the space the model sees (noising, prediction, loss). 'pm1': pixels linearly in [-1, 1] (JiT);
+# 'imagenet': per-channel (x01 - mean) / std with ImageNet's statistics (unit std per channel, zero mean on ImageNet).
+# Set once per process (train_jit.py --data_norm, or from a checkpoint by jit_common.build_denoiser); every image
+# entering the model goes through normalize() (to_model_input, the Prefetcher), every image leaving it through
+# denormalize() (fid.to_uint8: samples, grids, FID).
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+_DATA_NORM = 'pm1'
+
+def set_data_norm(name):
+    global _DATA_NORM
+    assert name in ('pm1', 'imagenet'), f"data_norm must be 'pm1' or 'imagenet', got {name}"
+    _DATA_NORM = name
+
+def get_data_norm():
+    return _DATA_NORM
+
+def _affine(x):
+    # model = a * pm1 + b per channel: pm1 = 2 x01 - 1, model = (x01 - mean) / std
+    std = torch.tensor(IMAGENET_STD, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+    mean = torch.tensor(IMAGENET_MEAN, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+    return 0.5 / std, (0.5 - mean) / std
+
+def normalize(x):
+    # [-1, 1] images [B, 3, H, W] -> model space
+    if _DATA_NORM == 'pm1':
+        return x
+    a, b = _affine(x)
+    return x * a + b
+
+def denormalize(x):
+    # model space -> [-1, 1]
+    if _DATA_NORM == 'pm1':
+        return x
+    a, b = _affine(x)
+    return (x - b) / a
 
 def to_model_input(x_uint8, flip, device):
     """
-    uint8 [B, R, R, 3] numpy -> float [B, 3, R, R] in [-1, 1] on device, with optional random horizontal flips.
+    uint8 [B, R, R, 3] numpy -> float [B, 3, R, R] in the model's data space (normalize(): [-1, 1] by default) on device,
+    with optional random horizontal flips.
     """
     x = torch.from_numpy(x_uint8).pin_memory() if 'cuda' in str(device) else torch.from_numpy(x_uint8)
     x = x.to(device, non_blocking=True).permute(0, 3, 1, 2)
     if flip:
         mask = torch.rand(x.shape[0], device=device) < 0.5
         x = torch.where(mask.view(-1, 1, 1, 1), x.flip(-1), x)
-    return x.float().div_(255).mul_(2).sub_(1)
+    return normalize(x.float().div_(255).mul_(2).sub_(1))

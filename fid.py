@@ -70,8 +70,10 @@ def load_ref_stats(path):
     return {'mu': d['mu'], 'sigma': d['sigma']}
 
 def to_uint8(x):
-    # [-1, 1] float -> [0, 255] uint8, rounding the same way JiT does before writing PNGs
-    return torch.round(((x.float() + 1) / 2).clamp(0, 1) * 255).to(torch.uint8)
+    # model-space float (data_jit.normalize's space: [-1, 1] by default) -> [0, 255] uint8, rounding the same way JiT
+    # does before writing PNGs
+    from data_jit import denormalize
+    return torch.round(((denormalize(x.float()) + 1) / 2).clamp(0, 1) * 255).to(torch.uint8)
 
 def precision_recall(real, fake, k=3, chunk=4096):
     """

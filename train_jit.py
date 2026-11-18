@@ -196,6 +196,9 @@ proj_dropout = 0.0
 # flow matching
 P_mean = -0.8
 P_std = 0.8
+data_norm = 'pm1' # data space the model works in: 'pm1' (pixels in [-1, 1], JiT) or 'imagenet' (per-channel (x - mean) / std:
+                  # ~2.2x the data scale of pm1, so at the same noise_scale the SNR rises ~4.9x; --noise_scale=1.106 keeps
+                  # the average SNR of pm1's 0.5 at 128px: 0.5 / (2 x 0.226))
 P_std_right = 0.0 # > 0: split logit-normal t, std P_std on the noisy side of the mode and P_std_right on the clean side (0 = symmetric)
 t_eps = 5e-2
 input_perturb = 0.0 # DDPM-IP: the training input's noise gets an extra Gaussian of this relative size (target unchanged), so the model
@@ -367,6 +370,10 @@ def check_prepared(data_dir, diag):
                                 '\nrun:\n  ' + '\n  '.join(steps) + ('\nor pass --diag=False to train without diagnostics (needs only fid.py)' if diag else ''))
 
 check_prepared(data_dir, diag)
+from data_jit import set_data_norm
+set_data_norm(data_norm) # before any image enters the model space (build_denoiser sets it again from denoiser_args)
+assert data_norm == 'pm1' or (not repa_encoder and model.startswith('JiT')), \
+    "data_norm='imagenet': JiT models without REPA only (the frozen encoders and the other families' drawing code expect [-1, 1])"
 is_pixeldit = model.startswith('PixelDiT')
 if is_pixeldit: # the JiT-specific options don't exist in PixelDiT
     jit_only = dict(bottleneck_dim=bottleneck_dim < 0, attn_res=attn_res == 'none', adaln_single=not adaln_single, gated_bottleneck=not gated_bottleneck,
@@ -503,6 +510,7 @@ denoiser_args = dict(
     ema_decay1=ema_decay1, ema_decay2=ema_decay2, sampling_method=sampling_method,
     num_sampling_steps=num_sampling_steps, cfg=fid_cfg, interval_min=fid_interval_min, interval_max=fid_interval_max,
     **({'P_std_right': P_std_right} if P_std_right > 0 else {}),
+    **({'data_norm': data_norm} if data_norm != 'pm1' else {}),
 )
 assert not (P_std_right > 0 and token_sizes), 'P_std_right: the two-size allocator assumes a symmetric logit-normal (alloc.t_dist)'
 denoiser = build_denoiser(**denoiser_args).to(device)

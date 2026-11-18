@@ -324,10 +324,14 @@ def model_cost(net, img_size, num_classes, device='cpu'):
 
 def build_denoiser(model, img_size, num_classes, attn_dropout=0.0, proj_dropout=0.0, label_drop_prob=0.1,
                    P_mean=-0.8, P_std=0.8, t_eps=5e-2, noise_scale=1.0, ema_decay1=0.9999, ema_decay2=0.9996,
-                   sampling_method='heun', num_sampling_steps=50, cfg=1.0, interval_min=0.0, interval_max=1.0, arch=None, P_std_right=0.0):
+                   sampling_method='heun', num_sampling_steps=50, cfg=1.0, interval_min=0.0, interval_max=1.0, arch=None, P_std_right=0.0,
+                   data_norm='pm1'):
     """
     arch: full architecture dict (from resolve_arch) for non-preset models; stored in checkpoints so eval can rebuild them.
+    data_norm: the data space (data_jit.set_data_norm), set process-wide so loading a checkpoint restores it.
     """
+    from data_jit import set_data_norm
+    set_data_norm(data_norm)
     if arch is not None:
         _register(model, arch)
     args = SimpleNamespace(
@@ -617,7 +621,7 @@ _ARCH_SHORT = {'depth': 'd', 'hidden_size': 'w', 'num_heads': 'h', 'patch_size':
 _NAME_TOKENS = {
     'optimizer_type': '', 'muon_adjust_lr': 'muon-', 'muon_lr': 'muonlr', 'muon_weight_decay': 'muonwd',
     'muon_momentum': 'muonmom', 'muon_ns_steps': 'muonns', 'muon_split_fused': 'muonsplit', 'muon_adaln': 'muonadaln',
-    'noise_scale': 'noise', 'P_mean': 'pmean', 'token_sizes': 'tok-', 'fine_frac': 'fine', 'alloc_floor': 'allocfloor', 'alloc_gain': 'allocgain-', 'tail_blocks': 'tail', 'tail_query_patch': 'tailq', 'tail_dim': 'taildim', 'tail_heads': 'tailheads', 'tail_head_dim': 'tailhd', 'tail_query_pos': 'tailpos-', 'attn_gate': 'attngate-', 'in_context_cond': 'iclcond', 'kv_prefix_len': 'kvprefix', 'kv_prefix_start': 'kvprefixstart', 'kv_prefix_depth': 'kvprefixdepth', 'kv_prefix_pool': 'kvpool-', 'kv_prefix_pool_mode': 'kvpoolmode-', 'kv_prefix_pool_init': 'kvpoolinit', 'kv_prefix_mlp': 'kvprefixmlp', 'tail_mlp_ratio': 'tailmlp', 'tail_keys': 'tailkeys-', 'loss_freq_weight': 'lossf-', 'loss_freq_table': 'lossftable-', 'loss_t_weight': 'losst-', 'loss_weight_normalize': 'lossnorm', 'P_std': 'pstd', 'P_std_right': 'pstdr', 't_eps': 'teps', 'input_perturb': 'ip', 'label_drop_prob': 'labeldrop',
+    'noise_scale': 'noise', 'P_mean': 'pmean', 'token_sizes': 'tok-', 'fine_frac': 'fine', 'alloc_floor': 'allocfloor', 'alloc_gain': 'allocgain-', 'tail_blocks': 'tail', 'tail_query_patch': 'tailq', 'tail_dim': 'taildim', 'tail_heads': 'tailheads', 'tail_head_dim': 'tailhd', 'tail_query_pos': 'tailpos-', 'attn_gate': 'attngate-', 'in_context_cond': 'iclcond', 'kv_prefix_len': 'kvprefix', 'kv_prefix_start': 'kvprefixstart', 'kv_prefix_depth': 'kvprefixdepth', 'kv_prefix_pool': 'kvpool-', 'kv_prefix_pool_mode': 'kvpoolmode-', 'kv_prefix_pool_init': 'kvpoolinit', 'kv_prefix_mlp': 'kvprefixmlp', 'tail_mlp_ratio': 'tailmlp', 'tail_keys': 'tailkeys-', 'loss_freq_weight': 'lossf-', 'loss_freq_table': 'lossftable-', 'loss_t_weight': 'losst-', 'loss_weight_normalize': 'lossnorm', 'P_std': 'pstd', 'P_std_right': 'pstdr', 'data_norm': 'datanorm-', 't_eps': 'teps', 'input_perturb': 'ip', 'label_drop_prob': 'labeldrop',
     'blr': 'blr', 'lr_schedule': 'lr-', 'min_lr': 'minlr', 'warmup_epochs': 'warmup', 'weight_decay': 'wd',
     'beta1': 'beta1-', 'beta2': 'beta2-', 'grad_clip': 'clip', 'ema_decay1': 'ema', 'ema_decay2': 'ema2-', 'ema_warmup': 'emawarmup',
     'attn_dropout': 'attndrop', 'proj_dropout': 'projdrop', 'attn_res': 'attnres-', 'attn_res_block_size': 'attnresbs',
