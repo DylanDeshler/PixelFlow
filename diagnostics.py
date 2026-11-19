@@ -66,6 +66,8 @@ def tile_mask(g, tile, n_prefix, device):
     mask[n_prefix:, n_prefix:] = same_tile
     return mask
 
+PREFIX_CAPTURE = None # set to a list to record, per block, the patch queries' attention on the kv_prefix slots (kv_prefix_diag.py)
+
 def _attention(attn, x, rope, n_prefix, g, mask=None, prefix=None):
     # prefix (kv_prefix): normed / modulated prefix tokens [B, P, C], extra keys / values only (keys ordered [prefix,
     # in-context, patches]). Gated attention (attn.gate_mode) applied as in model_jit.Attention
@@ -106,12 +108,17 @@ def _attention(attn, x, rope, n_prefix, g, mask=None, prefix=None):
     stats['attn_sink_max'] = sink.max(-1).values.mean()
     stats['attn_sink_uniform'] = torch.tensor(1.0 / K, device=x.device)
     o = w @ v # same casting as JiT: fp32 weights @ v under the caller's autocast
+    gv = None
     if getattr(attn, 'gate_mode', 'none') != 'none':
         gv = attn.gate_values(x)
         o = o * gv.to(o.dtype)
         stats['attn_gate_mean'] = gv.float().mean()
     else:
         stats['attn_gate_mean'] = torch.ones((), device=x.device)
+    if PREFIX_CAPTURE is not None: # patch queries -> prefix slots [B, H, N, P] and the head gates [B, H, N] (None: no prefix here)
+        PREFIX_CAPTURE.append(None if P == 0 else {
+            'w': w[:, :, n_prefix:, :P].float(),
+            'gate': (gv.float().mean(-1)[:, :, n_prefix:] if gv is not None else torch.ones_like(w[:, :, n_prefix:, 0]))})
     out = attn.proj(o.transpose(1, 2).reshape(B, N, C))
     return out, stats
 
