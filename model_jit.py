@@ -1214,6 +1214,7 @@ class JiT(nn.Module):
         kv_prefix_pool_mode='spatial',
         kv_prefix_pool_init=0.02,
         kv_prefix_mlp=0.0,
+        kv_prefix_class_tokens=False,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -1335,6 +1336,14 @@ class JiT(nn.Module):
             assert self.kv_prefix_start < depth, f'kv_prefix_start {self.kv_prefix_start} must be < depth {depth}'
             self.kv_prefix_posemb = nn.Parameter(torch.zeros(1, kv_prefix_len, hidden_size))
             torch.nn.init.normal_(self.kv_prefix_posemb, std=.02)
+        # kv_prefix_class_tokens: the prefix tokens are a learned table of kv_prefix_len tokens per class (and one set for the
+        # null label, so classifier-free guidance's unconditional pass has its own), replacing class embedding + shared
+        # vector. Separate from the class embedding, which still drives adaLN; the table only feeds the prefix's keys / values
+        self.kv_prefix_class_tokens = kv_prefix_class_tokens and kv_prefix_len > 0
+        if self.kv_prefix_class_tokens:
+            assert kv_prefix_mlp == 0, 'kv_prefix_class_tokens replaces the prefix construction: no kv_prefix_mlp'
+            self.kv_prefix_table = nn.Embedding(num_classes + 1, kv_prefix_len * hidden_size)
+            nn.init.normal_(self.kv_prefix_table.weight, std=.02)
         # kv_prefix_mlp > 0: the prefix tokens are generated per class by a shared MLP instead of the sum class + vector:
         #   prefix_p = SwiGLU(RMSNorm(class + vector_p)), hidden width kv_prefix_mlp x hidden_size (the trunk's MLP form), no
         # residual: any class x token interaction, so each class can have its own set of prefix specialties, sharing
@@ -1631,9 +1640,9 @@ class JiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def run_blocks(self, x, res, start, end, c_blocks, y_emb, fine=False, pool_scale=None):
+    def run_blocks(self, x, res, start, end, c_blocks, y_emb, fine=False, pool_scale=None, y=None):
         # trunk blocks start..end-1 (0-indexed), with the in-context class tokens prepended at in_context_start
-        kvp = self.kv_prefix_tokens(y_emb) # [B, P, D] (kv_prefix) or None
+        kvp = self.kv_prefix_tokens(y_emb, y) # [B, P, D] (kv_prefix) or None
         pool_cache = {}
         for i in range(start, end):
             if self.in_context_len > 0 and i == self.in_context_start:
@@ -1697,7 +1706,7 @@ class JiT(nn.Module):
         depth = len(self.blocks)
         k = self.skip_inject_after if self.skip_pathway else depth
         pool_scale = self.kv_prefix_pool_scale(F.silu(t_emb)) if getattr(self, 'kv_prefix_pool', 'none') != 'none' else None
-        x = self.run_blocks(x, res, 0, k, c_blocks, y_emb, fine, pool_scale=pool_scale)
+        x = self.run_blocks(x, res, 0, k, c_blocks, y_emb, fine, pool_scale=pool_scale, y=y)
         if not self.skip_pathway:
             return self.output(x[:, self.in_context_len:], c, head=self.sampled_head(), fine=fine, res=res)
 
@@ -1740,10 +1749,14 @@ class JiT(nn.Module):
         out[~m] = coarse.to(fine.dtype)
         return out
 
-    def kv_prefix_tokens(self, y_emb):
-        # the prefix tokens before any per-block addition: class + learned vector, or the class-conditional MLP of it
+    def kv_prefix_tokens(self, y_emb, y=None):
+        # the prefix tokens before any per-block addition: class + learned vector, the class-conditional MLP of it, or the
+        # class's own row of the token table (kv_prefix_class_tokens; y: the labels after dropout, num_classes = null)
         if self.kv_prefix_len <= 0:
             return None
+        if getattr(self, 'kv_prefix_class_tokens', False):
+            assert y is not None, 'kv_prefix_class_tokens needs the labels'
+            return self.kv_prefix_table(y).view(y.shape[0], self.kv_prefix_len, -1)
         base = y_emb.unsqueeze(1) + self.kv_prefix_posemb # [B, P, D]
         if self.kv_prefix_mlp > 0:
             return self.kv_prefix_mlp_net(self.kv_prefix_mlp_norm(base))
