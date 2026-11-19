@@ -178,6 +178,7 @@ details summary { cursor: pointer; color: var(--ink2); margin-top: 12px; }
   <h1>Runs</h1><span class="muted">__ROOT__ &middot; generated __GENERATED__</span>
   <label>metric <select id="metric"></select></label>
   <label>parameters chart at epoch <select id="atep"></select></label>
+  <label><input type="checkbox" id="logx"> log x axis</label>
   <span class="muted">legend: click hides / shows a run, double-click shows only it &middot; charts: drag a box to zoom, double-click to reset</span>
 </header>
 <main>
@@ -202,7 +203,7 @@ details summary { cursor: pointer; color: var(--ink2); margin-top: 12px; }
 const D = __DATA__;
 const MARKERS = ['circle', 'square', 'triangle', 'diamond', 'down', 'plus'];
 D.runs.forEach((r, i) => { r.color = D.colors[i % D.colors.length]; r.marker = MARKERS[Math.floor(i / D.colors.length) % MARKERS.length]; r.i = i; });
-const state = { selected: new Set(D.runs.filter(r => r.default).map(r => r.i)), hidden: new Set(), metric: 'fid', atep: null, zoom: {} };
+const state = { selected: new Set(D.runs.filter(r => r.default).map(r => r.i)), hidden: new Set(), metric: 'fid', atep: null, zoom: {}, logx: false };
 const $ = id => document.getElementById(id);
 const NS = 'http://www.w3.org/2000/svg';
 const el = (tag, attrs = {}, parent) => { const e = document.createElementNS(NS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); if (parent) parent.appendChild(e); return e; };
@@ -224,6 +225,13 @@ function ticks(lo, hi, n = 5) {
   const step = [1, 2, 2.5, 5, 10].map(m => m * mag).find(s => s >= step0);
   const out = []; for (let v = Math.ceil(lo / step) * step; v <= hi + step * 1e-9; v += step) out.push(+v.toFixed(10)); return out;
 }
+function logTicks(lo, hi) { // lo, hi in log10 units: decades, plus 2 and 5 when few decades are visible
+  const out = [], span = hi - lo;
+  for (let d = Math.floor(lo); d <= Math.ceil(hi); d++)
+    for (const m of span > 3 ? [1] : span > 1.2 ? [1, 2, 5] : span > 0.5 ? [1, 1.5, 2, 3, 5, 7] : [1, 1.5, 2, 2.5, 3, 4, 5, 6, 7, 8, 9]) { const v = Math.log10(m) + d; if (v >= lo - 1e-9 && v <= hi + 1e-9) out.push(v); }
+  return out;
+}
+const tickLabel = v => { const a = Math.abs(v); return a >= 1e4 || (a > 0 && a < 1e-2) ? v.toExponential(0).replace('e+', 'e') : +v.toPrecision(3); };
 function relabel() { // label = the tokens not shared by every checked run ('base' if none): stable while the legend hides runs
   const vis = D.runs.filter(r => state.selected.has(r.i)); const common = vis.length > 1 ? vis.map(r => new Set(r.tokens)).reduce((a, b) => new Set([...a].filter(t => b.has(t)))) : new Set();
   for (const r of D.runs) r.label = r.tokens.filter(t => !common.has(t)).join(' ') || 'base';
@@ -235,11 +243,13 @@ function chart(svg, series, xlabel, ylabel, line, labels) {
   svg.innerHTML = '';
   const W = svg.parentNode.clientWidth || 480, H = 330, m = { l: 52, r: 16, t: 10, b: 40 };
   svg.setAttribute('width', W); svg.setAttribute('height', H); svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  if (state.logx) // log x: plot log10(x); points at x <= 0 can't be shown
+    series = series.map(s => ({ run: s.run, pts: s.pts.filter(p => p.x > 0).map(p => ({ x: Math.log10(p.x), y: p.y, ev: p.ev })) })).filter(s => s.pts.length);
   const pts = series.flatMap(s => s.pts);
   if (!pts.length) { el('text', { x: W / 2, y: H / 2, 'text-anchor': 'middle' }, svg).textContent = 'no data for the visible runs'; return; }
   let [x0, x1] = [Math.min(...pts.map(p => p.x)), Math.max(...pts.map(p => p.x))];
   let [y0, y1] = [Math.min(...pts.map(p => p.y)), Math.max(...pts.map(p => p.y))];
-  const minSpan = Math.abs(x1) * 0.1 || 1; if (x1 - x0 < minSpan) { const c = (x0 + x1) / 2; x0 = c - minSpan / 2; x1 = c + minSpan / 2; }
+  const minSpan = state.logx ? 0.2 : (Math.abs(x1) * 0.1 || 1); if (x1 - x0 < minSpan) { const c = (x0 + x1) / 2; x0 = c - minSpan / 2; x1 = c + minSpan / 2; }
   const px = (x1 - x0) * 0.04, py = (y1 - y0) * 0.06 || 1; x0 -= px; x1 += px; y0 -= py; y1 += py;
   const z = state.zoom[svg.id]; if (z) [x0, x1, y0, y1] = z; // box zoom (drag), reset by double-click
   const zr = svg.parentNode.querySelector('.reset'); if (zr) zr.style.display = z ? 'inline' : 'none';
@@ -267,8 +277,8 @@ function chart(svg, series, xlabel, ylabel, line, labels) {
     window.addEventListener('mousemove', move); window.addEventListener('mouseup', up);
   });
   for (const v of ticks(y0, y1)) { el('line', { x1: m.l, x2: W - m.r, y1: sy(v), y2: sy(v), stroke: D.grid }, svg); el('text', { x: m.l - 6, y: sy(v) + 4, 'text-anchor': 'end' }, svg).textContent = v; }
-  for (const v of ticks(x0, x1, 6)) { el('line', { x1: sx(v), x2: sx(v), y1: m.t, y2: H - m.b, stroke: D.grid }, svg); el('text', { x: sx(v), y: H - m.b + 15, 'text-anchor': 'middle' }, svg).textContent = v; }
-  el('text', { x: (m.l + W - m.r) / 2, y: H - 6, 'text-anchor': 'middle' }, svg).textContent = xlabel;
+  for (const v of (state.logx ? logTicks(x0, x1) : ticks(x0, x1, 6))) { el('line', { x1: sx(v), x2: sx(v), y1: m.t, y2: H - m.b, stroke: D.grid }, svg); el('text', { x: sx(v), y: H - m.b + 15, 'text-anchor': 'middle' }, svg).textContent = state.logx ? tickLabel(Math.pow(10, v)) : v; }
+  el('text', { x: (m.l + W - m.r) / 2, y: H - 6, 'text-anchor': 'middle' }, svg).textContent = xlabel + (state.logx ? ' (log scale)' : '');
   el('text', { x: 12, y: (m.t + H - m.b) / 2, 'text-anchor': 'middle', transform: `rotate(-90 12 ${(m.t + H - m.b) / 2})` }, svg).textContent = ylabel;
   const marks = el('g', { 'clip-path': `url(#${clipId})` }, svg); // lines and markers clipped to the plot area when zoomed
   for (const s of series) {
@@ -346,6 +356,7 @@ $('metric').addEventListener('change', e => { state.metric = e.target.value; sta
 $('atep').addEventListener('change', () => { delete state.zoom.c_params; });
 document.querySelectorAll('.reset').forEach(a => a.addEventListener('click', e => { e.preventDefault(); delete state.zoom[a.dataset.c]; render(); }));
 $('atep').addEventListener('change', e => { state.atep = +e.target.value; render(); });
+$('logx').addEventListener('change', e => { state.logx = e.target.checked; state.zoom = {}; render(); }); // zoom boxes are in the old axis units
 $('search').addEventListener('input', renderList);
 const visibleInList = () => D.runs.filter(r => { const t = $('search').value.toLowerCase().split(/\s+/).filter(Boolean); return t.every(x => r.path.toLowerCase().includes(x)); });
 $('all').addEventListener('click', () => { visibleInList().forEach(r => state.selected.add(r.i)); state.hidden.clear(); renderList(); render(); });
