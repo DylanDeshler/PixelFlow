@@ -179,6 +179,7 @@ details summary { cursor: pointer; color: var(--ink2); margin-top: 12px; }
   <label>metric <select id="metric"></select></label>
   <label>parameters chart at epoch <select id="atep"></select></label>
   <label><input type="checkbox" id="logx"> log x axis</label>
+  <label>max epoch <input type="number" id="maxep" min="0" step="1" placeholder="all" style="width:5em"></label>
   <span class="muted">legend: click hides / shows a run, double-click shows only it &middot; charts: drag a box to zoom, double-click to reset</span>
 </header>
 <main>
@@ -203,7 +204,7 @@ details summary { cursor: pointer; color: var(--ink2); margin-top: 12px; }
 const D = __DATA__;
 const MARKERS = ['circle', 'square', 'triangle', 'diamond', 'down', 'plus'];
 D.runs.forEach((r, i) => { r.color = D.colors[i % D.colors.length]; r.marker = MARKERS[Math.floor(i / D.colors.length) % MARKERS.length]; r.i = i; });
-const state = { selected: new Set(D.runs.filter(r => r.default).map(r => r.i)), hidden: new Set(), metric: 'fid', atep: null, zoom: {}, logx: false };
+const state = { selected: new Set(D.runs.filter(r => r.default).map(r => r.i)), hidden: new Set(), metric: 'fid', atep: null, zoom: {}, logx: false, maxep: null };
 const $ = id => document.getElementById(id);
 const NS = 'http://www.w3.org/2000/svg';
 const el = (tag, attrs = {}, parent) => { const e = document.createElementNS(NS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); if (parent) parent.appendChild(e); return e; };
@@ -310,7 +311,8 @@ function render() {
   const mk = state.metric, ylab = D.metrics[mk];
   const vis = visibleRuns();
   relabel();
-  const series = (fx) => vis.map(r => ({ run: r, pts: r.evals.filter(e => e[mk] != null && fx(e) != null).map(e => ({ x: fx(e), y: e[mk], ev: e })) })).filter(s => s.pts.length);
+  const keep = e => state.maxep == null || e.epoch <= state.maxep + 1e-6; // max-epoch cutoff: longer runs are truncated
+  const series = (fx) => vis.map(r => ({ run: r, pts: r.evals.filter(e => keep(e) && e[mk] != null && fx(e) != null).map(e => ({ x: fx(e), y: e[mk], ev: e })) })).filter(s => s.pts.length);
   chart($('c_images'), series(e => e.images), 'images seen (M)', ylab, true);
   chart($('c_flops'), series(e => e.pflops), 'training compute (PFLOPs: images × 3 × forward FLOPs)', ylab, true);
   chart($('c_hours'), series(e => e.hours), 'training hours (images / typical img/s on this GPU; evals excluded)', ylab, true);
@@ -329,7 +331,7 @@ function render() {
     lg.appendChild(it);
   }
   // table
-  const eps = [...new Set(vis.flatMap(r => r.evals.map(e => Math.round(e.epoch))))].sort((a, b) => a - b);
+  const eps = [...new Set(vis.flatMap(r => r.evals.filter(keep).map(e => Math.round(e.epoch))))].sort((a, b) => a - b);
   let h = `<table><tr><th>run</th><th>params</th><th>GFLOP/img</th><th>GFLOP/sample</th><th>img/s</th>${eps.map(e => `<th>${ylab} @${e}</th>`).join('')}</tr>`;
   for (const r of vis) h += `<tr><td title="${r.path}">${r.label}</td><td>${r.params ? (r.params / 1e6).toFixed(2) + 'M' : '–'}</td><td>${fmt(r.gflops)}</td><td>${r.sgflops ? r.sgflops.toFixed(0) : '–'}</td><td>${r.ips || '–'}</td>` +
     eps.map(ep => { const e = nearest(r, ep); return `<td>${e ? fmt(e[mk], mk === 'fid' || mk === 'is' ? 2 : 3) : ''}</td>`; }).join('') + '</tr>';
@@ -357,6 +359,7 @@ $('atep').addEventListener('change', () => { delete state.zoom.c_params; });
 document.querySelectorAll('.reset').forEach(a => a.addEventListener('click', e => { e.preventDefault(); delete state.zoom[a.dataset.c]; render(); }));
 $('atep').addEventListener('change', e => { state.atep = +e.target.value; render(); });
 $('logx').addEventListener('change', e => { state.logx = e.target.checked; state.zoom = {}; render(); }); // zoom boxes are in the old axis units
+$('maxep').addEventListener('input', e => { const v = parseFloat(e.target.value); state.maxep = isFinite(v) && v > 0 ? v : null; state.zoom = {}; render(); });
 $('search').addEventListener('input', renderList);
 const visibleInList = () => D.runs.filter(r => { const t = $('search').value.toLowerCase().split(/\s+/).filter(Boolean); return t.every(x => r.path.toLowerCase().includes(x)); });
 $('all').addEventListener('click', () => { visibleInList().forEach(r => state.selected.add(r.i)); state.hidden.clear(); renderList(); render(); });
