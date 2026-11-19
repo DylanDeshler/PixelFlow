@@ -77,7 +77,7 @@ class TokenMasker(nn.Module):
         return m.repeat_interleave(self.patch_size, dim=2).repeat_interleave(self.patch_size, dim=3)
 
 def flow_loss(denoiser, x, labels, masker=None, mask=None, weighting='effective_t', return_aux=False, parts=None, weighter=None,
-              backward=None, path_aux=None):
+              backward=None, path_aux=None, net_kwargs=None):
     """
     JiT's training loss (Denoiser.forward: label dropout, logit-normal t, x-prediction, v-loss), with optional token
     masking. With mask=None this is numerically the same computation as denoiser(x, labels).
@@ -102,6 +102,8 @@ def flow_loss(denoiser, x, labels, masker=None, mask=None, weighting='effective_
     z = t * x + (1 - t) * perturbed(denoiser, e)
     two = denoiser.training and getattr(denoiser.net, 'skip_stop_grad', False)
     kwargs = {'return_trunk': True} if two else {}
+    if net_kwargs: # extra per-sample inputs to the network (e.g. exemplar_exclude for the exemplar memory)
+        kwargs.update(net_kwargs)
     if mask is None:
         x_pred = denoiser.net(z, t.flatten(), labels, **kwargs)
     else:

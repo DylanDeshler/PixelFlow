@@ -162,6 +162,11 @@ kv_prefix_len = 0 # > 0: this many conditioning tokens as extra keys / values on
 kv_prefix_depth = False # kv_prefix: each reading block adds its own learned offset to the prefix tokens (zero at init: starts as the shared prefix)
 kv_prefix_class_tokens = False # the prefix tokens are a learned table of kv_prefix_len tokens per class (+ the null label for CFG)
                                # instead of class embedding + shared vector; adaLN keeps its own class embedding
+kv_prefix_exemplar_n = 0 # > 0: exemplar memory, the prefix built from N exemplar images per class (prepare_exemplars.py
+                         # --n_medoids=N writes {data_dir}/exemplars_dinov2_vitb14_N{N}.npz): M = kv_prefix_len / K of them read
+kv_prefix_exemplar_k = 4 # tokens per exemplar, pooled from its 16 x 16 DINOv2 patch grid (a square: 1, 4, 9, 16, ...)
+kv_prefix_exemplar_policy = 'holdout' # exemplar images: 'holdout' (never trained on), 'exclude' (trained on, but a sample that is an
+                                      # exemplar draws its memory from its class's other N - 1), 'none'
 kv_prefix_t_bands = 0 # > 1 (with kv_prefix_class_tokens): a joint (class, noise level) memory, this many independent token sets
                       # per class, evenly spaced in the training t distribution's CDF from t = 0 to t = 1; a sample reads the
                       # interpolation of the two neighbouring sets
@@ -456,6 +461,8 @@ model_name, arch = resolve_arch(model, **{k: (None if v < 0 else v) for k, v in 
     kv_prefix_class_tokens=True if kv_prefix_len and kv_prefix_class_tokens else None,
     kv_prefix_t_bands=kv_prefix_t_bands if kv_prefix_len and kv_prefix_class_tokens and kv_prefix_t_bands > 1 else None,
     kv_prefix_band_dist=[P_mean, P_std, P_std_right or P_std] if kv_prefix_len and kv_prefix_class_tokens and kv_prefix_t_bands > 1 else None,
+    kv_prefix_exemplars=os.path.abspath(os.path.join(data_dir, f'exemplars_dinov2_vitb14_N{kv_prefix_exemplar_n}.npz')) if kv_prefix_len and kv_prefix_exemplar_n > 0 else None,
+    kv_prefix_exemplar_k=kv_prefix_exemplar_k if kv_prefix_len and kv_prefix_exemplar_n > 0 and kv_prefix_exemplar_k != 4 else None,
     kv_prefix_pool=kv_prefix_pool if kv_prefix_len and kv_prefix_pool != 'none' else None,
     kv_prefix_pool_mode=kv_prefix_pool_mode if kv_prefix_len and kv_prefix_pool != 'none' and kv_prefix_pool_mode != 'spatial' else None,
     kv_prefix_pool_init=kv_prefix_pool_init if kv_prefix_len and kv_prefix_pool != 'none' and kv_prefix_pool_init != 0.02 else None,
@@ -515,19 +522,39 @@ data = MemmapImages(data_dir)
 img_size, num_classes = data.img_size, data.num_classes
 class_names = data.class_names()
 noise_scale = noise_scale or img_size / 256
-sampler = EpochSampler(len(data), batch_size)
+ex_slot = None # exemplar memory: each training row's slot among its class's exemplars (-1: not an exemplar)
+train_rows = None
+if kv_prefix_len and kv_prefix_exemplar_n > 0:
+    assert kv_prefix_exemplar_policy in ('exclude', 'holdout', 'none'), kv_prefix_exemplar_policy
+    _ex = np.load(os.path.join(data_dir, f'exemplars_dinov2_vitb14_N{kv_prefix_exemplar_n}.npz'))['indices'] # [C, N] rows
+    ex_slot = np.full(len(data), -1, dtype=np.int64)
+    ex_slot[_ex.reshape(-1)] = np.tile(np.arange(_ex.shape[1]), _ex.shape[0])
+    if kv_prefix_exemplar_policy == 'holdout':
+        train_rows = np.flatnonzero(ex_slot < 0)
+    print(f"exemplar memory: {_ex.shape[1]} exemplars per class, reading {kv_prefix_len // kv_prefix_exemplar_k} x {kv_prefix_exemplar_k} tokens; "
+          f"policy {kv_prefix_exemplar_policy}" + (f' ({len(data) - len(train_rows):,} exemplar images held out)' if train_rows is not None else ''))
+    if kv_prefix_exemplar_policy != 'exclude':
+        ex_slot = None
+sampler = EpochSampler(len(data), batch_size, indices=train_rows)
 effective_batch_size = batch_size * gradient_accumulation_steps
-iters_per_epoch = len(data) // effective_batch_size
+iters_per_epoch = sampler.n // effective_batch_size
 assert iters_per_epoch > 0, f'effective batch {effective_batch_size} is larger than the dataset ({len(data):,} images); lower batch_size / gradient_accumulation_steps'
 max_iters = epochs * iters_per_epoch
 lr = blr * effective_batch_size / 1024
 print(f"{data_dir}: {len(data):,} images, {num_classes} classes, {img_size}px | effective batch {effective_batch_size}, "
       f"{iters_per_epoch:,} iters/epoch, {max_iters:,} total iters, lr {lr:.2e}, noise scale {noise_scale}")
 
+EX_AUX = None # the current batch's exemplar slots (kv_prefix_exemplar_policy='exclude'), set by get_batch with each batch
 def get_batch():
+    global EX_AUX
     if prefetcher is not None:
-        return prefetcher.next()
-    x, y = data.get(sampler.next())
+        out = prefetcher.next()
+        EX_AUX = prefetcher.last_aux
+        return out
+    idx = sampler.next()
+    x, y = data.get(idx)
+    if ex_slot is not None:
+        EX_AUX = torch.from_numpy(ex_slot[idx]).to(device)
     y = torch.from_numpy(y)
     return to_model_input(x, flip=True, device=device), (y.pin_memory() if 'cuda' in device else y).to(device, non_blocking=True) # pinned: no stream sync
 phase_acc, phase_clock = {}, [0.0] # (phase_timing)
@@ -1362,7 +1389,7 @@ keep_iters = keep_ckpt_every_epochs * iters_per_epoch
 
 # training loop
 if data_workers > 0:
-    prefetcher = Prefetcher(data, sampler, device, flip=True, workers=data_workers, depth=data_prefetch)
+    prefetcher = Prefetcher(data, sampler, device, flip=True, workers=data_workers, depth=data_prefetch, aux=ex_slot)
 X, Y = get_batch() # fetch the very first batch
 t0 = time.time()
 data_seconds = 0.0 # per step: host time spent in get_batch (reset every iteration)
@@ -1464,7 +1491,7 @@ while True:
     for micro_step in range(gradient_accumulation_steps):
         with ctx:
             loss_parts = {}
-            if masker is None and not (encoder is not None and repa_adapter == 'mta') and not skip_stop_grad and loss_weighter is None and not token_sizes:
+            if masker is None and not (encoder is not None and repa_adapter == 'mta') and not skip_stop_grad and loss_weighter is None and not token_sizes and ex_slot is None:
                 loss_fm = denoiser(X, Y) # JiT's own loss
                 loss_parts['skip'] = loss_fm
             else:
@@ -1478,6 +1505,7 @@ while True:
                     if token_sizes and disp_captures else None
                 loss_fm, t_used, y_used = flow_loss(denoiser, X, Y, masker, token_mask, mask_weighting, return_aux=True, parts=loss_parts,
                                                     weighter=loss_weighter, backward=path_backward,
+                                                    net_kwargs={'exemplar_exclude': EX_AUX} if ex_slot is not None else None,
                                                     path_aux=(lambda: disp_weight * path_disp()) if path_disp else None)
             loss = loss_fm
             if encoder is not None:

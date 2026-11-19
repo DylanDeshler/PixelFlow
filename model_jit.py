@@ -1217,6 +1217,8 @@ class JiT(nn.Module):
         kv_prefix_class_tokens=False,
         kv_prefix_t_bands=0,
         kv_prefix_band_dist=None,
+        kv_prefix_exemplars='',
+        kv_prefix_exemplar_k=4,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -1356,6 +1358,34 @@ class JiT(nn.Module):
                 self.kv_prefix_band_dist = tuple(float(v) for v in kv_prefix_band_dist)
             self.kv_prefix_table = nn.Embedding(num_classes + 1, nb * kv_prefix_len * hidden_size)
             nn.init.normal_(self.kv_prefix_table.weight, std=.02)
+        # kv_prefix_exemplars: the prefix is real data instead of learned tokens. The file (prepare_exemplars.py) holds, per
+        # class, its N medoid images' full 16 x 16 DINOv2 patch grids; each exemplar is pooled to K tokens (a square:
+        # kv_prefix_exemplar_k = 1, 4, 9, 16, ...), a sample reads M = kv_prefix_len / K of its class's N exemplars (a random
+        # subset; with train_jit's 'exclude' policy never the sample's own image: kv_prefix_tokens' exclude), projected to the
+        # model width plus a learned embedding of each token's grid cell. The null label (CFG's unconditional pass) reads
+        # kv_prefix_len learned tokens. The features are a non-persistent buffer, reloaded from the file
+        self.kv_prefix_exemplars = kv_prefix_exemplars if kv_prefix_len > 0 else ''
+        if self.kv_prefix_exemplars:
+            assert not self.kv_prefix_class_tokens and kv_prefix_mlp == 0, 'kv_prefix_exemplars replaces the prefix construction'
+            K = kv_prefix_exemplar_k
+            gk = int(round(K ** 0.5))
+            assert gk * gk == K and kv_prefix_len % K == 0, f'kv_prefix_exemplar_k must be a square (1, 4, 9, 16, ...) dividing kv_prefix_len ({kv_prefix_len})'
+            # the full 16 x 16 patch grid per exemplar (memory-mapped), pooled to gk x gk class by class
+            patches = np.load(self.kv_prefix_exemplars[:-4] + '_patches.npy', mmap_mode='r') # [C, N, 256, Dx]
+            Cn, N, G2, Dx = patches.shape
+            assert Cn == num_classes, f'exemplar file has {Cn} classes, model {num_classes}'
+            gs = int(round(G2 ** 0.5))
+            pooled = torch.empty(Cn, N, K, Dx, dtype=torch.bfloat16)
+            for c0 in range(0, Cn, 50):
+                f = torch.from_numpy(np.ascontiguousarray(patches[c0:c0 + 50]).astype(np.float32)) # [c, N, G2, Dx]
+                f = F.adaptive_avg_pool2d(f.reshape(-1, gs, gs, Dx).permute(0, 3, 1, 2), gk).flatten(2).transpose(1, 2)
+                pooled[c0:c0 + 50] = f.reshape(-1, N, K, Dx).to(torch.bfloat16)
+            self.register_buffer('kv_prefix_ex_feats', pooled, persistent=False)
+            self.kv_prefix_ex_k, self.kv_prefix_ex_m, self.kv_prefix_ex_n = K, kv_prefix_len // K, N
+            assert self.kv_prefix_ex_m <= N, f'reading M = {self.kv_prefix_ex_m} exemplars needs N >= M (N = {N}; N - 1 with the exclude policy)'
+            self.kv_prefix_ex_proj = nn.Linear(Dx, hidden_size)
+            self.kv_prefix_ex_cell = nn.Parameter(torch.randn(1, K, hidden_size) * .02)
+            self.kv_prefix_ex_null = nn.Parameter(torch.randn(1, kv_prefix_len, hidden_size) * .02)
         # kv_prefix_mlp > 0: the prefix tokens are generated per class by a shared MLP instead of the sum class + vector:
         #   prefix_p = SwiGLU(RMSNorm(class + vector_p)), hidden width kv_prefix_mlp x hidden_size (the trunk's MLP form), no
         # residual: any class x token interaction, so each class can have its own set of prefix specialties, sharing
@@ -1652,9 +1682,9 @@ class JiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def run_blocks(self, x, res, start, end, c_blocks, y_emb, fine=False, pool_scale=None, y=None, t=None):
+    def run_blocks(self, x, res, start, end, c_blocks, y_emb, fine=False, pool_scale=None, y=None, t=None, exemplar_exclude=None):
         # trunk blocks start..end-1 (0-indexed), with the in-context class tokens prepended at in_context_start
-        kvp = self.kv_prefix_tokens(y_emb, y, t) # [B, P, D] (kv_prefix) or None
+        kvp = self.kv_prefix_tokens(y_emb, y, t, exemplar_exclude) # [B, P, D] (kv_prefix) or None
         pool_cache = {}
         for i in range(start, end):
             if self.in_context_len > 0 and i == self.in_context_start:
@@ -1676,7 +1706,7 @@ class JiT(nn.Module):
             x = self.blocks[i](x, c_blocks, rope, res=res, index=i, prefix=self.prefix_for_block(kvp, i, x[:, n_ic:], pool_scale, pool_cache))
         return x
 
-    def forward(self, x, t, y, return_trunk=False, patch=None):
+    def forward(self, x, t, y, return_trunk=False, patch=None, exemplar_exclude=None):
         """
         x: (N, C, H, W)
         t: (N,)
@@ -1718,7 +1748,7 @@ class JiT(nn.Module):
         depth = len(self.blocks)
         k = self.skip_inject_after if self.skip_pathway else depth
         pool_scale = self.kv_prefix_pool_scale(F.silu(t_emb)) if getattr(self, 'kv_prefix_pool', 'none') != 'none' else None
-        x = self.run_blocks(x, res, 0, k, c_blocks, y_emb, fine, pool_scale=pool_scale, y=y, t=t)
+        x = self.run_blocks(x, res, 0, k, c_blocks, y_emb, fine, pool_scale=pool_scale, y=y, t=t, exemplar_exclude=exemplar_exclude)
         if not self.skip_pathway:
             return self.output(x[:, self.in_context_len:], c, head=self.sampled_head(), fine=fine, res=res)
 
@@ -1778,11 +1808,31 @@ class JiT(nn.Module):
         w.scatter_add_(1, (i + 1).unsqueeze(1), a.unsqueeze(1))
         return w
 
-    def kv_prefix_tokens(self, y_emb, y=None, t=None):
+    def kv_prefix_exemplar_tokens(self, y, exclude=None):
+        # [B, M * K, D]: M random exemplars of each sample's class (never slot exclude[b] >= 0, the sample's own image),
+        # their K pooled DINO tokens projected + grid-cell embedding; the null label reads the learned null tokens
+        B = y.shape[0]
+        null = y >= self.kv_prefix_ex_feats.shape[0]
+        yc = torch.where(null, torch.zeros_like(y), y)
+        score = torch.rand(B, self.kv_prefix_ex_n, device=y.device)
+        if exclude is not None:
+            ex = exclude.to(y.device).long()
+            score = torch.where((ex.unsqueeze(1) == torch.arange(self.kv_prefix_ex_n, device=y.device)) & (ex.unsqueeze(1) >= 0),
+                                torch.full_like(score, -1.0), score)
+        pick = score.topk(self.kv_prefix_ex_m, dim=1).indices # [B, M]
+        f = self.kv_prefix_ex_feats[yc.unsqueeze(1), pick] # [B, M, K, Dx]
+        tok = self.kv_prefix_ex_proj(f.to(self.kv_prefix_ex_proj.weight.dtype)) + self.kv_prefix_ex_cell.unsqueeze(1) # [B, M, K, D]
+        tok = tok.reshape(B, self.kv_prefix_ex_m * self.kv_prefix_ex_k, -1)
+        return torch.where(null.view(B, 1, 1), self.kv_prefix_ex_null.to(tok.dtype).expand(B, -1, -1), tok)
+
+    def kv_prefix_tokens(self, y_emb, y=None, t=None, exclude=None):
         # the prefix tokens before any per-block addition: class + learned vector, the class-conditional MLP of it, or the
         # class's own row of the token table (kv_prefix_class_tokens; y: the labels after dropout, num_classes = null)
         if self.kv_prefix_len <= 0:
             return None
+        if getattr(self, 'kv_prefix_exemplars', ''):
+            assert y is not None, 'kv_prefix_exemplars needs the labels'
+            return self.kv_prefix_exemplar_tokens(y, exclude)
         if getattr(self, 'kv_prefix_class_tokens', False):
             assert y is not None, 'kv_prefix_class_tokens needs the labels'
             rows = self.kv_prefix_table(y)

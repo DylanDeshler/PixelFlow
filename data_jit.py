@@ -56,18 +56,20 @@ class EpochSampler:
     """
     Shuffled without-replacement batches, reshuffling every epoch (drop_last semantics).
     """
-    def __init__(self, n, batch_size, seed=0):
-        self.n = n
+    def __init__(self, n, batch_size, seed=0, indices=None):
+        # indices: draw only these dataset rows (e.g. with held-out rows removed); default all n
+        self.rows = np.arange(n) if indices is None else np.asarray(indices)
+        self.n = len(self.rows)
         self.batch_size = batch_size
         self.rng = np.random.default_rng(seed)
         self.epoch = 0
-        self.perm = self.rng.permutation(n)
+        self.perm = self.rows[self.rng.permutation(self.n)]
         self.pos = 0
 
     def next(self):
         if self.pos + self.batch_size > self.n:
             self.epoch += 1
-            self.perm = self.rng.permutation(self.n)
+            self.perm = self.rows[self.rng.permutation(self.n)]
             self.pos = 0
         idx = self.perm[self.pos:self.pos + self.batch_size]
         self.pos += self.batch_size
@@ -83,8 +85,10 @@ class Prefetcher:
     next() returns what to_model_input(*data.get(sampler.next())) would: images [B, 3, R, R] in [-1, 1] on device
     (with random flips) and labels, rows in sorted index order as MemmapImages.get returns them.
     """
-    def __init__(self, data, sampler, device, flip=True, workers=16, depth=3):
+    def __init__(self, data, sampler, device, flip=True, workers=16, depth=3, aux=None):
+        # aux: optional per-row array (e.g. each row's exemplar slot); next() then also sets self.last_aux for its batch
         self.data, self.sampler, self.device, self.flip, self.workers = data, sampler, device, flip, workers
+        self.aux, self.last_aux = aux, None
         self.cuda = 'cuda' in str(device)
         self.row = data.img_size * data.img_size * 3
         self.fd = os.open(data.images.filename, os.O_RDONLY)
@@ -96,6 +100,7 @@ class Prefetcher:
         # non_blocking says), which stalled every training step until the GPU drained its queue. Harmless when a step is
         # one compiled graph, costly when Python launches many small ops (compile_mode='blocks': ~2.5x slower)
         self.label_buffers = [torch.empty(sampler.batch_size, dtype=torch.int64, pin_memory=self.cuda) for _ in range(depth + 1)]
+        self.aux_buffers = [torch.empty(sampler.batch_size, dtype=torch.int64, pin_memory=self.cuda) for _ in range(depth + 1)] if aux is not None else None
         self.copied = [None] * len(self.buffers) # CUDA event after each buffer's last host-to-device copy
         self.free, self.ready = queue.Queue(), queue.Queue()
         for k in range(len(self.buffers)):
@@ -131,6 +136,8 @@ class Prefetcher:
                 for f in [self.pool.submit(self._read_rows, out[p[0]:p[-1] + 1], idx[p[0]:p[-1] + 1]) for p in parts if len(p)]:
                     f.result()
                 self.label_buffers[k].numpy()[:] = self.data.labels[idx]
+                if self.aux_buffers is not None:
+                    self.aux_buffers[k].numpy()[:] = self.aux[idx]
                 self.ready.put((k, None))
         except BaseException as e: # surfaced by next()
             self.ready.put((None, e))
@@ -142,10 +149,14 @@ class Prefetcher:
         if self.cuda: # both copies from pinned memory: truly asynchronous; the event marks when the buffers can be refilled
             x = self.buffers[k].to(self.device, non_blocking=True)
             y = self.label_buffers[k].to(self.device, non_blocking=True)
+            if self.aux_buffers is not None:
+                self.last_aux = self.aux_buffers[k].to(self.device, non_blocking=True)
             self.copied[k] = torch.cuda.Event()
             self.copied[k].record()
         else:
             x, y = self.buffers[k].clone(), self.label_buffers[k].clone()
+            if self.aux_buffers is not None:
+                self.last_aux = self.aux_buffers[k].clone()
         self.free.put(k)
         x = x.permute(0, 3, 1, 2)
         if self.flip:
