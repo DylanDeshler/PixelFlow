@@ -1219,6 +1219,7 @@ class JiT(nn.Module):
         kv_prefix_band_dist=None,
         kv_prefix_exemplars='',
         kv_prefix_exemplar_k=4,
+        kv_prefix_exemplar_use=0,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -1372,6 +1373,8 @@ class JiT(nn.Module):
             assert gk * gk == K and kv_prefix_len % K == 0, f'kv_prefix_exemplar_k must be a square (1, 4, 9, 16, ...) dividing kv_prefix_len ({kv_prefix_len})'
             # the full 16 x 16 patch grid per exemplar (memory-mapped), pooled to gk x gk class by class
             patches = np.load(self.kv_prefix_exemplars[:-4] + '_patches.npy', mmap_mode='r') # [C, N, 256, Dx]
+            if kv_prefix_exemplar_use: # the first N slots of a larger cache (greedy covering order)
+                patches = patches[:, :kv_prefix_exemplar_use]
             Cn, N, G2, Dx = patches.shape
             assert Cn == num_classes, f'exemplar file has {Cn} classes, model {num_classes}'
             gs = int(round(G2 ** 0.5))

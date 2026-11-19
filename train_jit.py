@@ -165,8 +165,8 @@ kv_prefix_class_tokens = False # the prefix tokens are a learned table of kv_pre
 kv_prefix_exemplar_n = 0 # > 0: exemplar memory, the prefix built from N exemplar images per class (prepare_exemplars.py
                          # --n_medoids=N writes {data_dir}/exemplars_dinov2_vitb14_N{N}.npz): M = kv_prefix_len / K of them read
 kv_prefix_exemplar_k = 4 # tokens per exemplar, pooled from its 16 x 16 DINOv2 patch grid (a square: 1, 4, 9, 16, ...)
-kv_prefix_exemplar_policy = 'holdout' # exemplar images: 'holdout' (never trained on), 'exclude' (trained on, but a sample that is an
-                                      # exemplar draws its memory from its class's other N - 1), 'none'
+kv_prefix_exemplar_policy = 'exclude' # exemplar images: 'exclude' (all images trained on; a sample that is itself an exemplar draws its
+                                      # memory from its class's other N - 1), 'holdout' (exemplar images removed from training), 'none'
 kv_prefix_t_bands = 0 # > 1 (with kv_prefix_class_tokens): a joint (class, noise level) memory, this many independent token sets
                       # per class, evenly spaced in the training t distribution's CDF from t = 0 to t = 1; a sample reads the
                       # interpolation of the two neighbouring sets
@@ -439,6 +439,18 @@ if kv_prefix_len and kv_prefix_class_tokens and kv_prefix_t_bands > 1:
     print(f"kv prefix memory: {kv_prefix_t_bands} token sets per class at t = "
           + ', '.join(f'{_t_at(b / (kv_prefix_t_bands - 1)):.3f}' for b in range(kv_prefix_t_bands)))
 assert not (kv_prefix_t_bands > 1 and not kv_prefix_class_tokens), 'kv_prefix_t_bands extends kv_prefix_class_tokens'
+ex_file, ex_file_n = None, None
+if kv_prefix_len and kv_prefix_exemplar_n > 0:
+    # the exemplar cache: exactly N medoids, else the smallest larger cache, using its first N slots (the medoids are stored
+    # in greedy covering order, so the first N are the covering-priority ones; a subset, not the optimal N-medoid cover)
+    import glob as _glob
+    _cands = sorted((int(os.path.basename(f).split('_N')[1][:-4]), f) for f in _glob.glob(os.path.join(data_dir, 'exemplars_dinov2_vitb14_N*.npz')))
+    _ok = [(n_, f) for n_, f in _cands if n_ >= kv_prefix_exemplar_n]
+    assert _ok, f'no exemplar cache with >= {kv_prefix_exemplar_n} medoids in {data_dir}: run prepare_exemplars.py --n_medoids={kv_prefix_exemplar_n}'
+    ex_file_n, ex_file = next(((n_, f) for n_, f in _ok if n_ == kv_prefix_exemplar_n), _ok[0])
+    ex_file = os.path.abspath(ex_file)
+    if ex_file_n != kv_prefix_exemplar_n:
+        print(f'exemplar memory: using the first {kv_prefix_exemplar_n} of the {ex_file_n} medoids in {ex_file}')
 model_name, arch = resolve_arch(model, **{k: (None if v < 0 else v) for k, v in dict(
     depth=depth, hidden_size=hidden_size, num_heads=num_heads, patch_size=patch_size, bottleneck_dim=bottleneck_dim,
     in_context_len=in_context_len, in_context_start=in_context_start, mlp_ratio=mlp_ratio, pixel_depth=pixel_depth, pixel_dim=pixel_dim).items()},
@@ -461,7 +473,8 @@ model_name, arch = resolve_arch(model, **{k: (None if v < 0 else v) for k, v in 
     kv_prefix_class_tokens=True if kv_prefix_len and kv_prefix_class_tokens else None,
     kv_prefix_t_bands=kv_prefix_t_bands if kv_prefix_len and kv_prefix_class_tokens and kv_prefix_t_bands > 1 else None,
     kv_prefix_band_dist=[P_mean, P_std, P_std_right or P_std] if kv_prefix_len and kv_prefix_class_tokens and kv_prefix_t_bands > 1 else None,
-    kv_prefix_exemplars=os.path.abspath(os.path.join(data_dir, f'exemplars_dinov2_vitb14_N{kv_prefix_exemplar_n}.npz')) if kv_prefix_len and kv_prefix_exemplar_n > 0 else None,
+    kv_prefix_exemplars=ex_file if kv_prefix_len and kv_prefix_exemplar_n > 0 else None,
+    kv_prefix_exemplar_use=kv_prefix_exemplar_n if kv_prefix_len and kv_prefix_exemplar_n > 0 and ex_file_n != kv_prefix_exemplar_n else None,
     kv_prefix_exemplar_k=kv_prefix_exemplar_k if kv_prefix_len and kv_prefix_exemplar_n > 0 and kv_prefix_exemplar_k != 4 else None,
     kv_prefix_pool=kv_prefix_pool if kv_prefix_len and kv_prefix_pool != 'none' else None,
     kv_prefix_pool_mode=kv_prefix_pool_mode if kv_prefix_len and kv_prefix_pool != 'none' and kv_prefix_pool_mode != 'spatial' else None,
@@ -526,7 +539,7 @@ ex_slot = None # exemplar memory: each training row's slot among its class's exe
 train_rows = None
 if kv_prefix_len and kv_prefix_exemplar_n > 0:
     assert kv_prefix_exemplar_policy in ('exclude', 'holdout', 'none'), kv_prefix_exemplar_policy
-    _ex = np.load(os.path.join(data_dir, f'exemplars_dinov2_vitb14_N{kv_prefix_exemplar_n}.npz'))['indices'] # [C, N] rows
+    _ex = np.load(ex_file)['indices'][:, :kv_prefix_exemplar_n] # [C, N] rows (the first N slots of a larger cache)
     ex_slot = np.full(len(data), -1, dtype=np.int64)
     ex_slot[_ex.reshape(-1)] = np.tile(np.arange(_ex.shape[1]), _ex.shape[0])
     if kv_prefix_exemplar_policy == 'holdout':
