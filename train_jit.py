@@ -162,6 +162,9 @@ kv_prefix_len = 0 # > 0: this many conditioning tokens as extra keys / values on
 kv_prefix_depth = False # kv_prefix: each reading block adds its own learned offset to the prefix tokens (zero at init: starts as the shared prefix)
 kv_prefix_class_tokens = False # the prefix tokens are a learned table of kv_prefix_len tokens per class (+ the null label for CFG)
                                # instead of class embedding + shared vector; adaLN keeps its own class embedding
+kv_prefix_t_bands = 0 # > 1 (with kv_prefix_class_tokens): a joint (class, noise level) memory, this many independent token sets
+                      # per class, evenly spaced in the training t distribution's CDF from t = 0 to t = 1; a sample reads the
+                      # interpolation of the two neighbouring sets
 kv_prefix_mlp = 0.0 # > 0: prefix tokens = SwiGLU-MLP(RMSNorm(class + learned vector)) with this hidden ratio (4 = the trunk's): class-specific
                     # prefix specialties from shared parameters; no residual. 0 = the plain sum class + vector
 kv_prefix_pool = 'none' # kv_prefix: each prefix token also carries a pooled image summary, scaled by a per-block function of t (zero at init):
@@ -418,6 +421,19 @@ if is_quadtree: # the quadtree model has the JiT backbone options it needs (attn
     assert quad_router not in ('dino', 'pixel') or quad_route_baseline, f"quad_router={quad_router} needs --quad_route_baseline (a uniform JiT checkpoint)"
 else:
     assert (quad_tokens, quad_levels, quad_router) == (64, 3, 'uniform') and not quad_route_baseline, 'quad_* options are QuadJiT options'
+if kv_prefix_len and kv_prefix_class_tokens and kv_prefix_t_bands > 1:
+    # the joint (class, t) memory's sets sit at u = b / (bands - 1) of the training t CDF: print where that is in t
+    from statistics import NormalDist
+    _sl, _sr = P_std, (P_std_right or P_std)
+    _wl = _sl / (_sl + _sr)
+    def _t_at(q):
+        if q <= 0 or q >= 1:
+            return float(q >= 1)
+        z = _sl * NormalDist().inv_cdf(q / (2 * _wl)) if q <= _wl else _sr * NormalDist().inv_cdf(0.5 + (q - _wl) / (2 * (1 - _wl)))
+        return 1 / (1 + math.exp(-(P_mean + z)))
+    print(f"kv prefix memory: {kv_prefix_t_bands} token sets per class at t = "
+          + ', '.join(f'{_t_at(b / (kv_prefix_t_bands - 1)):.3f}' for b in range(kv_prefix_t_bands)))
+assert not (kv_prefix_t_bands > 1 and not kv_prefix_class_tokens), 'kv_prefix_t_bands extends kv_prefix_class_tokens'
 model_name, arch = resolve_arch(model, **{k: (None if v < 0 else v) for k, v in dict(
     depth=depth, hidden_size=hidden_size, num_heads=num_heads, patch_size=patch_size, bottleneck_dim=bottleneck_dim,
     in_context_len=in_context_len, in_context_start=in_context_start, mlp_ratio=mlp_ratio, pixel_depth=pixel_depth, pixel_dim=pixel_dim).items()},
@@ -438,6 +454,8 @@ model_name, arch = resolve_arch(model, **{k: (None if v < 0 else v) for k, v in 
     kv_prefix_depth=True if kv_prefix_len and kv_prefix_depth else None,
     kv_prefix_mlp=kv_prefix_mlp if kv_prefix_len and kv_prefix_mlp > 0 else None,
     kv_prefix_class_tokens=True if kv_prefix_len and kv_prefix_class_tokens else None,
+    kv_prefix_t_bands=kv_prefix_t_bands if kv_prefix_len and kv_prefix_class_tokens and kv_prefix_t_bands > 1 else None,
+    kv_prefix_band_dist=[P_mean, P_std, P_std_right or P_std] if kv_prefix_len and kv_prefix_class_tokens and kv_prefix_t_bands > 1 else None,
     kv_prefix_pool=kv_prefix_pool if kv_prefix_len and kv_prefix_pool != 'none' else None,
     kv_prefix_pool_mode=kv_prefix_pool_mode if kv_prefix_len and kv_prefix_pool != 'none' and kv_prefix_pool_mode != 'spatial' else None,
     kv_prefix_pool_init=kv_prefix_pool_init if kv_prefix_len and kv_prefix_pool != 'none' and kv_prefix_pool_init != 0.02 else None,

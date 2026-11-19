@@ -1215,6 +1215,8 @@ class JiT(nn.Module):
         kv_prefix_pool_init=0.02,
         kv_prefix_mlp=0.0,
         kv_prefix_class_tokens=False,
+        kv_prefix_t_bands=0,
+        kv_prefix_band_dist=None,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -1342,7 +1344,17 @@ class JiT(nn.Module):
         self.kv_prefix_class_tokens = kv_prefix_class_tokens and kv_prefix_len > 0
         if self.kv_prefix_class_tokens:
             assert kv_prefix_mlp == 0, 'kv_prefix_class_tokens replaces the prefix construction: no kv_prefix_mlp'
-            self.kv_prefix_table = nn.Embedding(num_classes + 1, kv_prefix_len * hidden_size)
+            # kv_prefix_t_bands > 1: a joint (class, noise level) memory. Each class owns t_bands independent sets of
+            # kv_prefix_len tokens (each initialized randomly), placed evenly in the training distribution's CDF u = F(t):
+            # u_b = b / (t_bands - 1), so the first sits at t = 0 and the last at t = 1 and every t is an interpolation of the
+            # two neighbouring sets (linear in u: each segment holds the same share of training draws). The prefix changes
+            # smoothly with t. kv_prefix_band_dist = (P_mean, P_std, P_std_right) of the training t distribution
+            nb = max(1, kv_prefix_t_bands)
+            self.kv_prefix_t_bands = nb
+            if nb > 1:
+                assert kv_prefix_band_dist is not None and len(kv_prefix_band_dist) == 3, 'kv_prefix_t_bands needs kv_prefix_band_dist'
+                self.kv_prefix_band_dist = tuple(float(v) for v in kv_prefix_band_dist)
+            self.kv_prefix_table = nn.Embedding(num_classes + 1, nb * kv_prefix_len * hidden_size)
             nn.init.normal_(self.kv_prefix_table.weight, std=.02)
         # kv_prefix_mlp > 0: the prefix tokens are generated per class by a shared MLP instead of the sum class + vector:
         #   prefix_p = SwiGLU(RMSNorm(class + vector_p)), hidden width kv_prefix_mlp x hidden_size (the trunk's MLP form), no
@@ -1640,9 +1652,9 @@ class JiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def run_blocks(self, x, res, start, end, c_blocks, y_emb, fine=False, pool_scale=None, y=None):
+    def run_blocks(self, x, res, start, end, c_blocks, y_emb, fine=False, pool_scale=None, y=None, t=None):
         # trunk blocks start..end-1 (0-indexed), with the in-context class tokens prepended at in_context_start
-        kvp = self.kv_prefix_tokens(y_emb, y) # [B, P, D] (kv_prefix) or None
+        kvp = self.kv_prefix_tokens(y_emb, y, t) # [B, P, D] (kv_prefix) or None
         pool_cache = {}
         for i in range(start, end):
             if self.in_context_len > 0 and i == self.in_context_start:
@@ -1706,7 +1718,7 @@ class JiT(nn.Module):
         depth = len(self.blocks)
         k = self.skip_inject_after if self.skip_pathway else depth
         pool_scale = self.kv_prefix_pool_scale(F.silu(t_emb)) if getattr(self, 'kv_prefix_pool', 'none') != 'none' else None
-        x = self.run_blocks(x, res, 0, k, c_blocks, y_emb, fine, pool_scale=pool_scale, y=y)
+        x = self.run_blocks(x, res, 0, k, c_blocks, y_emb, fine, pool_scale=pool_scale, y=y, t=t)
         if not self.skip_pathway:
             return self.output(x[:, self.in_context_len:], c, head=self.sampled_head(), fine=fine, res=res)
 
@@ -1749,14 +1761,37 @@ class JiT(nn.Module):
         out[~m] = coarse.to(fine.dtype)
         return out
 
-    def kv_prefix_tokens(self, y_emb, y=None):
+    def kv_prefix_band_weights(self, t):
+        # [B, bands] linear interpolation weights in u = F(t), the training t distribution's CDF (split logit-normal), between
+        # the two neighbouring sets at u_b = b / (bands - 1)
+        m, sl, sr = self.kv_prefix_band_dist
+        nb = self.kv_prefix_t_bands
+        z = torch.logit(t.float().clamp(1e-6, 1 - 1e-6)) - m
+        wl = sl / (sl + sr) # mass left of the mode
+        cdf = lambda v, s_: 0.5 * (1 + torch.erf(v / (s_ * math.sqrt(2))))
+        u = torch.where(z <= 0, 2 * wl * cdf(z, sl), wl + 2 * (1 - wl) * (cdf(z, sr) - 0.5)).clamp(0, 1)
+        pos = u * (nb - 1)
+        i = pos.floor().clamp(0, nb - 2).long()
+        a = pos - i
+        w = torch.zeros(t.shape[0], nb, device=t.device)
+        w.scatter_(1, i.unsqueeze(1), (1 - a).unsqueeze(1))
+        w.scatter_add_(1, (i + 1).unsqueeze(1), a.unsqueeze(1))
+        return w
+
+    def kv_prefix_tokens(self, y_emb, y=None, t=None):
         # the prefix tokens before any per-block addition: class + learned vector, the class-conditional MLP of it, or the
         # class's own row of the token table (kv_prefix_class_tokens; y: the labels after dropout, num_classes = null)
         if self.kv_prefix_len <= 0:
             return None
         if getattr(self, 'kv_prefix_class_tokens', False):
             assert y is not None, 'kv_prefix_class_tokens needs the labels'
-            return self.kv_prefix_table(y).view(y.shape[0], self.kv_prefix_len, -1)
+            rows = self.kv_prefix_table(y)
+            if getattr(self, 'kv_prefix_t_bands', 1) <= 1:
+                return rows.view(y.shape[0], self.kv_prefix_len, -1)
+            assert t is not None, 'kv_prefix_t_bands needs t'
+            rows = rows.view(y.shape[0], self.kv_prefix_t_bands, self.kv_prefix_len, -1) # [B, bands, P, D]
+            w = self.kv_prefix_band_weights(t).to(rows.dtype)
+            return torch.einsum('bk,bkpd->bpd', w, rows)
         base = y_emb.unsqueeze(1) + self.kv_prefix_posemb # [B, P, D]
         if self.kv_prefix_mlp > 0:
             return self.kv_prefix_mlp_net(self.kv_prefix_mlp_norm(base))
