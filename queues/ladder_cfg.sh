@@ -6,8 +6,8 @@
 #   2. every ladder row at 20 epochs, scales 3,4,5. -> {run}/eval_cfg20/
 # Checkpoint of a run at E epochs (iteration E x 1251): the milestone ckpt_<iter>.pt if it exists, else ckpt.pt if the
 # iteration stored in it is exactly that (loaded and checked), else the run is skipped with a note.
-# Guidance is capped at 5 (no extension): the ladder reports FID / IS at the fixed scale 4 for every row, plus the best
-# FID within <= 5. Scales already scored are never re-scored; each eval_jit call's results are kept as
+# Guidance is capped at 5 (no extension). The summary reports, per run, the trade-off pick as eval_jit.py makes it (the
+# highest IS among the scales whose FID is within 5% of the best FID, over all scales scored <= 5): its FID, IS and scale. Scales already scored are never re-scored; each eval_jit call's results are kept as
 # eval_10k_heun50_cfg<scales>.json and merged for the summary.
 #
 # $ bash queues/ladder_cfg.sh            (from the repo root, GPU free)
@@ -100,17 +100,16 @@ for f in glob.glob(os.path.join(out, 'eval_10k_heun50*.json')):
     r = json.load(open(f))
     for k in r['fid']:
         m[float(k)] = (r['fid'][k], r['is'].get(k), r.get('precision', {}).get(k), r.get('recall', {}).get(k))
-fmt = lambda c: f"FID {m[c][0]:6.2f}  IS {m[c][1]:6.1f}  P {m[c][2]:.3f}  R {m[c][3]:.3f}" if m[c][2] is not None else f"FID {m[c][0]:6.2f}  IS {m[c][1]:6.1f}"
 ok = [c for c in m if c <= 5]
 if ok:
-    b = min(ok, key=lambda c: m[c][0])
-    at4 = fmt(4.0) if 4.0 in m else 'cfg 4 not scored'
-    print(f"  {label:<20} cfg 4: {at4}   |   best <= 5: cfg {b:g}  {fmt(b)}")
+    best = min(m[c][0] for c in ok)
+    pick = max((c for c in ok if m[c][0] <= 1.05 * best), key=lambda c: m[c][1]) # eval_jit's trade-off rule (fid_tolerance 0.05)
+    print(f"  {label:<20} FID {m[pick][0]:6.2f}  IS {m[pick][1]:6.1f}  at cfg {pick:g}   (best FID {best:.2f}; scales scored <= 5: {', '.join(f'{c:g}' for c in sorted(ok))})")
 else:
     print(f"  {label:<20} -")
 EOF
 }
-echo; echo "summary, 80 epochs (FID-10k / IS / precision / recall; guidance capped at 5):"
+echo; echo "summary, 80 epochs (FID-10k / IS trade-off pick: highest IS within 5% of the best FID, guidance <= 5):"
 for entry in "${LONG[@]}"; do summary "${entry%%|*}" "$ROOT/${entry#*|}/eval_cfg80"; done
-echo "summary, 20 epochs (row 7 and the class table: their earlier sweeps, cfg 4 = 17.13 / 14.75):"
+echo "summary, 20 epochs (same rule; row 7 and the class table from their earlier sweeps, see the ladder):"
 for entry in "${RUNS[@]}"; do summary "${entry%%|*}" "$ROOT/${entry#*|}/eval_cfg20"; done
