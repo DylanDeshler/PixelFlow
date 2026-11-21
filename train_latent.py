@@ -104,6 +104,7 @@ adaln_single = False
 attn_res_chunk = 1
 attn_gate = 'none' # as train_jit.py: 'head' / 'elem' gated attention
 kv_prefix_len = 0 # as train_jit.py: class + learned K/V-only prefix tokens
+kv_prefix_class_tokens = False # as train_jit.py: the prefix is a learned table of kv_prefix_len tokens per class (+ null label)
 kv_prefix_start = -1 # -1: block 4 (JiT-B/16's in_context_start, as the pixel runs)
 in_context_start = 4 # only the KV prefix's default start (no in-context tokens here)
 loss_t_weight = 'none' # as train_jit.py: 'learned' = EDM2-style learned per-noise-level weight (loss L / e^u(t) + u(t))
@@ -120,6 +121,7 @@ disp_group = 0
 eval_every_epochs = 5
 fid_num_images = 10000
 fid_cfg = 1.0
+eval_cfgs = '' # with init_from='resume': score the checkpoint at these CFG scales (comma list, FID-10k each, EMA1 weights), then exit
 fid_interval_min = 0.1
 fid_interval_max = 1.0
 num_sampling_steps = 50
@@ -164,7 +166,7 @@ if not out_dir: # pixel runs' naming (jit_common's short tokens); size in the mo
     changed = [_name_token(k, v) for k, v in config.items()
                if k not in tuple(ARCH) + ('data_dir', 'latent_dir', 'runs_root', 'out_dir', 'init_from', 'recipe', 'epochs', 'eval_every_epochs',
                             'save_every_epochs', 'log_interval', 'device', 'dtype', 'compile', 'decode', 'attn_res_chunk', 'gen_batch_size',
-                            'fid_num_images', 'fid_cfg', 'fid_interval_min', 'fid_interval_max', 'num_sampling_steps', 'probe_blocks',
+                            'fid_num_images', 'fid_cfg', 'eval_cfgs', 'fid_interval_min', 'fid_interval_max', 'num_sampling_steps', 'probe_blocks',
                             'probe_ts', 'probe_train_images', 'probe_val_images', 'eval_loss_images', 'seed') # (evaluation / system settings)
                and v != dict(_defaults, **RECIPES[recipe])[k]] # settings that differ from the recipe's (or the script's) values
     out_dir = os.path.join(runs_root, dataset, model_dir, '_'.join([recipe] + changed))
@@ -212,7 +214,8 @@ print(f"recipe {recipe}: {optimizer_type}, lr {lr:.2e}, betas ({beta1}, {beta2})
 # network: v-prediction (the output is the velocity)
 net = JiT(input_size=H, patch_size=patch_size, in_channels=C, hidden_size=hidden_size, depth=depth, num_heads=num_heads,
           num_classes=num_classes, bottleneck_dim=bottleneck_dim, in_context_len=0, in_context_start=in_context_start, attn_res=attn_res,
-          adaln_single=adaln_single, attn_gate=attn_gate, kv_prefix_len=kv_prefix_len, kv_prefix_start=kv_prefix_start).to(device)
+          adaln_single=adaln_single, attn_gate=attn_gate, kv_prefix_len=kv_prefix_len, kv_prefix_start=kv_prefix_start,
+          kv_prefix_class_tokens=kv_prefix_class_tokens).to(device)
 net.attn_res_chunk = attn_res_chunk
 print(f"network: JiT blocks, {depth} x {hidden_size}, {(H // patch_size) * (W // patch_size)} tokens of {patch_size}x{patch_size}x{C} latent patches, "
       f"{sum(p.numel() for p in net.parameters()) / 1e6:.1f}M params")
@@ -474,6 +477,22 @@ def save_checkpoint():
                 'optimizer': optimizer.state_dict(), 'loss_weighting': loss_weighter.state_dict() if loss_weighter is not None else None, 'iter_num': iter_num, 'best_fid': best_fid, 'train_seconds': train_seconds,
                 'config': config}, os.path.join(out_dir, 'ckpt.pt.tmp'))
     os.replace(os.path.join(out_dir, 'ckpt.pt.tmp'), os.path.join(out_dir, 'ckpt.pt'))
+
+if eval_cfgs: # evaluation only: a guided sweep of the resumed checkpoint, as eval_jit.py does for pixel runs
+    assert init_from == 'resume', 'eval_cfgs evaluates a checkpoint: pass --init_from=resume'
+    cfgs = [float(v) for v in eval_cfgs.split(',') if v.strip()]
+    res = {'iter': iter_num, 'epoch': iter_num / iters_per_epoch, 'interval': [fid_interval_min, fid_interval_max], 'fid': {}, 'is': {}}
+    with ema_weights(1):
+        for cg in cfgs:
+            o = generate_and_score(sampler_model, metrics, ref_stats, fid_num_images, num_classes, device, ctx, cfg=cg,
+                                   interval=(fid_interval_min, fid_interval_max), steps=num_sampling_steps, method='heun', batch_size=gen_batch_size)
+            res['fid'][str(cg)], res['is'][str(cg)] = o['fid'], o['is']
+            print(f"cfg {cg:g}: FID-{fid_num_images / 1000:g}k {o['fid']:.3f}, IS {o['is']:.1f}")
+    best = min(res['fid'], key=res['fid'].get)
+    print(f"iter {iter_num} (epoch {res['epoch']:.1f}): best FID {res['fid'][best]:.3f} at cfg {best}")
+    with open(os.path.join(out_dir, f'eval_cfgs_{iter_num}.json'), 'w') as f:
+        json.dump(res, f, indent=1)
+    sys.exit(0)
 
 # training
 sampler = EpochSampler(len(train_data), batch_size, seed=seed)
