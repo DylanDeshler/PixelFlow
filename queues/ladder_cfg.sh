@@ -1,11 +1,14 @@
 #!/bin/bash
 # Guided FID (CFG sweeps), one run after another (eval_jit.py, FID-10k per scale, EMA1, CFG at all t: the same settings as
 # the row-7 and class-table 20-epoch sweeps):
-#   1. 80 epochs, first (the headline long-training comparison): row 7 and the class table at ckpt_100080.pt, scales
-#      2,3,4,5 (the best scale drops with training); 1.5 is added if the best is 2, 6 if it is 5. -> {run}/eval_cfg80/
-#   2. every ladder row at 20 epochs: its ckpt.pt at iter 25020 (or a ckpt_25020.pt milestone; runs extended past 20
-#      epochs without one are skipped with a note), scales 3,4,5; 6 and 7 added if the best is 5. -> {run}/eval_cfg20/
-# Done steps are skipped on a rerun. A summary table at the end.
+#   1. 80 epochs, first (the headline long-training comparison): row 7 and the class table, scales 2,3,4,5 (the best
+#      scale drops with training). -> {run}/eval_cfg80/
+#   2. every ladder row at 20 epochs, scales 3,4,5. -> {run}/eval_cfg20/
+# Checkpoint of a run at E epochs (iteration E x 1251): the milestone ckpt_<iter>.pt if it exists, else ckpt.pt if the
+# iteration stored in it is exactly that (loaded and checked), else the run is skipped with a note.
+# Guidance is capped at 5 (no extension): the ladder reports FID / IS at the fixed scale 4 for every row, plus the best
+# FID within <= 5. Scales already scored are never re-scored; each eval_jit call's results are kept as
+# eval_10k_heun50_cfg<scales>.json and merged for the summary.
 #
 # $ bash queues/ladder_cfg.sh            (from the repo root, GPU free)
 set -u
@@ -29,62 +32,85 @@ LONG=(
   "class table (80 ep)|jit-b16_icl0/muon_attngate-head_kvprefix32_kvprefixclass_losst-learned_no-lossnorm_warmup1_clip0_attnres-full_adalnsingle"
 )
 
-ckpt_for() { # the 20-epoch checkpoint of run dir $1, or empty
-  local d=$1
-  if [ -f "$d/ckpt_25020.pt" ]; then echo "$d/ckpt_25020.pt"; return; fi
-  [ -f "$d/ckpt.pt" ] || return
+ckpt_for() { # run dir $1, iteration $2: the milestone ckpt_$2.pt, else ckpt.pt if its stored iteration is $2, else "skip:<iter>"
+  local d=$1 want=$2
+  if [ -f "$d/ckpt_$want.pt" ]; then echo "$d/ckpt_$want.pt"; return; fi
+  [ -f "$d/ckpt.pt" ] || { echo "skip:no ckpt.pt"; return; }
   local it
   it=$(python -c "import torch,sys; print(torch.load(sys.argv[1], map_location='cpu', weights_only=False).get('iter_num'))" "$d/ckpt.pt" 2>/dev/null)
-  if [ "$it" = "25020" ]; then echo "$d/ckpt.pt"; else echo "skip:$it"; fi
+  if [ "$it" = "$want" ]; then echo "$d/ckpt.pt"; else echo "skip:ckpt.pt is at iter $it, want $want"; fi
 }
 
-best_cfg() { python -c "import json,sys; r=json.load(open(sys.argv[1])); print(min(r['fid'], key=lambda k: r['fid'][k]))" "$1"; }
+missing() { # $1 out dir, $2 comma list: the scales of $2 not yet scored there (comma list, possibly empty)
+  python - "$1" "$2" <<'PYX'
+import json, sys, glob, os
+done = set()
+for f in glob.glob(os.path.join(sys.argv[1], 'eval_10k_heun50*.json')):
+    done |= {float(k) for k in json.load(open(f))['fid']}
+print(','.join(c for c in sys.argv[2].split(',') if float(c) not in done))
+PYX
+}
+
+score() { # $1 ckpt, $2 out dir, $3 comma list of scales: one eval_jit call, its results kept under their own name
+  python eval_jit.py --ckpt="$1" --data_dir="$DATA" --cfgs="$3" --sweep_num_images=0 --final_num_images=10000 --out_dir="$2" || return 1
+  mv "$2/eval_10k_heun50.json" "$2/eval_10k_heun50_cfg${3//,/_}.json"
+}
+
+
+for d0 in $(find "$ROOT" -type d \( -name eval_cfg20 -o -name eval_cfg80 \) 2>/dev/null); do # results of the old script: one name per call
+  [ -f "$d0/eval_10k_heun50.json" ] || continue
+  python - "$d0" <<'PYX'
+import json, os, sys
+d = sys.argv[1]
+src = os.path.join(d, 'eval_10k_heun50.json')
+scales = sorted(json.load(open(src))['fid'], key=float)
+os.replace(src, os.path.join(d, 'eval_10k_heun50_cfg' + '_'.join(scales) + '.json'))
+PYX
+done
 
 # 1. 80 epochs
 for entry in "${LONG[@]}"; do
-  label=${entry%%|*}; rel=${entry#*|}; d="$ROOT/$rel"; ck="$d/ckpt_100080.pt"; out="$d/eval_cfg80"
-  if [ ! -f "$ck" ]; then echo "== $label: no $ck -- skipped"; continue; fi
-  if [ -f "$out/eval_10k_heun50.json" ]; then echo "== $label: already done"; continue; fi
-  echo "== $label: $ck"
-  python eval_jit.py --ckpt="$ck" --data_dir="$DATA" --cfgs=2.0,3.0,4.0,5.0 --sweep_num_images=0 --final_num_images=10000 --out_dir="$out" || continue
-  b=$(best_cfg "$out/eval_10k_heun50.json")
-  if [ "$b" = "2.0" ] || [ "$b" = "5.0" ]; then
-    extra=$([ "$b" = "2.0" ] && echo "1.5" || echo "6.0")
-    mv "$out/eval_10k_heun50.json" "$out/eval_10k_heun50_cfg2345.json"
-    python eval_jit.py --ckpt="$ck" --data_dir="$DATA" --cfgs="$b,$extra" --sweep_num_images=0 --final_num_images=10000 --out_dir="$out"
-  fi
+  label=${entry%%|*}; rel=${entry#*|}; d="$ROOT/$rel"; out="$d/eval_cfg80"
+  ck=$(ckpt_for "$d" 100080)
+  if [[ "$ck" == skip:* ]]; then echo "== $label: no 80-epoch checkpoint in $d (${ck#skip:}) -- skipped"; continue; fi
+  todo=$(missing "$out" 2.0,3.0,4.0,5.0)
+  if [ -z "$todo" ]; then echo "== $label: done"; continue; fi
+  echo "== $label: $ck, scales $todo"
+  score "$ck" "$out" "$todo"
 done
 
 # 2. ladder rows at 20 epochs
 for entry in "${RUNS[@]}"; do
   label=${entry%%|*}; rel=${entry#*|}; d="$ROOT/$rel"
-  ck=$(ckpt_for "$d")
-  if [ -z "$ck" ] || [[ "$ck" == skip:* ]]; then echo "== $label: no 20-epoch checkpoint in $d (${ck#skip:}) -- skipped"; continue; fi
+  ck=$(ckpt_for "$d" 25020)
+  if [[ "$ck" == skip:* ]]; then echo "== $label: no 20-epoch checkpoint in $d (${ck#skip:}) -- skipped"; continue; fi
   out="$d/eval_cfg20"
-  if [ -f "$out/eval_10k_heun50.json" ]; then echo "== $label: already done"; continue; fi
-  echo "== $label: $ck"
-  python eval_jit.py --ckpt="$ck" --data_dir="$DATA" --cfgs=3.0,4.0,5.0 --sweep_num_images=0 --final_num_images=10000 --out_dir="$out" || continue
-  if [ "$(best_cfg "$out/eval_10k_heun50.json")" = "5.0" ]; then
-    mv "$out/eval_10k_heun50.json" "$out/eval_10k_heun50_cfg345.json"
-    python eval_jit.py --ckpt="$ck" --data_dir="$DATA" --cfgs=5.0,6.0,7.0 --sweep_num_images=0 --final_num_images=10000 --out_dir="$out"
-  fi
+  todo=$(missing "$out" 3.0,4.0,5.0)
+  if [ -z "$todo" ]; then echo "== $label: done"; continue; fi
+  echo "== $label: $ck, scales $todo"
+  score "$ck" "$out" "$todo"
 done
 
 summary() { # $1 = label, $2 = results dir
   python - "$1" "$2" <<'EOF'
 import json, sys, glob, os
 label, out = sys.argv[1], sys.argv[2]
-fid = {}
+m = {}
 for f in glob.glob(os.path.join(out, 'eval_10k_heun50*.json')):
-    fid.update(json.load(open(f))['fid'])
-if fid:
-    b = min(fid, key=fid.get)
-    print(f"  {label:<20} best {fid[b]:.2f} at cfg {b}   (" + ', '.join(f'{k}: {v:.2f}' for k, v in sorted(fid.items(), key=lambda kv: float(kv[0]))) + ')')
+    r = json.load(open(f))
+    for k in r['fid']:
+        m[float(k)] = (r['fid'][k], r['is'].get(k), r.get('precision', {}).get(k), r.get('recall', {}).get(k))
+fmt = lambda c: f"FID {m[c][0]:6.2f}  IS {m[c][1]:6.1f}  P {m[c][2]:.3f}  R {m[c][3]:.3f}" if m[c][2] is not None else f"FID {m[c][0]:6.2f}  IS {m[c][1]:6.1f}"
+ok = [c for c in m if c <= 5]
+if ok:
+    b = min(ok, key=lambda c: m[c][0])
+    at4 = fmt(4.0) if 4.0 in m else 'cfg 4 not scored'
+    print(f"  {label:<20} cfg 4: {at4}   |   best <= 5: cfg {b:g}  {fmt(b)}")
 else:
     print(f"  {label:<20} -")
 EOF
 }
-echo; echo "summary, 80 epochs (best guided FID-10k):"
+echo; echo "summary, 80 epochs (FID-10k / IS / precision / recall; guidance capped at 5):"
 for entry in "${LONG[@]}"; do summary "${entry%%|*}" "$ROOT/${entry#*|}/eval_cfg80"; done
-echo "summary, 20 epochs (best guided FID-10k; row 7 17.13 and class table 14.75 from their earlier sweeps):"
+echo "summary, 20 epochs (row 7 and the class table: their earlier sweeps, cfg 4 = 17.13 / 14.75):"
 for entry in "${RUNS[@]}"; do summary "${entry%%|*}" "$ROOT/${entry#*|}/eval_cfg20"; done
