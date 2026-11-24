@@ -38,6 +38,7 @@ $ python prepare_latents.py --data_dir=/data/in1k_128
 $ python train_latent.py --data_dir=/data/in1k_128                                  # recipe jit, 20 epochs
 $ python train_latent.py --data_dir=/data/in1k_128 --disp_weight=0.5                # + Dispersive Loss, the paper's settings
 $ python train_latent.py --data_dir=/data/in1k_128 --recipe=sit
+$ python train_latent.py --data_dir=/data/in1k_128 --vae=mar-kl16 --patch_size=1   # MAR's ImageNet-only KL-16 (16 x 8 x 8): 64 tokens
 $ python train_latent.py --data_dir=/data/in1k_128 --attn_res=full --adaln_single=True --attn_res_chunk=8 --kv_prefix_len=32 --attn_gate=head \
       --loss_t_weight=learned --warmup_epochs=1 --grad_clip=0                    # the row-7 stack in latent space
 """
@@ -70,7 +71,8 @@ sys.stdout.reconfigure(line_buffering=True) # logs redirected to a file show eac
 
 # -----------------------------------------------------------------------------
 data_dir = '' # the prepared pixel dataset (FID reference stats, labels, class count); latents in latent_dir
-latent_dir = '' # default: {data_dir}/latents_sdvae-ft-ema
+vae = 'stabilityai/sd-vae-ft-ema' # latent_vae.py: or 'mar-kl16' (ImageNet-only, 16 x 8 x 8 at 128px: pass --patch_size=1 for 64 tokens)
+latent_dir = '' # default: {data_dir}/latents_{latent_vae.SHORT[vae]} (prepare_latents.py --vae=...)
 runs_root = 'runs'
 out_dir = '' # default: {runs_root}/{dataset}/latent-b2[_d.._w.._h..]/{recipe}{_changes}
 init_from = 'scratch' # 'scratch' or 'resume'
@@ -155,16 +157,19 @@ for k, v in RECIPES[recipe].items(): # the recipe fills what wasn't set explicit
 config = {k: globals()[k] for k in config_keys}
 assert data_dir, 'pass --data_dir (the prepared pixel dataset; latents from prepare_latents.py)'
 assert t_sampling in ('logit_normal', 'uniform') and optimizer_type in ('muon', 'adamw')
-latent_dir = latent_dir or os.path.join(data_dir, 'latents_sdvae-ft-ema')
+from latent_vae import load_vae, SHORT as VAE_SHORT
+latent_dir = latent_dir or os.path.join(data_dir, 'latents_' + VAE_SHORT[vae])
 lmeta = json.load(open(os.path.join(latent_dir, 'meta.json')))
+assert lmeta['vae'] == vae, f'{latent_dir} holds {lmeta["vae"]} latents, but vae = {vae}'
 C, H, W = lmeta['latent_shape']
 dataset = os.path.basename(os.path.normpath(data_dir))
 if not out_dir: # pixel runs' naming (jit_common's short tokens); size in the model directory, as JiT's d / w / h
     from jit_common import _name_token
     ARCH = {'depth': ('d', 12), 'hidden_size': ('w', 768), 'num_heads': ('h', 12), 'patch_size': ('p', 2)}
-    model_dir = 'latent-b2' + ''.join(f'_{a}{config[k]}' for k, (a, d) in ARCH.items() if config[k] != d)
+    model_dir = 'latent-b2' + ''.join(f'_{a}{config[k]}' for k, (a, d) in ARCH.items() if config[k] != d) \
+                + ('' if vae == _defaults['vae'] else '_' + VAE_SHORT[vae])
     changed = [_name_token(k, v) for k, v in config.items()
-               if k not in tuple(ARCH) + ('data_dir', 'latent_dir', 'runs_root', 'out_dir', 'init_from', 'recipe', 'epochs', 'eval_every_epochs',
+               if k not in tuple(ARCH) + ('vae', 'data_dir', 'latent_dir', 'runs_root', 'out_dir', 'init_from', 'recipe', 'epochs', 'eval_every_epochs',
                             'save_every_epochs', 'log_interval', 'device', 'dtype', 'compile', 'decode', 'attn_res_chunk', 'gen_batch_size',
                             'fid_num_images', 'fid_cfg', 'eval_cfgs', 'fid_interval_min', 'fid_interval_max', 'num_sampling_steps', 'probe_blocks',
                             'probe_ts', 'probe_train_images', 'probe_val_images', 'eval_loss_images', 'seed') # (evaluation / system settings)
@@ -233,24 +238,24 @@ net.eval()
 fwd_gflops = _flops(lambda: net(torch.randn(1, C, H, W, device=device), torch.full((1,), 0.5, device=device), torch.zeros(1, dtype=torch.long, device=device)))
 net.train(_was)
 SCALE = lmeta['scale']
-vae = None
-if decode == 'vae':
-    from diffusers.models import AutoencoderKL
-    vae = AutoencoderKL.from_pretrained(lmeta['vae']).to(device).eval()
+vae_model = load_vae(vae, device) if decode == 'vae' else None
 img_size_px = lmeta.get('img_size', pix.img_size)
-if vae is not None:
+if vae_model is not None:
     _x = torch.randn(1, 3, img_size_px, img_size_px, device=device)
-    vae_cost = dict(vae_encoder_params=sum(p.numel() for n, p in vae.named_parameters() if n.startswith(('encoder', 'quant_conv'))),
-                    vae_decoder_params=sum(p.numel() for n, p in vae.named_parameters() if n.startswith(('decoder', 'post_quant_conv'))),
-                    vae_encode_gflops=_flops(lambda: vae.encode(_x).latent_dist.mean),
-                    vae_decode_gflops=_flops(lambda: vae.decode(torch.randn(1, C, H, W, device=device))))
+    vae_cost = dict(vae_encoder_params=sum(p.numel() for n, p in vae_model.named_parameters() if n.startswith(('encoder', 'quant_conv'))),
+                    vae_decoder_params=sum(p.numel() for n, p in vae_model.named_parameters() if n.startswith(('decoder', 'post_quant_conv'))),
+                    vae_encode_gflops=_flops(lambda: vae_model.encode_mean(_x)),
+                    vae_decode_gflops=_flops(lambda: vae_model.decode_img(torch.randn(1, C, H, W, device=device))))
 else:
     vae_cost = dict(vae_encoder_params=0, vae_decoder_params=0, vae_encode_gflops=0.0, vae_decode_gflops=0.0)
 n_encoded = (len(train_data) + len(val_data)) * 2 # prepare_latents.py encodes both flips of train and val
 trunk_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
-vae_train = vae_training_cost(vae, lmeta['vae'], device) if vae is not None else None
-assert vae_train is not None or vae is None, f"no training record for {lmeta['vae']} in vae_cost.VAE_TRAINING: add its stages (model card / paper)"
-vae_train = vae_train or {'vae_train_pflops': 0.0, 'vae_train_stages': []}
+vae_train = vae_training_cost(vae_model, vae, device) if vae_model is not None else None
+assert vae_train is not None or vae_model is None, f"no training record for {lmeta['vae']} in vae_cost.VAE_TRAINING: add its stages (model card / paper)"
+vae_train = vae_train or {'vae_train_pflops': 0.0, 'vae_train_complete': True, 'vae_train_stages': []}
+if not vae_train['vae_train_complete']:
+    print(f"note: {vae}'s training steps are unpublished; its training compute is not in train_pflops_offset (per image: "
+          + ', '.join(f"{s['gflops_per_image']:.0f} GF" for s in vae_train['vae_train_stages'] if s['pflops'] is None) + ')')
 sample_nfe = sampling_nfe(num_sampling_steps, 'heun', fid_cfg, (fid_interval_min, fid_interval_max))
 config['resolved'] = dict(model_name=f'latent-{depth}x{hidden_size}/{patch_size}', img_size=img_size_px, num_classes=num_classes,
                           effective_batch_size=batch_size, iters_per_epoch=iters_per_epoch, max_iters=max_iters, train_images=len(train_data),
@@ -350,7 +355,7 @@ def ema_weights(which):
 if decode == 'vae':
     def to_images(z):
         with ctx:
-            return vae.decode(z / SCALE).sample.float().clamp(-1, 1)
+            return vae_model.decode_img(z / SCALE).float().clamp(-1, 1)
 else: # CPU smoke tests only
     def to_images(z):
         x = torch.nn.functional.interpolate(z[:, :3], scale_factor=lmeta['img_size'] // H, mode='nearest')

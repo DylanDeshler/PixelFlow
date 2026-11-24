@@ -1,5 +1,5 @@
 """
-Training compute of the pretrained VAEs that latent baselines (train_latent.py) depend on, so a latent pipeline's training
+Training compute of the pretrained VAEs (latent_vae.py) that latent baselines (train_latent.py) depend on, so a latent pipeline's training
 FLOPs = VAE training + trunk training, comparable with an end-to-end pixel model's.
 
 Each VAE's training history is listed as stages with steps, batch size, crop resolution, which parts were trained and the
@@ -37,16 +37,24 @@ _FT_EMA = dict(name='ft-EMA (LAION-Aesthetics + LAION-Humans)', steps=313198, ba
 _FT_MSE = dict(name='ft-MSE (from ft-EMA, MSE + 0.1 LPIPS)', steps=280000, batch=192, res=256, trains='decoder',
                lpips=True, disc_start=None, note='resolution not stated (256 assumed)')
 
+# MAR's KL-16 (ImageNet-1k only): LDM's kl-f8 recipe (LPIPS + PatchGAN from step 50,001) at batch 256 / lr 1e-4 (the author,
+# github.com/LTH14/mar/issues/3); the number of steps was never published, so only the cost per training image is known and the
+# total is not counted (vae_train_complete False: per-FLOP charts then understate this pipeline's training compute)
+_MAR_KL16 = dict(name='MAR KL-16 (ImageNet-1k)', steps=None, batch=256, res=256, trains='encoder+decoder', lpips=True,
+                 disc_start=50001, note='steps unpublished: total not counted (per-image cost only, without the discriminator)')
+
 VAE_TRAINING = {
     'stabilityai/sd-vae-ft-ema': [_ORIGINAL_KLF8, _FT_EMA],
     'stabilityai/sd-vae-ft-mse': [_ORIGINAL_KLF8, _FT_EMA, _FT_MSE],
+    'mar-kl16': [_MAR_KL16],
 }
 
 def vae_training_cost(vae, name, device):
     """
-    {'vae_train_pflops': total, 'vae_train_stages': [per stage: name, steps, batch, res, gflops_per_image, pflops, note]}
-    or None for a VAE not in the table. vae: the loaded diffusers AutoencoderKL (its forward FLOPs are measured per stage
-    resolution).
+    {'vae_train_pflops': total, 'vae_train_complete': whether every stage's steps are known, 'vae_train_stages': [per stage:
+    name, steps, batch, res, gflops_per_image, pflops, note]} or None for a VAE not in the table. A stage with unknown steps
+    reports its per-image cost (without the discriminator) and pflops None, and adds nothing to the total. vae: a
+    latent_vae.load_vae module (its forward FLOPs are measured per stage resolution).
     """
     import torch
     from torch.utils.flop_counter import FlopCounterMode
@@ -56,24 +64,29 @@ def vae_training_cost(vae, name, device):
         with torch.no_grad(), FlopCounterMode(display=False) as fc:
             fn()
         return fc.get_total_flops() / 1e9
-    stages, total = [], 0.0
+    stages, total, complete = [], 0.0, True
     measured = {}
     for st in VAE_TRAINING[name]:
         r = st['res']
         if r not in measured:
             x = torch.randn(1, 3, r, r, device=device)
             with torch.no_grad():
-                z = vae.encode(x).latent_dist.mean
-            measured[r] = (flops(lambda: vae.encode(x).latent_dist.mean), flops(lambda: vae.decode(z)))
+                z = vae.encode_mean(x)
+            measured[r] = (flops(lambda: vae.encode_mean(x)), flops(lambda: vae.decode_img(z)))
         enc, dec = measured[r]
         scale = (r / 256) ** 2
         per = 3 * (enc + dec) if st['trains'] == 'encoder+decoder' else enc + 3 * dec
         if st['lpips']:
             per += 3 * VGG16_GF_256 * scale
+        if st['steps'] is None:
+            complete = False
+            stages.append(dict(name=st['name'], steps=None, batch=st['batch'], res=r, trains=st['trains'],
+                               gflops_per_image=per, pflops=None, note=st['note']))
+            continue
         steps_gan = max(0, st['steps'] - st['disc_start'] + 1) if st['disc_start'] else 0
         gf_total = st['steps'] * st['batch'] * per + steps_gan * st['batch'] * 8 * DISC_GF_256 * scale
         pf = gf_total / 1e6
         total += pf
         stages.append(dict(name=st['name'], steps=st['steps'], batch=st['batch'], res=r, trains=st['trains'],
                            gflops_per_image=gf_total / (st['steps'] * st['batch']), pflops=pf, note=st['note']))
-    return {'vae_train_pflops': total, 'vae_train_stages': stages}
+    return {'vae_train_pflops': total, 'vae_train_complete': complete, 'vae_train_stages': stages}

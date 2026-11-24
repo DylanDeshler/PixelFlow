@@ -1,15 +1,17 @@
 """
 Encode a prepared pixel dataset (prepare_jit_data.py layout: {data_dir}/images.u8 + labels.npy + meta.json, and val/ alike)
-into Stable Diffusion VAE latents for latent-space baselines (train_latent.py), as DiT / SiT train: 128px -> 4 x 16 x 16
-(downsampling 8), scaled by the VAE's 0.18215 so the latents have roughly unit variance. Both horizontal flips of every
+into VAE latents for latent-space baselines (train_latent.py), as DiT / SiT train. --vae (latent_vae.py): Stable Diffusion's
+(default; 128px -> 4 x 16 x 16, downsampling 8, scaled by 0.18215) or MAR's ImageNet-only KL-16 (mar-kl16; 128px -> 16 x 8 x 8,
+downsampling 16, scaled by MAR's 0.2325), so the latents have roughly unit variance (the std is printed per split). Both horizontal flips of every
 image are encoded (a VAE doesn't commute with flipping), stored float16 as [N, 2, 4, 16, 16] (0 = as is, 1 = flipped), and
 train_latent.py picks one per sample, as random flips would. The posterior mean is stored (deterministic; DiT's feature
 extraction samples once instead, a negligible difference at this noise level).
 
 Writes {out_dir}/train/latents.npy and {out_dir}/val/latents.npy (memmaps; labels are read from the pixel dataset) and
-{out_dir}/meta.json. ImageNet-1k at 128px: ~5.2 GB train. Needs `pip install diffusers` and the VAE weights from the hub.
+{out_dir}/meta.json. ImageNet-1k at 128px: ~5.2 GB train. SD needs `pip install diffusers` and the VAE weights from the hub; MAR's checkpoint is downloaded on first use.
 
 $ python prepare_latents.py --data_dir=/data/in1k_128          # -> /data/in1k_128/latents_sdvae-ft-ema
+$ python prepare_latents.py --data_dir=/data/in1k_128 --vae=mar-kl16   # -> /data/in1k_128/latents_mar-kl16
 """
 
 import os
@@ -25,26 +27,25 @@ from util.progress import bar
 parser = argparse.ArgumentParser()
 parser.add_argument('--data_dir', type=str, required=True)
 parser.add_argument('--out_dir', type=str, default='', help="default: {data_dir}/latents_{vae name}")
-parser.add_argument('--vae', type=str, default='stabilityai/sd-vae-ft-ema', help="a diffusers AutoencoderKL ('stabilityai/sd-vae-ft-mse' also works)")
+parser.add_argument('--vae', type=str, default='stabilityai/sd-vae-ft-ema', help="latent_vae.SCALE's names: 'stabilityai/sd-vae-ft-ema' (-mse), 'mar-kl16' (ImageNet-only)")
 parser.add_argument('--batch_size', type=int, default=256)
 parser.add_argument('--device', type=str, default='cuda')
 args = parser.parse_args()
 
-SCALE = 0.18215 # the SD VAE's latent scaling (DiT / SiT / LDM)
-out_dir = args.out_dir or os.path.join(args.data_dir, 'latents_' + args.vae.split('/')[-1].replace('sd-vae-', 'sdvae-'))
-
-from diffusers.models import AutoencoderKL
-vae = AutoencoderKL.from_pretrained(args.vae).to(args.device).eval()
+from latent_vae import load_vae, SCALE as SCALES, SHORT
+SCALE = SCALES[args.vae] # the VAE's own latent scaling (SD: 0.18215 as DiT / SiT / LDM; MAR KL-16: 0.2325)
+out_dir = args.out_dir or os.path.join(args.data_dir, 'latents_' + SHORT[args.vae])
+vae = load_vae(args.vae, args.device)
 
 @torch.no_grad()
 def encode(x_uint8):
     x = torch.from_numpy(x_uint8).to(args.device).permute(0, 3, 1, 2).float().div_(127.5).sub_(1) # [-1, 1], as the VAE was trained
     both = torch.cat([x, x.flip(-1)])
     with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled='cuda' in args.device):
-        z = vae.encode(both).latent_dist.mean * SCALE
+        z = vae.encode_mean(both) * SCALE
     z = z.float()
     n = x.shape[0]
-    return torch.stack([z[:n], z[n:]], dim=1).half().cpu().numpy() # [n, 2, 4, h, w]
+    return torch.stack([z[:n], z[n:]], dim=1).half().cpu().numpy() # [n, 2, C, h, w]
 
 shape = None
 for split, src in (('train', args.data_dir), ('val', os.path.join(args.data_dir, 'val'))):

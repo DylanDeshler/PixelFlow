@@ -90,6 +90,8 @@ for d, name in zip(dirs, names):
     if os.path.exists(log): # median img/s after the first half epoch (hardware-dependent, for reference)
         v = sorted(r['imgs_per_sec'] for r in map(json.loads, open(log)) if 'imgs_per_sec' in r and r.get('epoch', 0) > 0.5)
         ips = v[len(v) // 2] if v else None
+    if res.get('vae_train_complete') is False:
+        print(f"note: {d}: its VAE's training compute is unknown and not included (vae_cost.py), so its FLOPs are a lower bound")
     pts = [{'iter': it, 'epoch': it / ipe, 'images': it * batch, 'train_pflops': res.get('train_pflops_offset', 0.0) + it * batch * 3 * cost['fwd_gflops'] / 1e6, 'fid': fid}
            for it, fid in evals]
     near = min(pts, key=lambda p: abs(p['epoch'] - at_epoch)) if pts else None
