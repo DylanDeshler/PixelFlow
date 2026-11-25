@@ -272,9 +272,11 @@ print(f"cost: trunk {trunk_params / 1e6:.2f}M params, {fwd_gflops:.2f} forward G
       f"{vae_cost['vae_decode_gflops']:.1f} GFLOPs; sampling {sample_nfe} calls + VAE decoder = {config['resolved']['sample_gflops']:.0f} GFLOPs per image")
 _trunk_pf = max_iters * batch_size * 3 * fwd_gflops / 1e6
 for st in vae_train['vae_train_stages']:
-    print(f"  VAE training: {st['name']}: {st['steps']:,} steps x {st['batch']} at {st['res']}px, {st['trains']}, "
-          f"{st['gflops_per_image']:.0f} GFLOPs/image = {st['pflops']:,.0f} PFLOPs ({st['note']})")
-print(f"  training compute: VAE {vae_train['vae_train_pflops']:,.0f} + trunk {_trunk_pf:,.0f} PFLOPs over this run "
+    steps = 'unknown' if st['steps'] is None else f"{st['steps']:,}"
+    total = 'not counted' if st['pflops'] is None else f"{st['pflops']:,.0f} PFLOPs"
+    print(f"  VAE training: {st['name']}: {steps} steps x {st['batch']} at {st['res']}px, {st['trains']}, "
+          f"{st['gflops_per_image']:.0f} GFLOPs/image = {total} ({st['note']})")
+print(f"  training compute: VAE {vae_train['vae_train_pflops']:,.0f}{'' if vae_train['vae_train_complete'] else ' (incomplete)'} + trunk {_trunk_pf:,.0f} PFLOPs over this run "
       f"(cached dataset encoding {config['resolved']['cached_encoding_pflops']:,.0f} PFLOPs, not counted)")
 
 disp_captures = []
