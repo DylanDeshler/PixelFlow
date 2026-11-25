@@ -79,6 +79,7 @@ init_from = 'scratch' # 'scratch' or 'resume'
 recipe = 'jit' # 'jit' or 'sit' (see above); settings left at their sentinel take the recipe's value
 epochs = 20
 batch_size = 1024
+gradient_accumulation_steps = 1 # the batch is split into this many micro-batches (same effective batch / lr; for large models)
 optimizer_type = '' # 'muon' / 'adamw' ('' = recipe)
 blr = -1.0 # lr per 1024 images ('' / < 0 = recipe)
 beta2 = -1.0
@@ -123,7 +124,9 @@ disp_group = 0
 eval_every_epochs = 5
 fid_num_images = 10000
 fid_cfg = 1.0
+fd_dino = False # also FD-DINOv2 of the eval samples ('val/fd_dino'), as train_jit.py
 eval_cfgs = '' # with init_from='resume': score the checkpoint at these CFG scales (comma list, FID-10k each, EMA1 weights), then exit
+eval_ckpt = '' # with eval_cfgs: score this kept ckpt_{iter}.pt instead of ckpt.pt
 fid_interval_min = 0.1
 fid_interval_max = 1.0
 num_sampling_steps = 50
@@ -135,6 +138,7 @@ probe_val_images = 5000
 eval_loss_images = 4096
 decode = 'vae' # 'vae' (the latents' VAE) or 'debug' (no VAE: the first 3 latent channels upsampled, for CPU smoke tests only)
 save_every_epochs = 1
+keep_ckpt_every_epochs = 0 # also keep ckpt_{iter}.pt (EMA1 weights only) for later guided sweeps (--eval_ckpt); 0 = off
 log_interval = 100
 seed = 0
 device = 'cuda'
@@ -171,7 +175,7 @@ if not out_dir: # pixel runs' naming (jit_common's short tokens); size in the mo
     changed = [_name_token(k, v) for k, v in config.items()
                if k not in tuple(ARCH) + ('vae', 'data_dir', 'latent_dir', 'runs_root', 'out_dir', 'init_from', 'recipe', 'epochs', 'eval_every_epochs',
                             'save_every_epochs', 'log_interval', 'device', 'dtype', 'compile', 'decode', 'attn_res_chunk', 'gen_batch_size',
-                            'fid_num_images', 'fid_cfg', 'eval_cfgs', 'fid_interval_min', 'fid_interval_max', 'num_sampling_steps', 'probe_blocks',
+                            'fid_num_images', 'fid_cfg', 'fd_dino', 'eval_cfgs', 'eval_ckpt', 'keep_ckpt_every_epochs', 'gradient_accumulation_steps', 'fid_interval_min', 'fid_interval_max', 'num_sampling_steps', 'probe_blocks',
                             'probe_ts', 'probe_train_images', 'probe_val_images', 'eval_loss_images', 'seed') # (evaluation / system settings)
                and v != dict(_defaults, **RECIPES[recipe])[k]] # settings that differ from the recipe's (or the script's) values
     out_dir = os.path.join(runs_root, dataset, model_dir, '_'.join([recipe] + changed))
@@ -264,7 +268,7 @@ config['resolved'] = dict(model_name=f'latent-{depth}x{hidden_size}/{patch_size}
                           train_pflops_offset=vae_train['vae_train_pflops'], **vae_train,
                           cached_encoding_pflops=n_encoded * vae_cost['vae_encode_gflops'] / 1e6,
                           sample_nfe=sample_nfe, sample_gflops=sample_nfe * fwd_gflops + vae_cost['vae_decode_gflops'],
-                          latent_shape=[C, H, W], vae=lmeta['vae'])
+                          latent_shape=[C, H, W], vae=lmeta['vae'], latent_dir=latent_dir)
 with open(os.path.join(out_dir, 'config.json'), 'w') as f:
     json.dump(config, f, indent=2)
 print(f"cost: trunk {trunk_params / 1e6:.2f}M params, {fwd_gflops:.2f} forward GFLOPs per image; VAE encoder "
@@ -315,7 +319,14 @@ else:
 ema1 = [p.detach().clone() for p in net.parameters()]
 ema2 = [p.detach().clone() for p in net.parameters()]
 iter_num, best_fid, train_seconds = 0, float('inf'), 0.0
-if init_from == 'resume':
+if eval_ckpt: # a kept milestone (EMA1 weights only): evaluation with eval_cfgs
+    assert eval_cfgs and init_from == 'resume', 'eval_ckpt is for guided sweeps: pass --eval_cfgs and --init_from=resume'
+    ck = torch.load(eval_ckpt, map_location=device, weights_only=False)
+    ema1 = [ck['ema1'][n].to(device) for n, _ in net.named_parameters()]
+    iter_num = ck['iter_num']
+    print(f"loaded {eval_ckpt} (iter {iter_num}, epoch {iter_num / iters_per_epoch:.2f})")
+    del ck
+elif init_from == 'resume':
     ck = torch.load(os.path.join(out_dir, 'ckpt.pt'), map_location=device, weights_only=False)
     net.load_state_dict(ck['model'])
     ema1 = [ck['ema1'][n].to(device) for n, _ in net.named_parameters()]
@@ -404,6 +415,10 @@ sampler_model = LatentSampler()
 ref_path = os.path.join(data_dir, 'fid_stats_jit.npz')
 ref_stats = load_ref_stats(ref_path if os.path.exists(ref_path) else os.path.join(data_dir, 'fid_stats.npz'))
 metrics = InceptionMetrics(device)
+if fd_dino:
+    from dino_fd import DinoFD
+    dino = DinoFD(device)
+    dino_ref = dino.reference(pix, n_per_class=10, cache=os.path.join(data_dir, 'fd_dino_ref_10pc.npz')) # the same reference as train_jit.py
 spaced = lambda n, k: np.linspace(0, n - 1, min(k, n)).round().astype(np.int64) # as train_jit.py: the same images
 pb = [int(b) for b in probe_blocks.split(',') if int(b) <= depth]
 pts = [float(t) for t in probe_ts.split(',')]
@@ -458,13 +473,17 @@ def evaluate(step):
     t0 = time.time()
     log = {'eval/val_loss': val_loss()}
     with ema_weights(1):
+        dino_feats = []
         out = generate_and_score(sampler_model, metrics, ref_stats, fid_num_images, num_classes, device, ctx, cfg=fid_cfg,
-                                 interval=(fid_interval_min, fid_interval_max), steps=num_sampling_steps, method='heun', batch_size=gen_batch_size)
+                                 interval=(fid_interval_min, fid_interval_max), steps=num_sampling_steps, method='heun', batch_size=gen_batch_size,
+                                 on_batch=(lambda x, labels=None: dino_feats.append(dino.features(x))) if fd_dino else None)
         net.eval()
         tr, va = probe_features(probe_train[0], 'probe features, train'), probe_features(probe_val[0], 'probe features, held-out')
         net.train()
     probes = diag_lib.run_probes(tr, torch.from_numpy(probe_train[1]).to(device), va, torch.from_numpy(probe_val[1]).to(device), num_classes)
     log.update({'val/fid': out['fid'], 'val/is': out['is']})
+    if fd_dino:
+        log['val/fd_dino'] = dino.distance(torch.cat(dino_feats), dino_ref)
     if loss_weighter is not None:
         log.update({f'loss_weight/{k}': v for k, v in loss_weighter.summary().items()})
     for (b, t), r in probes.items():
@@ -474,7 +493,7 @@ def evaluate(step):
         json.dump({'iter': step, 'scalars': log, 'probes': {f'block{b}_t{t}': r for (b, t), r in probes.items()}}, f)
     bmid = pb[len(pb) // 2]
     print(f"iter {step} (epoch {step / iters_per_epoch:.2f}): val loss {log['eval/val_loss']:.4f}, FID-{fid_num_images / 1000:g}k {out['fid']:.2f}, "
-          f"IS {out['is']:.1f} (cfg {fid_cfg}); probes block {bmid} t=0.5: kNN {probes[(bmid, 0.5)]['knn']:.2f}, linear {probes[(bmid, 0.5)]['linear']:.2f} "
+          f"IS {out['is']:.1f} (cfg {fid_cfg})" + (f", FD-DINOv2 {log['val/fd_dino']:.1f}" if fd_dino else '') + f"; probes block {bmid} t=0.5: kNN {probes[(bmid, 0.5)]['knn']:.2f}, linear {probes[(bmid, 0.5)]['linear']:.2f} "
           f"(eval {(time.time() - t0) / 60:.1f} min)")
     return out['fid']
 
@@ -484,6 +503,9 @@ def save_checkpoint():
                 'optimizer': optimizer.state_dict(), 'loss_weighting': loss_weighter.state_dict() if loss_weighter is not None else None, 'iter_num': iter_num, 'best_fid': best_fid, 'train_seconds': train_seconds,
                 'config': config}, os.path.join(out_dir, 'ckpt.pt.tmp'))
     os.replace(os.path.join(out_dir, 'ckpt.pt.tmp'), os.path.join(out_dir, 'ckpt.pt'))
+    if keep_ckpt_every_epochs and iter_num % (keep_ckpt_every_epochs * iters_per_epoch) == 0: # EMA1 only, for --eval_ckpt
+        torch.save({'ema1': dict(zip(names, [e.cpu() for e in ema1])), 'iter_num': iter_num, 'config': config},
+                   os.path.join(out_dir, f'ckpt_{iter_num}.pt'))
 
 if eval_cfgs: # evaluation only: a guided sweep of the resumed checkpoint, as eval_jit.py does for pixel runs
     assert init_from == 'resume', 'eval_cfgs evaluates a checkpoint: pass --init_from=resume'
@@ -497,8 +519,10 @@ if eval_cfgs: # evaluation only: a guided sweep of the resumed checkpoint, as ev
             print(f"cfg {cg:g}: FID-{fid_num_images / 1000:g}k {o['fid']:.3f}, IS {o['is']:.1f}")
     best = min(res['fid'], key=res['fid'].get)
     print(f"iter {iter_num} (epoch {res['epoch']:.1f}): best FID {res['fid'][best]:.3f} at cfg {best}")
-    with open(os.path.join(out_dir, f'eval_cfgs_{iter_num}.json'), 'w') as f:
+    path = os.path.join(out_dir, f"eval_cfgs_{iter_num}_cfg{'_'.join(f'{c:g}' for c in cfgs)}.json")
+    with open(path, 'w') as f:
         json.dump(res, f, indent=1)
+    print(f'wrote {path}')
     sys.exit(0)
 
 # training
@@ -523,21 +547,22 @@ while True:
         g['lr'] = g['peak_lr'] * get_lr(iter_num) / lr
     x_np, y_np = pending.result()
     pending = pool.submit(fetch)
-    x = torch.from_numpy(x_np).to(device, non_blocking=True)
-    y = torch.from_numpy(y_np).to(device, non_blocking=True)
-    y = torch.where(torch.rand(len(y), device=device) < label_drop_prob, torch.full_like(y, num_classes), y)
-    t = sample_t(len(x)).view(-1, 1, 1, 1)
-    e = torch.randn_like(x) * noise_scale
-    with ctx:
-        v_hat = net(t * x + (1 - t) * e, t.flatten(), y)
-        if loss_weighter is not None: # learned per-level weight on the per-sample v-loss (train_jit.py's residual is the same v - v_hat)
-            loss = loss_weighter(x - e - v_hat.float(), t.flatten())
-        else:
-            loss = (x - e - v_hat.float()).pow(2).mean() # ||v - v_hat||^2, v = x - s e
-        loss_disp = (sum(dispersive_loss(c.out, disp_temp, disp_kind, pool=disp_pool, group=disp_group) for c in disp_captures)
-                     / len(disp_captures)) if disp_captures else None
-        total = loss + disp_weight * loss_disp if disp_captures else loss
-    total.backward()
+    x_all = torch.from_numpy(x_np).to(device, non_blocking=True)
+    y_all = torch.from_numpy(y_np).to(device, non_blocking=True)
+    for x, y in zip(x_all.chunk(gradient_accumulation_steps), y_all.chunk(gradient_accumulation_steps)): # micro-batches (1 = the whole batch)
+        y = torch.where(torch.rand(len(y), device=device) < label_drop_prob, torch.full_like(y, num_classes), y)
+        t = sample_t(len(x)).view(-1, 1, 1, 1)
+        e = torch.randn_like(x) * noise_scale
+        with ctx:
+            v_hat = net(t * x + (1 - t) * e, t.flatten(), y)
+            if loss_weighter is not None: # learned per-level weight on the per-sample v-loss (train_jit.py's residual is the same v - v_hat)
+                loss = loss_weighter(x - e - v_hat.float(), t.flatten())
+            else:
+                loss = (x - e - v_hat.float()).pow(2).mean() # ||v - v_hat||^2, v = x - s e
+            loss_disp = (sum(dispersive_loss(c.out, disp_temp, disp_kind, pool=disp_pool, group=disp_group) for c in disp_captures)
+                         / len(disp_captures)) if disp_captures else None
+            total = loss + disp_weight * loss_disp if disp_captures else loss
+        (total / gradient_accumulation_steps).backward()
     gnorm = torch.nn.utils.clip_grad_norm_(params, grad_clip if grad_clip > 0 else float('inf'))
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)

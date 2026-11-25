@@ -281,6 +281,7 @@ mask_prob = 0.0 # fraction of each batch that is masked (the rest trains unmaske
 mask_weighting = 'effective_t' # 'effective_t' (masked patches weighted as t=0) or 'jit' (sampled-t weight for all patches)
 # FID eval during training
 fid_num_images = 10000 # must be divisible by the number of classes
+fd_dino = False # also FD-DINOv2 of the eval samples ('val/fd_dino'; dino_fd.py, reference: 10 train images per class, cached in data_dir)
 fid_cfg = 1.0
 fid_interval_min = 0.1
 fid_interval_max = 1.0
@@ -859,6 +860,10 @@ if not os.path.exists(ref_stats_path):
     ref_stats_path = os.path.join(data_dir, 'fid_stats.npz')
 ref_stats = load_ref_stats(ref_stats_path)
 metrics = InceptionMetrics(device)
+if fd_dino:
+    from dino_fd import DinoFD
+    dino = DinoFD(device)
+    dino_ref = dino.reference(data, n_per_class=10, cache=os.path.join(data_dir, 'fd_dino_ref_10pc.npz'))
 print(f"FID reference: {ref_stats_path}")
 
 # fixed subsets for the eval train / val loss (uint8 on CPU)
@@ -962,11 +967,18 @@ class SpectrumAccumulator:
         return self.power / self.count
 
 @torch.no_grad()
-def generate(spectrum=None):
+def generate(spectrum=None, dino_feats=None):
+    # dino_feats: a list collecting the samples' DINOv2 features (fd_dino)
+    def on_batch(x, labels=None):
+        if spectrum is not None:
+            spectrum(x, labels)
+        if dino_feats is not None:
+            dino_feats.append(dino.features(x))
     return generate_and_score(
         denoiser, metrics, ref_stats, fid_num_images, num_classes, device, ctx,
         cfg=fid_cfg, interval=(fid_interval_min, fid_interval_max), steps=num_sampling_steps,
-        method=sampling_method, batch_size=gen_batch_size, on_batch=spectrum, eta=sampling_eta,
+        method=sampling_method, batch_size=gen_batch_size, on_batch=on_batch if (spectrum is not None or dino_feats is not None) else None,
+        eta=sampling_eta,
     )
 
 class EvalTimer:
@@ -1011,7 +1023,8 @@ def evaluate(step):
     with ema_weights(denoiser, 1):
         if is_gauss: # the sampling (EMA) model's geometry along its own sampling trajectories, recorded during the FID generation
             denoiser.net.record_geometry(True)
-        out = generate(spectrum)
+        dino_feats = [] if fd_dino else None
+        out = generate(spectrum, dino_feats)
         timer.lap('FID sampling')
         if is_gauss:
             geo_ema = denoiser.net.geometry_record_summary()
@@ -1043,6 +1056,8 @@ def evaluate(step):
             probes = diag_lib.run_probes(tr, probe_train_y, va, probe_val_y, num_classes)
             timer.lap('probe fits')
     log['val/fid'], log['val/is'] = out['fid'], out['is']
+    if fd_dino:
+        log['val/fd_dino'] = dino.distance(torch.cat(dino_feats), dino_ref)
     if token_sizes and denoiser.net.alloc.ready():
         # the same FID-10k with the allocation's other inference mode: each call fine with the training probability at its t (in
         # distribution) instead of the top infer_frac of a uniform grid by gain (the in-loop default). Same noise and labels
@@ -1437,7 +1452,7 @@ while True:
         eval_log.update({f"eval_minutes/{k.replace(' / ', '_').replace(' ', '_')}": v for k, v in eval_timer.times.items()})
         print(eval_timer.summary())
         best_fid = min(best_fid, fid)
-        extra = ''.join(f", {k.split('/')[-1]} {eval_log[k]:.3f}" for k in ('val/precision', 'val/recall', 'val/fid_raw', 'mem/nn_ratio') if k in eval_log)
+        extra = ''.join(f", {k.split('/')[-1]} {eval_log[k]:.3f}" for k in ('val/fd_dino', 'val/precision', 'val/recall', 'val/fid_raw', 'mem/nn_ratio') if k in eval_log)
         loss_str = ', '.join(f"{k.split('/')[-1].replace('_', ' ')} {eval_log[k]:.4f}" for k in ('eval/train_loss', 'eval/val_loss') if k in eval_log)
         print(f"iter {iter_num} (epoch {iter_num / iters_per_epoch:.2f}): {loss_str}, FID-{fid_num_images / 1000:g}k {fid:.2f}, IS {eval_log['val/is']:.1f} (cfg {fid_cfg}){extra}")
         alloc = getattr(denoiser.net, 'alloc', None)

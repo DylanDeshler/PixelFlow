@@ -607,7 +607,7 @@ _NAME_EXCLUDE = {
     'out_dir', 'runs_root', 'run_name', 'data_root', 'data_dir', 'dataset', 'model', 'depth', 'hidden_size', 'num_heads',
     'patch_size', 'bottleneck_dim', 'in_context_len', 'in_context_start', 'mlp_ratio', 'pixel_depth', 'pixel_dim',
     'epochs', 'batch_size', 'gradient_accumulation_steps', 'eval_every_epochs', 'save_every_epochs', 'keep_ckpt_every_epochs', 'log_interval',
-    'eval_only', 'init_from', 'wandb_log', 'wandb_project', 'wandb_run_name', 'fid_num_images', 'fid_cfg',
+    'eval_only', 'init_from', 'wandb_log', 'wandb_project', 'wandb_run_name', 'fid_num_images', 'fid_cfg', 'fd_dino',
     'fid_interval_min', 'fid_interval_max', 'sample_cfg', 'sample_interval_min', 'sample_interval_max',
     'sampling_method', 'sampling_eta', 'num_sampling_steps', 'time_schedule', 'gen_batch_size', 'eval_loss_images',
     'device', 'dtype', 'compile', 'compile_mode', 'attn_res_fused', 'phase_timing', 'profile_steps', 'attn_res_kernel', 'act_memory_budget', 'attn_res_chunk', 'tail_checkpoint', 'tail_chunks', 'attn_impl', 'phema_stds', 'phema_every_epochs', 'phema_dtype', 'alloc_eval', 'alloc_eval_conditions', 'alloc_eval_images', 'alloc_eval_loss_images', 'alloc_eval_ts', 'alloc_eval_show', 'trend_plots', 'progress_gif', 'data_workers', 'data_prefetch', 'quad_route_baseline', 'quad_route_every',
