@@ -43,7 +43,7 @@ parser.add_argument('--vae_offset', action='store_true', help="add the VAE's tra
 parser.add_argument('--out', type=str, default='fid_projection')
 args = parser.parse_args()
 
-KNOWN_RFID = {'stabilityai/sd-vae-ft-ema': 8.99} # latent_rfid.py on in1k_128 (2026-11-23)
+KNOWN_RFID = {'stabilityai/sd-vae-ft-ema': 8.99, 'mar-kl16': 8.17} # latent_rfid.py on in1k_128 (2026-11-23)
 METRICS = {'val/fid': 'FID-10k', 'val/fd_dino': 'FD-DINOv2'}
 project = [float(e) for e in args.project.split(',') if e.strip()]
 dirs = list(dict.fromkeys(d.rstrip('/') for g in args.dirs for d in (sorted(glob.glob(g)) or [g]))) # command-line order (labels follow it)
