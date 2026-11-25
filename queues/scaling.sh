@@ -24,8 +24,12 @@
 # Shares the queues' GPU lock; resumes via .done markers and checkpoints. Skip sizes with SIZES (default "S B L"; the S
 # decisions always run first, everything else needs them).
 #
-#   nohup bash queues/scaling.sh > runs/queue_logs/queue_scaling.log 2>&1 &
-#   SIZES="S B" nohup bash queues/scaling.sh ...          # without the L runs
+# Every step's output goes to its own log (runs/queue_logs/<step>.log) and to the screen. Run it inside tmux so it survives a
+# disconnect, keeping the queue's own output too:
+#   tmux new -s scaling
+#   bash queues/scaling.sh 2>&1 | tee -a runs/queue_logs/queue_scaling.log
+#   (detach: Ctrl-b d; reattach: tmux attach -t scaling)
+#   SIZES="S B" bash queues/scaling.sh ...          # without the L runs
 set -u
 DATA=${JIT_DATA_ROOT:-/data}/in1k_128
 SIZES=${SIZES:-"S B L"}
@@ -60,8 +64,10 @@ step() { # step name command...: skipped if done (re-checked once the GPU lock i
     fi
     echo "=== $(date '+%F %T') start $name ${extra[*]+${extra[*]}}: $*"
     local guarded=(flock "$GPU_LOCK" bash -c '[ -e "$0" ] && exit 0; exec "$@"' "$done" "$@" ${extra[@]+"${extra[@]}"})
-    if [ "$mode" = ">>" ]; then "${guarded[@]}" >> "$log" 2>&1; else "${guarded[@]}" > "$log" 2>&1; fi
-    local rc=$?
+    # output to the step's log and the screen (tee); the exit code is the command's, not tee's
+    local tee_args=(); [ "$mode" = ">>" ] && tee_args=(-a)
+    "${guarded[@]}" 2>&1 | tee ${tee_args[@]+"${tee_args[@]}"} "$log"
+    local rc=${PIPESTATUS[0]}
     [ $rc -eq 0 ] && touch "$done"
     echo "=== $(date '+%F %T') end $name (exit $rc)"
 }
