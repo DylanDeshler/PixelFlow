@@ -29,7 +29,7 @@ mkdir -p runs/queue_logs runs/conditioning
 GPU_LOCK=runs/queue_logs/gpu.lock
 CAP=400 # epochs: only a cap, runs stop at convergence
 BASE="config/jit_in1k_128.py --optimizer_type=muon --data_dir=$DATA --warmup_updates=500 --phema_stds=0.02,0.05,0.10 \
---phema_dtype=bfloat16 --fid_num_images=10000 --converge_tol=0.02 --converge_patience=2"
+--phema_dtype=bfloat16 --fid_num_images=10000 --converge_tol=0.02 --converge_patience=2 --diag=False --trend_plots=False --progress_gif=False"
 W192="--hidden_size=192 --num_heads=3"
 S="--hidden_size=384 --num_heads=6"
 arm_flags() { case $1 in incontext) echo "--in_context_len=32" ;; kvtable) echo "--kv_prefix_len=32 --kv_prefix_class_tokens=True" ;; esac; }

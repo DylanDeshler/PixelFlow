@@ -27,6 +27,8 @@
 #   1  conditioning: queues/conditioning.sh (JiT in-context tokens vs the KV-prefix class table, W192, each arm's lr / noise
 #      / aux search, confirmations); the winner by guided FID at matched compute (the cheaper arm when within 2%) carries
 #      into every generator, pixel and latent
+#   1b pixel bottleneck rule: fixed 128 vs proportional (width / 6) at S to convergence (earlier 20-epoch evidence favours
+#      proportional: 77.85 vs 82.69); the winner applies to every pixel width
 #   2  tokenizers (DiTo-$TOK_SIZE): full data at lr 5e-5 / 1e-4 / 2e-4, each judged by a downstream probe (a W192 latent
 #      generator to convergence on its latents, guided FID); N/8 checks the neighbours of the chosen lr the same way; N/2
 #      and N/4 use the full-data lr. Every tokenizer trains to rFID convergence; its kept checkpoints are the investment
@@ -61,7 +63,7 @@ D=$STUDY/decisions
 CAP=400 # full-data epochs: only a safety cap (runs stop at convergence)
 TOK_CAP=300000 # tokenizer updates: the paper's schedule, as a cap
 EVAL="--phema_stds=0.02,0.05,0.10 --phema_dtype=bfloat16 --fid_num_images=10000 --converge_tol=0.02 --converge_patience=2 --warmup_updates=500"
-PIX_BASE="config/jit_in1k_128.py --optimizer_type=muon --data_dir=$DATA $EVAL"
+PIX_BASE="config/jit_in1k_128.py --optimizer_type=muon --data_dir=$DATA $EVAL --diag=False --trend_plots=False --progress_gif=False" # (the diagnostic suite does not feed the study)
 LAT_BASE="--data_dir=$DATA --recipe=jit --patch_size=2 $EVAL"
 width_flags() { echo "--hidden_size=$1 --num_heads=$(( $1 / 64 ))"; }
 length_flags() { # data fraction -> epochs cap, eval spacing and minimum length, all in full-data epochs
@@ -240,6 +242,19 @@ OTHER=$([ "$ARM" = incontext ] && echo kvtable || echo incontext)
 PIX_RECIPE="$COND $(lr_flags_of "$COND_STEP")" # the pixel recipe for full data (W192 search of stage 1)
 echo "=== conditioning: $ARM; pixel recipe: $PIX_RECIPE"
 
+# ---- 1b. pixel bottleneck rule: JiT's fixed 128 vs proportional to width (width / 6, JiT-B's 768 / 128) ---------------------------
+# Earlier evidence (scaling.sh, row-8 stack, S, 20 epochs): proportional 64 FID-10k 77.85 vs fixed 128 82.69. Confirmed here with
+# the study's recipe at convergence, at S (the largest discovery width); the winning rule applies to every pixel width.
+train_gen bn_S_fixed pixel $(width_flags 384) --bottleneck_dim=128 $(length_flags 1) $PIX_RECIPE
+train_gen bn_S_prop pixel $(width_flags 384) --bottleneck_dim=64 $(length_flags 1) $PIX_RECIPE
+r=$(decide bottleneck "pixel bottleneck at S (fixed 128 vs proportional 64)" bn_S_prop bn_S_fixed) || exit 1
+BN_RULE=$([ "${r%% *}" = bn_S_prop ] && echo proportional || echo fixed)
+bn_of() { if [ "$BN_RULE" = proportional ]; then echo $(( ($1 + 3) / 6 )); else echo 128; fi; } # width / 6, rounded
+gen_width() { # family width -> width flags (+ the pixel bottleneck by the rule)
+    if [ "$1" = pixel ]; then echo "$(width_flags $2) --bottleneck_dim=$(bn_of $2)"; else width_flags $2; fi
+}
+echo "=== pixel bottleneck rule: $BN_RULE (W192 $(bn_of 192), W256 $(bn_of 256), S $(bn_of 384), B $(bn_of 768))"
+
 # ---- 2. tokenizers -----------------------------------------------------------------------------------------------------------
 tok_id() { echo "tok_${TOK_SIZE}_frac$1_lr$2"; } # data fraction, lr
 train_tok() { # frac lr [seed]
@@ -332,7 +347,7 @@ for f in 0.25 0.125; do
         for v in base lrhalf lrdouble drop; do
             case $v in base) r="$base" ;; lrhalf) r=$(scale_lr "$base" 0.5) ;; lrdouble) r=$(scale_lr "$base" 2) ;; drop) r="$base $drop" ;; esac
             id=dd_${fam}_frac${f}_$v
-            train_gen $id $fam $W192 $(length_flags $f) $r
+            train_gen $id $fam $(gen_width $fam 192) $(length_flags $f) $r
             ids="$ids $id"
         done
         r=$(decide dd_${fam}_frac$f "$fam recipe at data $f" $ids) || exit 1; best=${r%% *}
@@ -360,8 +375,9 @@ for f in $FRACS; do # full data first (its width ladder), then the smaller data 
             # cell is stage 3's winner; the W192 N/4 and N/8 pixel / T_full cells are stage 4's winners
             if [ $w = 192 ] && [ $sys_ = full ] && [ $f = 1 ]; then id=$(cut -d' ' -f1 "$D/rec_lat_aux.txt"); fi
             if [ $w = 192 ] && [ $sys_ != early ] && { [ $f = 0.25 ] || [ $f = 0.125 ]; }; then id=$(cut -d' ' -f1 "$D/dd_${fam}_frac$f.txt"); fi
+            if [ $w = 384 ] && [ $sys_ = pixel ] && [ $f = 1 ]; then id=$(cut -d' ' -f1 "$D/bottleneck.txt"); fi # stage 1b's winner
             if done_ok "${id}_joint"; then :
-            else train_gen $id $fam $(width_flags $w) $(length_flags $f) $(recipe $fam $f) $extra || continue; fi
+            else train_gen $id $fam $(gen_width $fam $w) $(length_flags $f) $(recipe $fam $f) $extra || continue; fi
             done_ok "${id}_joint" && manifest "$id" "$([ $fam = pixel ] && echo pixel || echo latent-$sys_)" $w $f "$tok"
         done
     done
@@ -380,7 +396,7 @@ sha256sum -c <(echo "$(cat "$STUDY/predictions_w768.json.sha256")  $STUDY/predic
 for sys_ in pixel early full; do
     if [ $sys_ = pixel ]; then fam=pixel; tok=-; extra=""; else fam=latent; tok=$([ $sys_ = early ] && tok_early 1 || tok_full 1); extra="--vae=dito:$tok"; fi
     id=b_${sys_}
-    train_gen $id $fam $(width_flags 768) $(length_flags 1) $(recipe $fam 1) $extra || continue
+    train_gen $id $fam $(gen_width $fam 768) $(length_flags 1) $(recipe $fam 1) $extra || continue
     fid50k $id $fam
     done_ok "${id}_joint" && manifest "$id" "$([ $fam = pixel ] && echo pixel || echo latent-$sys_)" 768 1 "$tok"
 done
@@ -417,7 +433,7 @@ if [ "$RUN_SEEDS" = 1 ]; then
     LB=$(lt "$fe" "$ff" && echo early || echo full)
     echo ">>> seeds: pixel B vs latent B ($LB tokenizer)"
     for seed in 1 2; do
-        train_gen b_pixel_seed$seed pixel $(width_flags 768) $(length_flags 1) $(recipe pixel 1) --seed=$seed && fid50k b_pixel_seed$seed pixel
+        train_gen b_pixel_seed$seed pixel $(gen_width pixel 768) $(length_flags 1) $(recipe pixel 1) --seed=$seed && fid50k b_pixel_seed$seed pixel
         # the tokenizer retrained end to end with this seed, to the same number of updates as the study's checkpoint
         tck=$([ $LB = early ] && tok_early 1 || tok_full 1); tit=$(echo "$tck" | sed 's/.*ckpt_\([0-9]*\)\.pt/\1/')
         tid=$(tok_of 1)_seed$seed
@@ -445,7 +461,7 @@ fi
 # ---- 9. L (depth transfer) ------------------------------------------------------------------------------------------------------
 if [ "$RUN_L" = 1 ]; then
     LFLAGS="--depth=24 --hidden_size=1024 --num_heads=16"
-    train_gen l_pixel pixel --model=JiT-L/16 --batch_size=512 --gradient_accumulation_steps=2 --compile_mode=blocks $(length_flags 1) $(recipe pixel 1) && fid50k l_pixel pixel
+    train_gen l_pixel pixel --model=JiT-L/16 --bottleneck_dim=$(bn_of 1024) --batch_size=512 --gradient_accumulation_steps=2 --compile_mode=blocks $(length_flags 1) $(recipe pixel 1) && fid50k l_pixel pixel
     tok=$(tok_full 1)
     train_gen l_full latent $LFLAGS --gradient_accumulation_steps=2 $(length_flags 1) $(recipe latent 1) --vae=dito:$tok && fid50k l_full latent
 fi

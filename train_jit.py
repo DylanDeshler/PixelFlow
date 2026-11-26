@@ -1121,7 +1121,10 @@ def evaluate(step):
         log.update(a_log)
         images.update(a_images)
         timer.lap('allocation eval')
-    if not diag:
+    if not diag: # the scalars alone (FID, IS, ...): what scaling / convergence tools read (jit_common.fid_history, queues/study.sh)
+        os.makedirs(os.path.join(out_dir, 'diagnostics'), exist_ok=True)
+        with open(os.path.join(out_dir, 'diagnostics', f'diag_{step}.json'), 'w') as f:
+            json.dump({'iter': step, 'scalars': log}, f)
         return out['fid'], log, images
 
     gen_feats = out['features'].to(device)
