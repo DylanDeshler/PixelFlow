@@ -58,6 +58,12 @@ run_name = '' # optional tag appended to the derived out_dir (e.g. seed2)
 eval_every_epochs = 10 # FID eval
 save_every_epochs = 1 # overwrite ckpt.pt
 keep_ckpt_every_epochs = 0 # also keep ckpt_{iter}.pt (EMA1 weights only, ~0.5 GB for JiT-B) for eval_jit.py / eval_linear.py; 0 = off
+# run length by updates or by compute (the scaling study); each overrides epochs
+max_updates = 0 # > 0: exactly this many optimizer updates
+budget_pflops = 0.0 # > 0: as many updates as fit in this training compute (updates x effective batch x 3 x measured forward FLOPs)
+budget_keep = '' # milestones as fractions of the run, e.g. '1/16,1/8,1/4,1/2,1': each gets an eval, a kept ckpt_{iter}.pt and a
+                 # post-hoc EMA snapshot (so a budget is never evaluated with later weights)
+train_frac = 1.0 # nested class-stratified training subset (subsets.py): 1, 0.5, 0.25, 0.125, pinned to {data_dir}/subsets/
 log_interval = 100
 profile_steps = 0 # > 0: profile this many training steps (after 5 warm-up steps) with torch.profiler and print the top GPU ops by self
                   # time (also {out_dir}/profile_trace.json for chrome://tracing / Perfetto). A diagnostic
@@ -232,7 +238,9 @@ label_drop_prob = 0.1
 # optimizer
 epochs = 200
 warmup_epochs = 5
+warmup_updates = -1 # >= 0: linear warm-up over this many updates instead of warmup_epochs
 blr = 2e-4 # base lr per 1024 images
+aux_lr_mult = 1.0 # with Muon: the AdamW groups' lr (embeddings incl. the class-prefix table, patch embedding, readout, norms, biases) = lr x this
 lr_schedule = 'constant' # 'constant' or 'cosine'
 min_lr = 0.0
 weight_decay = 0.0
@@ -549,6 +557,11 @@ if kv_prefix_len and kv_prefix_exemplar_n > 0:
           f"policy {kv_prefix_exemplar_policy}" + (f' ({len(data) - len(train_rows):,} exemplar images held out)' if train_rows is not None else ''))
     if kv_prefix_exemplar_policy != 'exclude':
         ex_slot = None
+if train_frac < 1:
+    from subsets import subset_rows
+    _sub = subset_rows(data_dir, data.labels, train_frac)
+    train_rows = _sub if train_rows is None else np.intersect1d(train_rows, _sub)
+    print(f"training subset: {train_frac:g} of the data, {len(train_rows):,} images (nested, class-stratified: {data_dir}/subsets/)")
 sampler = EpochSampler(len(data), batch_size, indices=train_rows)
 effective_batch_size = batch_size * gradient_accumulation_steps
 iters_per_epoch = sampler.n // effective_batch_size
@@ -639,10 +652,23 @@ try: # parameters and forward FLOPs per image, for FID vs compute / size across 
 except Exception as e: # (other model families' forwards may not fit the probe; plot_scaling.py can still rebuild them)
     cost = {}
     print(f"cost: not measured ({type(e).__name__}: {e})")
+if budget_pflops > 0:
+    assert cost.get('fwd_gflops'), 'budget_pflops needs the measured forward FLOPs'
+    max_iters = math.ceil(budget_pflops * 1e6 / (effective_batch_size * 3 * cost['fwd_gflops']))
+elif max_updates > 0:
+    max_iters = max_updates
+keep_at = set()
+for _f in (v.strip() for v in budget_keep.split(',') if v.strip()):
+    _n, _, _d = _f.partition('/')
+    keep_at.add(max(1, round(float(_n) / float(_d or 1) * max_iters)))
+if budget_pflops > 0 or max_updates > 0 or keep_at:
+    print(f"run length: {max_iters:,} updates = {max_iters * effective_batch_size / 1e6:.3f}M images ({max_iters / iters_per_epoch:.2f} epochs of "
+          f"{sampler.n:,})" + (f", {max_iters * effective_batch_size * 3 * cost['fwd_gflops'] / 1e6:,.1f} training PFLOPs" if cost.get('fwd_gflops') else '')
+          + (f"; milestones at updates {sorted(keep_at)}" if keep_at else ''))
 with open(os.path.join(out_dir, 'config.json'), 'w') as f:
     json.dump({**config, 'resolved': {'data_dir': data_dir, 'out_dir': out_dir, 'model_name': model_name, 'arch': arch, 'noise_scale': noise_scale,
-                                       'effective_batch_size': effective_batch_size, 'lr': lr, 'max_iters': max_iters,
-                                       'iters_per_epoch': iters_per_epoch, 'train_images': len(data), 'img_size': img_size,
+                                       'effective_batch_size': effective_batch_size, 'lr': lr, 'max_iters': max_iters, 'keep_at': sorted(keep_at),
+                                       'iters_per_epoch': iters_per_epoch, 'train_images': sampler.n, 'img_size': img_size,
                                        'num_classes': num_classes, **cost}}, f, indent=2)
 grid = img_size // denoiser.net.patch_size
 
@@ -765,8 +791,9 @@ for name, p in trainable:
     else:
         (no_decay if p.ndim == 1 or name.endswith('.bias') or 'scale_shift_table' in name else decay).append(p)
 # every group stores its peak lr; the schedule scales all of them by the same factor
+aux_lr = lr * (aux_lr_mult if optimizer_type == 'muon' else 1.0)
 adamw = torch.optim.AdamW(
-    [{'params': no_decay, 'weight_decay': 0.0, 'peak_lr': lr}, {'params': decay, 'weight_decay': weight_decay, 'peak_lr': lr}]
+    [{'params': no_decay, 'weight_decay': 0.0, 'peak_lr': aux_lr, 'lr': aux_lr}, {'params': decay, 'weight_decay': weight_decay, 'peak_lr': aux_lr, 'lr': aux_lr}]
     + ([{'params': weighter_params, 'weight_decay': 0.0, 'peak_lr': lr * loss_weight_lr_mult, 'lr': lr * loss_weight_lr_mult}] if weighter_params else []),
     lr=lr, betas=(beta1, beta2), fused=device_type == 'cuda',
 )
@@ -780,7 +807,7 @@ if optimizer_type == 'muon':
     flat = [p for ps in muon_params.values() for p in ps]
     print(f"optimizer: Muon ({muon_adjust_lr}, lr {peak_muon_lr:.2e}, wd {muon_wd}) on {len(flat)} block matrices "
           f"({sum(p.numel() for p in flat) / 1e6:.1f}M params; matrices per split {dict((k, len(v)) for k, v in sorted(muon_params.items()))}), "
-          f"AdamW on the rest ({sum(p.numel() for p in no_decay + decay) / 1e6:.1f}M params, lr {lr:.2e})")
+          f"AdamW on the rest ({sum(p.numel() for p in no_decay + decay) / 1e6:.1f}M params, lr {aux_lr:.2e})")
 else:
     optimizer = adamw
 
@@ -945,8 +972,10 @@ if diag:
 
 def get_lr(it):
     # per-iteration version of JiT's schedule: linear warmup, then constant or half-cycle cosine
+    if warmup_updates >= 0 and it < warmup_updates:
+        return lr * it / warmup_updates
     epoch = it / iters_per_epoch
-    if epoch < warmup_epochs:
+    if warmup_updates < 0 and epoch < warmup_epochs:
         return lr * epoch / warmup_epochs
     if lr_schedule == 'constant':
         return lr
@@ -1398,7 +1427,7 @@ def save_checkpoint():
     tmp_path = os.path.join(out_dir, 'ckpt.pt.tmp')
     torch.save(checkpoint, tmp_path)
     os.replace(tmp_path, os.path.join(out_dir, 'ckpt.pt'))
-    if keep_iters and iter_num % keep_iters == 0:
+    if (keep_iters and iter_num % keep_iters == 0) or iter_num in keep_at:
         # milestone for eval_jit.py / eval_linear.py: the EMA1 weights and what's needed to rebuild the model
         torch.save({'model_ema1': ema1, 'denoiser_args': denoiser_args, 'iter_num': iter_num, 'epoch': iter_num / iters_per_epoch,
                     'config': config}, os.path.join(out_dir, f'ckpt_{iter_num}.pt'))
@@ -1430,7 +1459,7 @@ while True:
         param_group['lr'] = param_group['peak_lr'] * lr_now / lr
 
     # FID eval of EMA weights
-    if (eval_only or (iter_num > 0 and local_iter_num > 0 and (iter_num % eval_iters == 0 or iter_num == max_iters))):
+    if (eval_only or (iter_num > 0 and local_iter_num > 0 and (iter_num % eval_iters == 0 or iter_num == max_iters or iter_num in keep_at))):
         fid, eval_log, eval_images = evaluate(iter_num)
         save_samples(iter_num)
         eval_timer.lap('sample grids')
@@ -1488,9 +1517,9 @@ while True:
     if eval_only:
         break
 
-    if phema is not None and iter_num > 0 and local_iter_num > 0 and (iter_num % phema_iters == 0 or iter_num == max_iters):
+    if phema is not None and iter_num > 0 and local_iter_num > 0 and (iter_num % phema_iters == 0 or iter_num == max_iters or iter_num in keep_at):
         save_phema_snapshots()
-    if iter_num > 0 and local_iter_num > 0 and (iter_num % save_iters == 0 or iter_num == max_iters or (keep_iters and iter_num % keep_iters == 0)):
+    if iter_num > 0 and local_iter_num > 0 and (iter_num % save_iters == 0 or iter_num == max_iters or (keep_iters and iter_num % keep_iters == 0) or iter_num in keep_at):
         save_checkpoint()
         t0 = time.time() # don't count the save in the next iteration's timing
 

@@ -80,6 +80,15 @@ recipe = 'jit' # 'jit' or 'sit' (see above); settings left at their sentinel tak
 epochs = 20
 batch_size = 1024
 gradient_accumulation_steps = 1 # the batch is split into this many micro-batches (same effective batch / lr; for large models)
+# run length by updates or by compute (the scaling study), as train_jit.py; each overrides epochs
+max_updates = 0
+budget_pflops = 0.0 # trunk training compute: updates x batch x 3 x measured forward FLOPs (tokenizer costs are accounted separately)
+budget_keep = '' # milestones as fractions of the run ('1/16,1/8,1/4,1/2,1'): an eval, a kept ckpt_{iter}.pt and a post-hoc EMA snapshot each
+train_frac = 1.0 # nested class-stratified training subset (subsets.py), shared with train_jit.py
+warmup_updates = -1 # >= 0: linear warm-up over this many updates instead of warmup_epochs
+aux_lr_mult = 1.0 # with Muon: the AdamW groups' lr (embeddings incl. the class-prefix table, patch embedding, readout, norms, biases) = lr x this
+phema_stds = '' # post-hoc EMA (phema.py): power-function EMAs to track, e.g. '0.05,0.10', snapshotted every epoch and at the milestones
+phema_dtype = 'float32'
 optimizer_type = '' # 'muon' / 'adamw' ('' = recipe)
 blr = -1.0 # lr per 1024 images ('' / < 0 = recipe)
 beta2 = -1.0
@@ -127,6 +136,11 @@ fid_cfg = 1.0
 fd_dino = False # also FD-DINOv2 of the eval samples ('val/fd_dino'), as train_jit.py
 eval_cfgs = '' # with init_from='resume': score the checkpoint at these CFG scales (comma list, FID-10k each, EMA1 weights), then exit
 eval_ckpt = '' # with eval_cfgs: score this kept ckpt_{iter}.pt instead of ckpt.pt
+eval_phema = 0.0 # with eval_cfgs: score the post-hoc EMA with this sigma_rel, rebuilt from the snapshots at step eval_at (<= that step only)
+eval_at = -1 # the step for eval_phema (-1: the latest snapshot step)
+cfg_search = 0 # with --init_from=resume: a fixed budget of guidance scales instead of eval_cfgs (jit_common.cfg_search, as eval_jit.py)
+cfg_search_min = 1.0
+cfg_search_max = 5.0
 fid_interval_min = 0.1
 fid_interval_max = 1.0
 num_sampling_steps = 50
@@ -175,7 +189,7 @@ if not out_dir: # pixel runs' naming (jit_common's short tokens); size in the mo
     changed = [_name_token(k, v) for k, v in config.items()
                if k not in tuple(ARCH) + ('vae', 'data_dir', 'latent_dir', 'runs_root', 'out_dir', 'init_from', 'recipe', 'epochs', 'eval_every_epochs',
                             'save_every_epochs', 'log_interval', 'device', 'dtype', 'compile', 'decode', 'attn_res_chunk', 'gen_batch_size',
-                            'fid_num_images', 'fid_cfg', 'fd_dino', 'eval_cfgs', 'eval_ckpt', 'keep_ckpt_every_epochs', 'gradient_accumulation_steps', 'fid_interval_min', 'fid_interval_max', 'num_sampling_steps', 'probe_blocks',
+                            'fid_num_images', 'fid_cfg', 'fd_dino', 'eval_cfgs', 'eval_ckpt', 'eval_phema', 'eval_at', 'cfg_search', 'cfg_search_min', 'cfg_search_max', 'keep_ckpt_every_epochs', 'gradient_accumulation_steps', 'max_updates', 'budget_pflops', 'budget_keep', 'phema_stds', 'phema_dtype', 'fid_interval_min', 'fid_interval_max', 'num_sampling_steps', 'probe_blocks',
                             'probe_ts', 'probe_train_images', 'probe_val_images', 'eval_loss_images', 'seed') # (evaluation / system settings)
                and v != dict(_defaults, **RECIPES[recipe])[k]] # settings that differ from the recipe's (or the script's) values
     out_dir = os.path.join(runs_root, dataset, model_dir, '_'.join([recipe] + changed))
@@ -214,7 +228,13 @@ class LatentData:
 train_data = LatentData(os.path.join(latent_dir, 'train'), pix.labels)
 val_pix = MemmapImages(os.path.join(data_dir, 'val'))
 val_data = LatentData(os.path.join(latent_dir, 'val'), val_pix.labels)
-iters_per_epoch = len(train_data) // batch_size
+train_rows = None
+if train_frac < 1:
+    from subsets import subset_rows
+    train_rows = subset_rows(data_dir, pix.labels, train_frac)
+    print(f"training subset: {train_frac:g} of the data, {len(train_rows):,} images (nested, class-stratified: {data_dir}/subsets/)")
+n_train = len(train_data) if train_rows is None else len(train_rows)
+iters_per_epoch = n_train // batch_size
 max_iters = epochs * iters_per_epoch
 lr = blr * batch_size / 1024
 print(f"recipe {recipe}: {optimizer_type}, lr {lr:.2e}, betas ({beta1}, {beta2}), warm-up {warmup_epochs:g} epochs, t {t_sampling}, "
@@ -241,6 +261,17 @@ _was = net.training
 net.eval()
 fwd_gflops = _flops(lambda: net(torch.randn(1, C, H, W, device=device), torch.full((1,), 0.5, device=device), torch.zeros(1, dtype=torch.long, device=device)))
 net.train(_was)
+if budget_pflops > 0:
+    max_iters = math.ceil(budget_pflops * 1e6 / (batch_size * 3 * fwd_gflops))
+elif max_updates > 0:
+    max_iters = max_updates
+keep_at = set()
+for _f in (v.strip() for v in budget_keep.split(',') if v.strip()):
+    _n, _, _d = _f.partition('/')
+    keep_at.add(max(1, round(float(_n) / float(_d or 1) * max_iters)))
+if budget_pflops > 0 or max_updates > 0 or keep_at:
+    print(f"run length: {max_iters:,} updates = {max_iters * batch_size / 1e6:.3f}M images ({max_iters / iters_per_epoch:.2f} epochs of {n_train:,}), "
+          f"{max_iters * batch_size * 3 * fwd_gflops / 1e6:,.1f} trunk training PFLOPs" + (f"; milestones at updates {sorted(keep_at)}" if keep_at else ''))
 SCALE = lmeta['scale']
 vae_model = load_vae(vae, device) if decode == 'vae' else None
 img_size_px = lmeta.get('img_size', pix.img_size)
@@ -262,7 +293,7 @@ if not vae_train['vae_train_complete']:
           + ', '.join(f"{s['gflops_per_image']:.0f} GF" for s in vae_train['vae_train_stages'] if s['pflops'] is None) + ')')
 sample_nfe = sampling_nfe(num_sampling_steps, 'heun', fid_cfg, (fid_interval_min, fid_interval_max))
 config['resolved'] = dict(model_name=f'latent-{depth}x{hidden_size}/{patch_size}', img_size=img_size_px, num_classes=num_classes,
-                          effective_batch_size=batch_size, iters_per_epoch=iters_per_epoch, max_iters=max_iters, train_images=len(train_data),
+                          effective_batch_size=batch_size, iters_per_epoch=iters_per_epoch, max_iters=max_iters, keep_at=sorted(keep_at), train_images=n_train,
                           lr=lr, params=trunk_params, fwd_gflops=fwd_gflops, **vae_cost,
                           pipeline_params=trunk_params + vae_cost['vae_encoder_params'] + vae_cost['vae_decoder_params'],
                           train_pflops_offset=vae_train['vae_train_pflops'], **vae_train,
@@ -306,7 +337,8 @@ for n, p in net.named_parameters():
     else:
         (no_decay if p.ndim == 1 or n.endswith('.bias') or 'scale_shift_table' in n else decay).append(p)
 weighter_params = list(loss_weighter.parameters()) if loss_weighter is not None else [] # own group, as train_jit.py
-adamw = torch.optim.AdamW([{'params': no_decay, 'weight_decay': 0.0, 'peak_lr': lr}, {'params': decay, 'weight_decay': weight_decay, 'peak_lr': lr}]
+aux_lr = lr * (aux_lr_mult if optimizer_type == 'muon' else 1.0)
+adamw = torch.optim.AdamW([{'params': no_decay, 'weight_decay': 0.0, 'peak_lr': aux_lr, 'lr': aux_lr}, {'params': decay, 'weight_decay': weight_decay, 'peak_lr': aux_lr, 'lr': aux_lr}]
                           + ([{'params': weighter_params, 'weight_decay': 0.0, 'peak_lr': lr * loss_weight_lr_mult, 'lr': lr * loss_weight_lr_mult}] if weighter_params else []),
                           lr=lr, betas=(beta1, beta2), fused=device_type == 'cuda')
 if optimizer_type == 'muon':
@@ -319,13 +351,23 @@ else:
 ema1 = [p.detach().clone() for p in net.parameters()]
 ema2 = [p.detach().clone() for p in net.parameters()]
 iter_num, best_fid, train_seconds = 0, float('inf'), 0.0
+phema_state = None
 if eval_ckpt: # a kept milestone (EMA1 weights only): evaluation with eval_cfgs
-    assert eval_cfgs and init_from == 'resume', 'eval_ckpt is for guided sweeps: pass --eval_cfgs and --init_from=resume'
+    assert (eval_cfgs or cfg_search) and init_from == 'resume', 'eval_ckpt is for guided sweeps: pass --eval_cfgs or --cfg_search and --init_from=resume'
     ck = torch.load(eval_ckpt, map_location=device, weights_only=False)
     ema1 = [ck['ema1'][n].to(device) for n, _ in net.named_parameters()]
     iter_num = ck['iter_num']
     print(f"loaded {eval_ckpt} (iter {iter_num}, epoch {iter_num / iters_per_epoch:.2f})")
     del ck
+elif eval_phema: # a post-hoc EMA rebuilt from snapshots up to step eval_at: evaluation with eval_cfgs / cfg_search
+    assert (eval_cfgs or cfg_search) and init_from == 'resume', 'eval_phema is for guided sweeps: pass --eval_cfgs or --cfg_search and --init_from=resume'
+    from phema import reconstruct
+    _snap_dir = os.path.join(out_dir, 'phema')
+    _steps = sorted({int(f.split('-')[1]) for f in os.listdir(_snap_dir) if f.startswith('phema-')})
+    iter_num = _steps[-1] if eval_at < 0 else eval_at
+    _w = reconstruct(_snap_dir, iter_num, eval_phema)
+    ema1 = [_w[n].to(device) for n, _ in net.named_parameters()]
+    print(f"post-hoc EMA sigma_rel {eval_phema} at step {iter_num} (epoch {iter_num / iters_per_epoch:.2f}), from {_snap_dir}")
 elif init_from == 'resume':
     ck = torch.load(os.path.join(out_dir, 'ckpt.pt'), map_location=device, weights_only=False)
     net.load_state_dict(ck['model'])
@@ -335,8 +377,16 @@ elif init_from == 'resume':
     if loss_weighter is not None and ck.get('loss_weighting') is not None:
         loss_weighter.load_state_dict(ck['loss_weighting'])
     iter_num, best_fid, train_seconds = ck['iter_num'], ck['best_fid'], ck.get('train_seconds', 0.0)
+    phema_state = ck.get('phema')
     print(f"resumed at iter {iter_num} (epoch {iter_num / iters_per_epoch:.2f})")
     del ck
+phema = None # post-hoc EMA: power-function EMAs of every parameter, snapshotted for reconstruction (phema.reconstruct)
+if phema_stds and not (eval_cfgs or cfg_search):
+    from phema import PowerEMA
+    phema = PowerEMA(net.parameters(), [float(v) for v in phema_stds.split(',') if v])
+    if init_from == 'resume' and iter_num > 0:
+        assert phema_state is not None, f'--phema_stds on a resumed run without power EMAs in its checkpoint (iter {iter_num}): they must start at step 1'
+        phema.load_state(phema_state, device)
 if compile:
     print("compiling the model... (the first iteration and the first eval take a few minutes)")
     net.compile()
@@ -347,6 +397,8 @@ def sample_t(n):
     return torch.sigmoid(torch.randn(n, device=device) * P_std + P_mean)
 
 def get_lr(it):
+    if warmup_updates >= 0:
+        return lr * min(1.0, it / warmup_updates) if warmup_updates > 0 else lr
     e = it / iters_per_epoch
     return lr * min(1.0, e / warmup_epochs) if warmup_epochs > 0 else lr
 
@@ -497,36 +549,60 @@ def evaluate(step):
           f"(eval {(time.time() - t0) / 60:.1f} min)")
     return out['fid']
 
+def save_phema_snapshots():
+    # one file per power EMA at this step (the format phema.reconstruct reads)
+    d = os.path.join(out_dir, 'phema')
+    os.makedirs(d, exist_ok=True)
+    store = torch.bfloat16 if phema_dtype == 'bfloat16' else torch.float32
+    names = [n for n, _ in net.named_parameters()]
+    base = net.state_dict()
+    for std, ema in zip(phema.stds, phema.emas):
+        sd = dict(base)
+        sd.update({n: e.detach().to('cpu', store) for n, e in zip(names, ema)})
+        path = os.path.join(d, f'phema-{iter_num:08d}-{std:.3f}.pt')
+        torch.save({'t': iter_num, 'std': std, 'model': sd, 'params': names}, path + '.tmp')
+        os.replace(path + '.tmp', path)
+
 def save_checkpoint():
     names = [n for n, _ in net.named_parameters()]
     torch.save({'model': net.state_dict(), 'ema1': dict(zip(names, [e.cpu() for e in ema1])), 'ema2': dict(zip(names, [e.cpu() for e in ema2])),
                 'optimizer': optimizer.state_dict(), 'loss_weighting': loss_weighter.state_dict() if loss_weighter is not None else None, 'iter_num': iter_num, 'best_fid': best_fid, 'train_seconds': train_seconds,
-                'config': config}, os.path.join(out_dir, 'ckpt.pt.tmp'))
+                'phema': phema.state() if phema is not None else None, 'config': config}, os.path.join(out_dir, 'ckpt.pt.tmp'))
     os.replace(os.path.join(out_dir, 'ckpt.pt.tmp'), os.path.join(out_dir, 'ckpt.pt'))
-    if keep_ckpt_every_epochs and iter_num % (keep_ckpt_every_epochs * iters_per_epoch) == 0: # EMA1 only, for --eval_ckpt
+    if (keep_ckpt_every_epochs and iter_num % (keep_ckpt_every_epochs * iters_per_epoch) == 0) or iter_num in keep_at: # EMA1 only, for --eval_ckpt
         torch.save({'ema1': dict(zip(names, [e.cpu() for e in ema1])), 'iter_num': iter_num, 'config': config},
                    os.path.join(out_dir, f'ckpt_{iter_num}.pt'))
 
-if eval_cfgs: # evaluation only: a guided sweep of the resumed checkpoint, as eval_jit.py does for pixel runs
+if eval_cfgs or cfg_search: # evaluation only: a guided sweep / search of the resumed checkpoint, as eval_jit.py does for pixel runs
     assert init_from == 'resume', 'eval_cfgs evaluates a checkpoint: pass --init_from=resume'
-    cfgs = [float(v) for v in eval_cfgs.split(',') if v.strip()]
-    res = {'iter': iter_num, 'epoch': iter_num / iters_per_epoch, 'interval': [fid_interval_min, fid_interval_max], 'fid': {}, 'is': {}}
+    res = {'iter': iter_num, 'epoch': iter_num / iters_per_epoch, 'interval': [fid_interval_min, fid_interval_max], 'fid': {}, 'is': {},
+           'weights': f'phema {eval_phema}' if eval_phema else (eval_ckpt or 'ema1')}
+    def score(cg):
+        o = generate_and_score(sampler_model, metrics, ref_stats, fid_num_images, num_classes, device, ctx, cfg=cg,
+                               interval=(fid_interval_min, fid_interval_max), steps=num_sampling_steps, method='heun', batch_size=gen_batch_size)
+        res['fid'][str(cg)], res['is'][str(cg)] = o['fid'], o['is']
+        print(f"cfg {cg:g}: FID-{fid_num_images / 1000:g}k {o['fid']:.3f}, IS {o['is']:.1f}")
+        return o['fid']
     with ema_weights(1):
-        for cg in cfgs:
-            o = generate_and_score(sampler_model, metrics, ref_stats, fid_num_images, num_classes, device, ctx, cfg=cg,
-                                   interval=(fid_interval_min, fid_interval_max), steps=num_sampling_steps, method='heun', batch_size=gen_batch_size)
-            res['fid'][str(cg)], res['is'][str(cg)] = o['fid'], o['is']
-            print(f"cfg {cg:g}: FID-{fid_num_images / 1000:g}k {o['fid']:.3f}, IS {o['is']:.1f}")
+        if cfg_search:
+            from jit_common import cfg_search as cfg_search_fn
+            cfg_search_fn(score, cfg_search, cfg_search_min, cfg_search_max)
+            res['cfg_search'] = {'budget': cfg_search, 'range': [cfg_search_min, cfg_search_max]}
+        else:
+            for cg in (float(v) for v in eval_cfgs.split(',') if v.strip()):
+                score(cg)
+    cfgs = [float(c) for c in res['fid']]
     best = min(res['fid'], key=res['fid'].get)
     print(f"iter {iter_num} (epoch {res['epoch']:.1f}): best FID {res['fid'][best]:.3f} at cfg {best}")
-    path = os.path.join(out_dir, f"eval_cfgs_{iter_num}_cfg{'_'.join(f'{c:g}' for c in cfgs)}.json")
+    path = os.path.join(out_dir, f"eval_cfgs_{iter_num}" + (f'_phema{eval_phema:g}' if eval_phema else '')
+                        + (f'_search{cfg_search}' if cfg_search else f"_cfg{'_'.join(f'{c:g}' for c in cfgs)}") + '.json')
     with open(path, 'w') as f:
         json.dump(res, f, indent=1)
     print(f'wrote {path}')
     sys.exit(0)
 
 # training
-sampler = EpochSampler(len(train_data), batch_size, seed=seed)
+sampler = EpochSampler(len(train_data), batch_size, seed=seed, indices=train_rows)
 sampler.epoch = iter_num // iters_per_epoch
 rng = np.random.default_rng(seed + iter_num)
 pool = ThreadPoolExecutor(1) # reads the next batch while the GPU trains on this one
@@ -536,10 +612,12 @@ eval_iters, save_iters = eval_every_epochs * iters_per_epoch, save_every_epochs 
 params = list(net.parameters())
 t_last = time.time()
 while True:
-    if iter_num > 0 and (iter_num % eval_iters == 0 or iter_num == max_iters):
+    if iter_num > 0 and (iter_num % eval_iters == 0 or iter_num == max_iters or iter_num in keep_at):
         best_fid = min(best_fid, evaluate(iter_num))
         t_last = time.time()
-    if iter_num > 0 and (iter_num % save_iters == 0 or iter_num == max_iters):
+    if phema is not None and iter_num > 0 and (iter_num % iters_per_epoch == 0 or iter_num == max_iters or iter_num in keep_at):
+        save_phema_snapshots()
+    if iter_num > 0 and (iter_num % save_iters == 0 or iter_num == max_iters or iter_num in keep_at):
         save_checkpoint()
     if iter_num >= max_iters:
         break
@@ -570,6 +648,8 @@ while True:
         cap = (1 + iter_num) / (10 + iter_num)
         torch._foreach_lerp_(ema1, params, 1 - min(ema_decay1, cap))
         torch._foreach_lerp_(ema2, params, 1 - min(ema_decay2, cap))
+    if phema is not None:
+        phema.update(params, iter_num + 1) # t = optimizer steps taken, counting this one
     iter_num += 1
     if iter_num % log_interval == 0:
         now = time.time()

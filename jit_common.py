@@ -435,6 +435,31 @@ def generate_and_score(model, metrics, ref_stats, num_images, num_classes, devic
     fid, isc = metrics.compute(feats, torch.cat(logits), ref_stats)
     return {'fid': fid, 'is': isc, 'features': feats}
 
+def cfg_search(score, budget, lo=1.0, hi=5.0):
+    """
+    Fixed-budget guidance search (every model gets the same number of evaluations): a uniform start over [lo, hi] (3 points,
+    or the budget if smaller), then each further scale bisects the gap between the current best and its better neighbour
+    (the minimum of a unimodal FID-vs-scale curve lies on that side), until the budget is spent or the gap is < 0.02.
+    score(cfg) -> FID. Returns {cfg: FID} in evaluation order. On synthetic curves, a budget of 6 lands within 0.25 of the
+    optimum anywhere in [1, 5].
+    """
+    res = {}
+    m = min(budget, 3)
+    for c in ([lo] if m == 1 else [float(round(v, 4)) for v in np.linspace(lo, hi, m)]):
+        res[c] = score(c)
+    while len(res) < budget:
+        pts = sorted(res)
+        i = min(range(len(pts)), key=lambda j: res[pts[j]])
+        gaps = [(res[pts[n]], pts[j + 1] - pts[j], j) for j, n in ((i - 1, i - 1), (i, i + 1)) if 0 <= j < len(pts) - 1]
+        if not gaps:
+            break
+        _, width, j = min(gaps)
+        c = float(round((pts[j] + pts[j + 1]) / 2, 4))
+        if width < 0.02 or c in res:
+            break
+        res[c] = score(c)
+    return res
+
 def save_labeled_grid(x, names, path, nrow=8):
     """
     Saves a grid of images ([B, 3, H, W] in [-1, 1]) with each image's class name written underneath.
@@ -607,7 +632,7 @@ _NAME_EXCLUDE = {
     'out_dir', 'runs_root', 'run_name', 'data_root', 'data_dir', 'dataset', 'model', 'depth', 'hidden_size', 'num_heads',
     'patch_size', 'bottleneck_dim', 'in_context_len', 'in_context_start', 'mlp_ratio', 'pixel_depth', 'pixel_dim',
     'epochs', 'batch_size', 'gradient_accumulation_steps', 'eval_every_epochs', 'save_every_epochs', 'keep_ckpt_every_epochs', 'log_interval',
-    'eval_only', 'init_from', 'wandb_log', 'wandb_project', 'wandb_run_name', 'fid_num_images', 'fid_cfg', 'fd_dino',
+    'eval_only', 'init_from', 'wandb_log', 'wandb_project', 'wandb_run_name', 'fid_num_images', 'fid_cfg', 'fd_dino', 'max_updates', 'budget_pflops', 'budget_keep',
     'fid_interval_min', 'fid_interval_max', 'sample_cfg', 'sample_interval_min', 'sample_interval_max',
     'sampling_method', 'sampling_eta', 'num_sampling_steps', 'time_schedule', 'gen_batch_size', 'eval_loss_images',
     'device', 'dtype', 'compile', 'compile_mode', 'attn_res_fused', 'phase_timing', 'profile_steps', 'attn_res_kernel', 'act_memory_budget', 'attn_res_chunk', 'tail_checkpoint', 'tail_chunks', 'attn_impl', 'phema_stds', 'phema_every_epochs', 'phema_dtype', 'alloc_eval', 'alloc_eval_conditions', 'alloc_eval_images', 'alloc_eval_loss_images', 'alloc_eval_ts', 'alloc_eval_show', 'trend_plots', 'progress_gif', 'data_workers', 'data_prefetch', 'quad_route_baseline', 'quad_route_every',
@@ -622,7 +647,7 @@ _NAME_TOKENS = {
     'optimizer_type': '', 'muon_adjust_lr': 'muon-', 'muon_lr': 'muonlr', 'muon_weight_decay': 'muonwd',
     'muon_momentum': 'muonmom', 'muon_ns_steps': 'muonns', 'muon_split_fused': 'muonsplit', 'muon_adaln': 'muonadaln',
     'noise_scale': 'noise', 'P_mean': 'pmean', 'token_sizes': 'tok-', 'fine_frac': 'fine', 'alloc_floor': 'allocfloor', 'alloc_gain': 'allocgain-', 'tail_blocks': 'tail', 'tail_query_patch': 'tailq', 'tail_dim': 'taildim', 'tail_heads': 'tailheads', 'tail_head_dim': 'tailhd', 'tail_query_pos': 'tailpos-', 'attn_gate': 'attngate-', 'in_context_cond': 'iclcond', 'kv_prefix_len': 'kvprefix', 'kv_prefix_start': 'kvprefixstart', 'kv_prefix_depth': 'kvprefixdepth', 'kv_prefix_pool': 'kvpool-', 'kv_prefix_pool_mode': 'kvpoolmode-', 'kv_prefix_pool_init': 'kvpoolinit', 'kv_prefix_mlp': 'kvprefixmlp', 'kv_prefix_class_tokens': 'kvprefixclass', 'kv_prefix_t_bands': 'kvbands', 'kv_prefix_exemplar_n': 'kvexN', 'kv_prefix_exemplar_k': 'kvexK', 'kv_prefix_exemplar_policy': 'kvex-', 'tail_mlp_ratio': 'tailmlp', 'tail_keys': 'tailkeys-', 'loss_freq_weight': 'lossf-', 'loss_freq_table': 'lossftable-', 'loss_t_weight': 'losst-', 'loss_weight_normalize': 'lossnorm', 'P_std': 'pstd', 'P_std_right': 'pstdr', 'data_norm': 'datanorm-', 't_eps': 'teps', 'input_perturb': 'ip', 'label_drop_prob': 'labeldrop',
-    'blr': 'blr', 'lr_schedule': 'lr-', 'min_lr': 'minlr', 'warmup_epochs': 'warmup', 'weight_decay': 'wd',
+    'blr': 'blr', 'lr_schedule': 'lr-', 'min_lr': 'minlr', 'warmup_epochs': 'warmup', 'warmup_updates': 'warmupu', 'aux_lr_mult': 'auxlr', 'train_frac': 'frac', 'weight_decay': 'wd',
     'beta1': 'beta1-', 'beta2': 'beta2-', 'grad_clip': 'clip', 'ema_decay1': 'ema', 'ema_decay2': 'ema2-', 'ema_warmup': 'emawarmup',
     'attn_dropout': 'attndrop', 'proj_dropout': 'projdrop', 'attn_res': 'attnres-', 'attn_res_block_size': 'attnresbs',
     'adaln_single': 'adalnsingle', 'attn_res_adaln': 'attnresadaln', 'gated_bottleneck': 'gatedbn',

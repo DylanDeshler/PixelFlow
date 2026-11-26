@@ -87,3 +87,27 @@ class PowerEMA:
         assert [round(s, 6) for s in state['stds']] == [round(s, 6) for s in self.stds], \
             f"checkpoint has power EMAs {state['stds']}, run asks for {self.stds}"
         self.emas = [[e.to(device) for e in ema] for ema in state['emas']]
+
+
+def reconstruct(snap_dir, at, std):
+    """
+    The power-function EMA with sigma_rel std at step `at`, rebuilt from the snapshots in snap_dir taken at steps <= at (so a
+    budget is never evaluated with later weights). Snapshot files: phema-{t:08d}-{std:.3f}.pt with 'model' (a state dict)
+    and 'params' (the parameter names). Returns {parameter name: float32 tensor} (CPU).
+    """
+    import os
+    import re
+    pattern = re.compile(r'phema-(\d+)-([\d.]+)\.pt$')
+    snaps = sorted((int(m.group(1)), float(m.group(2)), os.path.join(snap_dir, f))
+                   for f in os.listdir(snap_dir) if (m := pattern.match(f)))
+    use = [s for s in snaps if s[0] <= at]
+    assert use and any(s[0] == at for s in use), f'no power-EMA snapshots at step {at} in {snap_dir}'
+    coef = solve_coefficients(np.array([s[0] for s in use]), np.array([s[1] for s in use]), at, [std])[:, 0]
+    acc = None
+    for c, (_, _, path) in zip(coef, use):
+        snap = torch.load(path, map_location='cpu', weights_only=False)
+        if acc is None:
+            acc = {n: torch.zeros_like(snap['model'][n], dtype=torch.float32) for n in snap['params']}
+        for n in acc:
+            acc[n].add_(snap['model'][n].float(), alpha=float(c))
+    return acc

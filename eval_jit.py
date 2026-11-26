@@ -13,6 +13,8 @@ gives the FID/IS Pareto frontier and plots FID, IS, precision/recall vs CFG and 
 sweep). A single scale is scored with --final_num_images directly.
 $ python eval_jit.py --ckpt=runs/in100_128/<model>/<run> --data_dir=/data/in100_128 --cfgs=1.0:4.0:0.25   # sweep at 10k, picks at 50k
 $ python eval_jit.py --ckpt=... --data_dir=/data/in100_128 --cfgs=1.0:4.0:0.25 --sweep_num_images=0      # sweep at 50k, no re-scoring
+$ python eval_jit.py --ckpt=... --data_dir=... --cfg_search=6 --sweep_num_images=8000 --final_num_images=50000  # fixed budget of 6
+  (scales 1, 3, 5, then bisection beside the best; the picks re-scored at 50k with fresh samples)
 --ckpt takes a checkpoint file (ckpt.pt, a milestone ckpt_{iter}.pt, or a released JiT .pth) or a run directory (its ckpt.pt).
 Every network call uses --gen_batch_size samples (it must be even), so the compiled model is built once per run: CFG 1
 generates gen_batch_size images per batch, CFG > 1 gen_batch_size / 2 (conditional + unconditional together), and the
@@ -39,7 +41,7 @@ warnings.filterwarnings('ignore', message=r'\s*Online softmax is disabled') # to
 from PIL import Image
 
 from data_jit import MemmapImages
-from jit_common import load_denoiser, generate_and_score, save_labeled_grid, save_layout_grids
+from jit_common import load_denoiser, generate_and_score, save_labeled_grid, save_layout_grids, cfg_search as cfg_search_fn
 from fid import InceptionMetrics, load_ref_stats, precision_recall
 
 from plot_style import SURFACE, INK, INK_2, GRID, BLUE, ORANGE # validated categorical pair on the light surface
@@ -137,6 +139,11 @@ out_dir = '' # defaults to the checkpoint's dir
 sweep_num_images = 10000 # images per scale during a CFG sweep; 0 (or >= final_num_images) sweeps at final_num_images, no re-scoring
 final_num_images = 50000 # final count: the best-FID and trade-off scales (or the single scale) are scored with this many
 cfgs = '1.0' # guidance scales: comma list (1.0,2.0,3.0) or inclusive range start:stop:step (1.0:4.0:0.25)
+cfg_search = 0 # > 0: a fixed budget of this many scales instead of --cfgs: a uniform start over [cfg_search_min, cfg_search_max]
+               # (3 points, or the budget if smaller), then each further scale bisects the gap between the current best FID
+               # and its better neighbour, until the budget is spent (every model gets the same number of searches)
+cfg_search_min = 1.0
+cfg_search_max = 5.0
 fid_tolerance = 0.05 # trade-off pick: highest IS among scales with FID <= (1 + tol) * best FID
 plot = True # save the CFG sweep plot (needs >= 2 scales)
 interval_min = 0.0
@@ -148,6 +155,8 @@ time_schedule = 'uniform' # 'uniform' (JiT), 'shift' (FLUX/SD3-style, uses the c
 gen_batch_size = 256 # samples per network call (even: halved into conditional + unconditional under CFG)
 quad_route_every = 1 # QuadJiT only: re-route every N network calls while sampling (heun makes 2 per step)
 ema = 1 # which weights to sample with: 1 or 2 = that EMA (JiT uses the first, decay 0.9999), 0 = the raw (non-EMA) weights
+phema_std = 0.0 # > 0: sample with the post-hoc EMA of this sigma_rel instead, rebuilt from the run's phema/ snapshots up to the
+                # checkpoint's step (phema.reconstruct; train with --phema_stds), so a budget is never evaluated with later weights
 seed = 0
 save_samples = '' # '', 'png' or 'npz'
 device = 'cuda'
@@ -186,6 +195,15 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16}[dtype]
 ctx = nullcontext() if (device_type == 'cpu' or dtype == 'float32') else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 denoiser, meta = load_denoiser(ckpt, ema, device) # eval mode: inference only (also keeps the compiled graph from being rebuilt for a train-mode call)
+if phema_std > 0:
+    from phema import reconstruct
+    _run = os.path.dirname(os.path.abspath(ckpt)) if os.path.isfile(ckpt) else ckpt
+    _at = int(meta.get('iter_num') or torch.load(ckpt if os.path.isfile(ckpt) else os.path.join(ckpt, 'ckpt.pt'), map_location='cpu', weights_only=False)['iter_num'])
+    _w = reconstruct(os.path.join(_run, 'phema'), _at, phema_std)
+    with torch.no_grad():
+        for _n, _p in denoiser.named_parameters():
+            _p.copy_(_w[_n].to(_p.device, _p.dtype))
+    print(f"weights: post-hoc EMA sigma_rel {phema_std} at step {_at} (snapshots <= that step in {_run}/phema)")
 denoiser.net.attn_res_chunk = attn_res_chunk
 denoiser.net.attn_res_kernel = attn_res_kernel
 if hasattr(denoiser.net, 'set_attn_impl'):
@@ -235,13 +253,13 @@ def parse_cfgs(spec):
 cfg_list = parse_cfgs(cfgs)
 sampler = f"{sampling_method}{num_sampling_steps}" + (f'_eta{sampling_eta:g}' if sampling_method == 'ancestral' else '') \
           + (f'_routeevery{quad_route_every}' if is_quadtree and quad_route_every > 1 else '') # for file names
-sweeping = len(cfg_list) > 1
+sweeping = len(cfg_list) > 1 or cfg_search > 1
 sweep_n = sweep_num_images if sweeping and 0 < sweep_num_images < final_num_images else final_num_images
 rescore = sweeping and sweep_n < final_num_images
 real_feats = real_features(sweep_n)
 
 results = {'ckpt': ckpt, 'final_num_images': final_num_images, 'sweep_num_images': sweep_n, 'steps': num_sampling_steps, 'method': sampling_method, 'time_schedule': time_schedule,
-           **({'eta': sampling_eta} if sampling_method == 'ancestral' else {}), 'ema': ema,
+           **({'eta': sampling_eta} if sampling_method == 'ancestral' else {}), 'ema': ema, 'phema_std': phema_std,
            'interval': [interval_min, interval_max], 'fid': {}, 'is': {}, 'precision': {}, 'recall': {}}
 class SampleWriter:
     """
@@ -300,12 +318,23 @@ def evaluate_cfg(cfg, n, real, save=True):
     print(f"cfg {cfg}: FID-{n / 1000:g}k {r['fid']:.3f}, IS {r['is']:.1f}{pr_str}")
     return r
 
-if rescore:
-    print(f"CFG sweep over {len(cfg_list)} scales at {sweep_n:,} images each; the picks are re-scored at {final_num_images:,}")
-for cfg in cfg_list:
+def score(cfg):
     r = evaluate_cfg(cfg, sweep_n, real_feats, save=not rescore) # samples are saved by the final evaluation
     for k, v in r.items():
         results[k][str(cfg)] = v
+
+if cfg_search > 0:
+    # fixed-budget search: uniform start, then bisect toward the best's better neighbour (FID is ~unimodal in the scale)
+    print(f"CFG search: {cfg_search} scales at {sweep_n:,} images each over [{cfg_search_min:g}, {cfg_search_max:g}] (jit_common.cfg_search)"
+          + (f"; the picks are re-scored at {final_num_images:,} with fresh samples" if rescore else ''))
+    cfg_search_fn(lambda c: (score(c), results['fid'][str(c)])[1], cfg_search, cfg_search_min, cfg_search_max)
+    cfg_list = sorted(float(c) for c in results['fid'])
+    results['cfg_search'] = {'budget': cfg_search, 'range': [cfg_search_min, cfg_search_max], 'order': list(results['fid'])}
+else:
+    if rescore:
+        print(f"CFG sweep over {len(cfg_list)} scales at {sweep_n:,} images each; the picks are re-scored at {final_num_images:,}")
+    for cfg in cfg_list:
+        score(cfg)
 
 # selections
 fids = {float(c): v for c, v in results['fid'].items()}
@@ -330,6 +359,9 @@ if rescore:
     print(f"\nre-scoring the picks at {final_num_images:,} images")
     final_real = real_features(final_num_images)
     results['final'] = {'num_images': final_num_images}
+    if cfg_search > 0: # the reported numbers come from samples the selection never saw
+        seed += 1
+        results['final']['seed'] = seed
     for c in sorted({best_fid_cfg, tradeoff_cfg}):
         results['final'][str(c)] = evaluate_cfg(c, final_num_images, final_real)
     f = results['final']
