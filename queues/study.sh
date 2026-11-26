@@ -12,9 +12,9 @@
 # Euler decoding) at batch 64 with Muon from the paper's AdamW lr 1e-4 (match_rms_adamw: the AdamW lr carries over).
 # Widths W192 / W256 / S (12 x 192 / 256 / 384, heads of 64); B (12 x 768) held out. Data N, N/2, N/4, N/8 (nested,
 # class-stratified: subsets.py).
-# Run length: every training run (generators and tokenizers) continues until its own curve has converged
-# (jit_common.converged: < 2% improvement over the last third of training at 2 consecutive evals; caps only as safety), so
-# small and large configurations each get the length they need. Generator evals every 5 full-data epochs: unguided
+# Run length: generators train for 100 full-data epochs (subsets: the same number of updates), stopping earlier only if their
+# own curve flattens (jit_common.converged: < 2% improvement over the last third of training at 2 consecutive evals);
+# tokenizers likewise by rFID, capped at the paper's 300k updates. frontier.py treats budgets past a run's end as extrapolated. Generator evals every 5 full-data epochs: unguided
 # FID-10k, a kept checkpoint and post-hoc EMA snapshots (sigma_rel 0.02 / 0.05 / 0.10, bfloat16) each.
 # Evaluation policy (one throughout): guided FID with post-hoc EMA and a fixed budget of 6 guidance scales (uniform 1/3/5
 # then bisection; CFG at all t), searched with 2K samples, the pick re-scored at FID-10K on fresh samples:
@@ -60,7 +60,8 @@ FRACS="1 0.5 0.25 0.125"
 mkdir -p runs/queue_logs "$STUDY/decisions" "$STUDY/args" "$STUDY/runs"
 GPU_LOCK=runs/queue_logs/gpu.lock
 D=$STUDY/decisions
-CAP=400 # full-data epochs: only a safety cap (runs stop at convergence)
+source queues/fast_data.sh # the image arrays on local NVMe for this queue (removed on exit; falls back to $DATA)
+CAP=100 # full-data epochs (subsets: the same number of updates): the run length unless the curve flattens first
 TOK_CAP=300000 # tokenizer updates: the paper's schedule, as a cap
 EVAL="--phema_stds=0.02,0.05,0.10 --phema_dtype=bfloat16 --fid_num_images=10000 --converge_tol=0.02 --converge_patience=2 --warmup_updates=500"
 PIX_BASE="config/jit_in1k_128.py --optimizer_type=muon --data_dir=$DATA $EVAL --diag=False --trend_plots=False --progress_gif=False" # (the diagnostic suite does not feed the study)

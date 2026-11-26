@@ -4,8 +4,8 @@
 #   B  kvtable    the KV prefix as a learned 32-token x 1,000-class table (+ null row)  --kv_prefix_len=32 --kv_prefix_class_tokens=True
 # Both: plain JiT + Muon (match_rms_adamw), batch 1024, 500-update warm-up then constant lr, clean-image prediction, identical
 # data / augmentation. Run length is not fixed: every run trains until its own curve has converged (jit_common.converged:
-# unguided FID-10k improved by < 2% over the last third of training at 2 consecutive evals, never before 20 epochs; 400 epochs
-# is only a cap), because the question is the trade-off between configurations, and the epochs one needs depend on the
+# unguided FID-10k improved by < 2% over the last third of training at 2 consecutive evals, never before 20 epochs), else
+# for 100 epochs (the compute budget's cap), because the question is the trade-off between configurations, and the epochs one needs depend on the
 # configuration (size, data, conditioning). Evals every 5 epochs of full-data training (unguided FID-10k, a kept checkpoint and
 # post-hoc EMA snapshots each, sigma_rel 0.02 / 0.05 / 0.10 in bfloat16), so each run is also a whole FID-vs-compute curve.
 # Selection: the final checkpoint's guided FID, post-hoc EMA sigma_rel 0.10 rebuilt at that step, a fixed budget of 6 guidance
@@ -27,7 +27,8 @@ set -u
 DATA=${JIT_DATA_ROOT:-/data}/in1k_128
 mkdir -p runs/queue_logs runs/conditioning
 GPU_LOCK=runs/queue_logs/gpu.lock
-CAP=400 # epochs: only a cap, runs stop at convergence
+source queues/fast_data.sh # the image arrays on local NVMe for this queue (removed on exit; falls back to $DATA)
+CAP=100 # full-data epochs: the run length unless the curve flattens first
 BASE="config/jit_in1k_128.py --optimizer_type=muon --data_dir=$DATA --warmup_updates=500 --phema_stds=0.02,0.05,0.10 \
 --phema_dtype=bfloat16 --fid_num_images=10000 --converge_tol=0.02 --converge_patience=2 --diag=False --trend_plots=False --progress_gif=False"
 W192="--hidden_size=192 --num_heads=3"

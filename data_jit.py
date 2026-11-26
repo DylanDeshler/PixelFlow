@@ -22,6 +22,23 @@ import numpy as np
 import torch
 
 
+def images_path(data_dir):
+    """
+    {data_dir}/images.u8, or a fast local copy of it when one is staged (fast_data.py): $JIT_FAST_DATA/{absolute data_dir}/
+    images.u8, used only if it exists and is complete (same size), so a missing or partial copy falls back to the original.
+    """
+    orig = os.path.join(data_dir, 'images.u8')
+    fast = os.environ.get('JIT_FAST_DATA')
+    if fast:
+        cand = os.path.join(fast, os.path.abspath(data_dir).lstrip(os.sep), 'images.u8')
+        try:
+            if os.path.getsize(cand) == os.path.getsize(orig):
+                return cand
+        except OSError:
+            pass
+    return orig
+
+
 class MemmapImages:
     def __init__(self, data_dir):
         with open(os.path.join(data_dir, 'meta.json')) as f:
@@ -29,7 +46,7 @@ class MemmapImages:
         self.n = self.meta['n']
         self.img_size = self.meta['img_size']
         self.num_classes = self.meta['num_classes']
-        self.images = np.memmap(os.path.join(data_dir, 'images.u8'), dtype=np.uint8, mode='r',
+        self.images = np.memmap(images_path(data_dir), dtype=np.uint8, mode='r',
                                 shape=(self.n, self.img_size, self.img_size, 3))
         self.labels = np.load(os.path.join(data_dir, 'labels.npy')).astype(np.int64)
 
