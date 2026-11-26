@@ -32,9 +32,9 @@ parser.add_argument('--batch_size', type=int, default=256)
 parser.add_argument('--device', type=str, default='cuda')
 args = parser.parse_args()
 
-from latent_vae import load_vae, SCALE as SCALES, SHORT
-SCALE = SCALES[args.vae] # the VAE's own latent scaling (SD: 0.18215 as DiT / SiT / LDM; MAR KL-16: 0.2325)
-out_dir = args.out_dir or os.path.join(args.data_dir, 'latents_' + SHORT[args.vae])
+from latent_vae import load_vae, scale_of, short_of
+SCALE = scale_of(args.vae) # the VAE's own latent scaling (SD: 0.18215 as DiT / SiT / LDM; MAR KL-16: 0.2325; DiTo: 1, LayerNorm'd)
+out_dir = args.out_dir or os.path.join(args.data_dir, 'latents_' + short_of(args.vae))
 vae = load_vae(args.vae, args.device)
 
 @torch.no_grad()

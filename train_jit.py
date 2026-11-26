@@ -59,7 +59,14 @@ eval_every_epochs = 10 # FID eval
 save_every_epochs = 1 # overwrite ckpt.pt
 keep_ckpt_every_epochs = 0 # also keep ckpt_{iter}.pt (EMA1 weights only, ~0.5 GB for JiT-B) for eval_jit.py / eval_linear.py; 0 = off
 # run length by updates or by compute (the scaling study); each overrides epochs
+keep_ckpt_at_eval = True # keep ckpt_{iter}.pt (EMA1 + what rebuilds the model) and a post-hoc EMA snapshot at every eval
 max_updates = 0 # > 0: exactly this many optimizer updates
+converge_tol = 0.0 # > 0: stop once training has converged by the run's own curve (jit_common.converged): in-loop FID improved by
+                   # less than this (relative) over the last converge_window of training at converge_patience consecutive evals.
+                   # epochs / max_updates / budget_pflops then only cap the run
+converge_window = 0.3333
+converge_patience = 2
+converge_min_epochs = 20.0 # never stop before this many epochs
 budget_pflops = 0.0 # > 0: as many updates as fit in this training compute (updates x effective batch x 3 x measured forward FLOPs)
 budget_keep = '' # milestones as fractions of the run, e.g. '1/16,1/8,1/4,1/2,1': each gets an eval, a kept ckpt_{iter}.pt and a
                  # post-hoc EMA snapshot (so a budget is never evaluated with later weights)
@@ -1427,7 +1434,7 @@ def save_checkpoint():
     tmp_path = os.path.join(out_dir, 'ckpt.pt.tmp')
     torch.save(checkpoint, tmp_path)
     os.replace(tmp_path, os.path.join(out_dir, 'ckpt.pt'))
-    if (keep_iters and iter_num % keep_iters == 0) or iter_num in keep_at:
+    if (keep_iters and iter_num % keep_iters == 0) or iter_num in keep_at or (keep_ckpt_at_eval and (iter_num % eval_iters == 0 or iter_num == max_iters)):
         # milestone for eval_jit.py / eval_linear.py: the EMA1 weights and what's needed to rebuild the model
         torch.save({'model_ema1': ema1, 'denoiser_args': denoiser_args, 'iter_num': iter_num, 'epoch': iter_num / iters_per_epoch,
                     'config': config}, os.path.join(out_dir, f'ckpt_{iter_num}.pt'))
@@ -1441,6 +1448,8 @@ if wandb_log:
     wandb.init(project=wandb_project, name=wandb_run_name, group=dataset, config=config, id=wandb_run_id, resume='allow')
 
 eval_iters = eval_every_epochs * iters_per_epoch
+from jit_common import fid_history, converged
+fid_hist = [h for h in fid_history(out_dir) if h[0] <= iter_num] if converge_tol > 0 else [] # the evals so far (resume)
 save_iters = max(1, save_every_epochs * iters_per_epoch)
 keep_iters = keep_ckpt_every_epochs * iters_per_epoch
 
@@ -1481,6 +1490,16 @@ while True:
         eval_log.update({f"eval_minutes/{k.replace(' / ', '_').replace(' ', '_')}": v for k, v in eval_timer.times.items()})
         print(eval_timer.summary())
         best_fid = min(best_fid, fid)
+        if converge_tol > 0:
+            fid_hist.append((iter_num, float(fid)))
+            _conv, _detail = converged(fid_hist, converge_tol, converge_window, converge_patience, converge_min_epochs * iters_per_epoch)
+            if _detail:
+                print(f"convergence check: {_detail}" + (" -> converged, stopping" if _conv else ""))
+            if _conv and iter_num < max_iters:
+                max_iters = iter_num # this step's checkpoint, snapshots and the loop's exit follow as for the planned end
+                with open(os.path.join(out_dir, 'converged.json'), 'w') as _f:
+                    json.dump({'iter': iter_num, 'epoch': iter_num / iters_per_epoch, 'detail': _detail, 'tol': converge_tol,
+                               'window': converge_window, 'patience': converge_patience}, _f, indent=1)
         extra = ''.join(f", {k.split('/')[-1]} {eval_log[k]:.3f}" for k in ('val/fd_dino', 'val/precision', 'val/recall', 'val/fid_raw', 'mem/nn_ratio') if k in eval_log)
         loss_str = ', '.join(f"{k.split('/')[-1].replace('_', ' ')} {eval_log[k]:.4f}" for k in ('eval/train_loss', 'eval/val_loss') if k in eval_log)
         print(f"iter {iter_num} (epoch {iter_num / iters_per_epoch:.2f}): {loss_str}, FID-{fid_num_images / 1000:g}k {fid:.2f}, IS {eval_log['val/is']:.1f} (cfg {fid_cfg}){extra}")
@@ -1517,9 +1536,9 @@ while True:
     if eval_only:
         break
 
-    if phema is not None and iter_num > 0 and local_iter_num > 0 and (iter_num % phema_iters == 0 or iter_num == max_iters or iter_num in keep_at):
+    if phema is not None and iter_num > 0 and local_iter_num > 0 and (iter_num % phema_iters == 0 or iter_num == max_iters or iter_num in keep_at or iter_num % eval_iters == 0):
         save_phema_snapshots()
-    if iter_num > 0 and local_iter_num > 0 and (iter_num % save_iters == 0 or iter_num == max_iters or (keep_iters and iter_num % keep_iters == 0) or iter_num in keep_at):
+    if iter_num > 0 and local_iter_num > 0 and (iter_num % save_iters == 0 or iter_num == max_iters or (keep_iters and iter_num % keep_iters == 0) or iter_num in keep_at or iter_num % eval_iters == 0):
         save_checkpoint()
         t0 = time.time() # don't count the save in the next iteration's timing
 

@@ -4,7 +4,9 @@ load_vae(name, device) returns an eval-mode module with
   encode_mean(x)  images in [-1, 1] [B, 3, H, W] -> the posterior mean [B, C, H/f, W/f] (unscaled)
   decode_img(z)   unscaled latents -> images in [-1, 1] (unclamped)
 and the usual parameter names (encoder / quant_conv / decoder / post_quant_conv) for counting encoder and decoder params.
-SCALE[name] is the factor latents are multiplied by for the diffusion model (about unit variance), as each VAE's own users set it.
+SCALE[name] / scale_of(name) is the factor latents are multiplied by for the diffusion model (about unit variance), as each VAE's
+own users set it. 'dito:<train_dito.py checkpoint>' loads one of our DiTo tokenizers (LayerNorm'd latents, scale 1; decoding =
+the paper's 50 Euler steps; its measured training compute travels in the checkpoint).
 
   stabilityai/sd-vae-ft-ema   SD's kl-f8 (4 channels, stride 8): trained on OpenImages, decoder fine-tuned on LAION. Scale 0.18215
   stabilityai/sd-vae-ft-mse   (DiT / SiT / LDM). diffusers.
@@ -45,7 +47,36 @@ def _mar_kl16_ckpt():
     return path
 
 
+def is_dito(name):
+    return name.startswith('dito:')
+
+
+def scale_of(name):
+    # DiTo's latents are LayerNorm'd (unit variance per image): used as they are, as the paper does
+    return 1.0 if is_dito(name) else SCALE[name]
+
+
+def short_of(name):
+    # latent directory name; a DiTo checkpoint is named by its run and update: dito-{run}-{iter}
+    if is_dito(name):
+        path = name[5:]
+        run = os.path.basename(os.path.dirname(os.path.abspath(path)))
+        size = os.path.basename(os.path.dirname(os.path.dirname(os.path.abspath(path))))
+        it = os.path.splitext(os.path.basename(path))[0].replace('ckpt_', '').replace('ckpt', 'last')
+        return f'{size}-{run}-{it}'
+    return SHORT[name]
+
+
 def load_vae(name, device):
+    if is_dito(name): # a train_dito.py checkpoint: 'dito:runs/in1k_128/dito-B/base/ckpt_100000.pt'
+        from dito_model import DiTo
+        ck = torch.load(name[5:], map_location='cpu', weights_only=False)
+        vae = DiTo(ck['size'], img_size=ck['img_size'], zaug_p=ck['zaug_p'], render_n_steps=ck['decode_steps'])
+        vae.load_state_dict(ck['model'])
+        vae.encode_mean = lambda x: vae.encode(x) # deterministic (no KL posterior): the LayerNorm'd encoder output
+        vae.decode_img = lambda z: vae.decode(z) # the paper's Euler sampler from fresh noise
+        vae.dito_record = {k: ck[k] for k in ('train_pflops', 'train_gflops_per_image', 'iter_num', 'train_images', 'train_frac', 'size')}
+        return vae.to(device).eval().requires_grad_(False)
     if name == 'mar-kl16':
         from mar_vae import AutoencoderKL as MarKL
         vae = MarKL(embed_dim=16, ch_mult=(1, 1, 2, 2, 4)) # as MAR's main_mar.py builds it

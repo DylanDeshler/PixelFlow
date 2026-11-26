@@ -58,6 +58,12 @@ def vae_training_cost(vae, name, device):
     """
     import torch
     from torch.utils.flop_counter import FlopCounterMode
+    if getattr(vae, 'dito_record', None) is not None: # our own DiTo: its measured training compute travels in the checkpoint
+        r = vae.dito_record
+        return {'vae_train_pflops': r['train_pflops'], 'vae_train_complete': True,
+                'vae_train_stages': [dict(name=f"DiTo-{r['size']} (train_dito.py, {r['train_images']:,} images)", steps=r['iter_num'],
+                                          batch=None, res=None, trains='encoder+decoder', gflops_per_image=r['train_gflops_per_image'],
+                                          pflops=r['train_pflops'], note='measured (FLOP counter) x updates x batch')]}
     if name not in VAE_TRAINING:
         return None
     def flops(fn):

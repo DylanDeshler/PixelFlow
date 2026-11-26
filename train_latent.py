@@ -20,10 +20,12 @@ Row-7 stack (as train_jit.py, same flags): --attn_res=full --adaln_single=True -
 in_context_start) unless --kv_prefix_start is given.
 Model size: --depth / --hidden_size / --num_heads (L: 24 / 1024 / 16, H: 32 / 1280 / 16), as JiT's presets.
 Pipeline cost for comparing with pixel runs (config.json 'resolved', read by plot_runs_html.py / plot_scaling.py):
-  training   train_pflops_offset = the VAE's own training compute (vae_cost.py: its published training stages, FLOPs per
-             image measured on the VAE + loss networks), so training compute = VAE training + images x 3 x trunk forward.
-             The one-off dataset encoding (cached_encoding_pflops) is recorded but not added (~0.1% of the VAE's training)
-  sampling   sample_gflops = network calls (the eval's sampler) x trunk forward + VAE decoder forward (generation never encodes)
+  training   train_pflops_offset = the tokenizer's own training compute (vae_cost.py: published training stages with measured
+             FLOPs per image, or a train_dito.py checkpoint's measured record) + the one-off dataset encoding
+             (cached_encoding_pflops), so training compute = offset + images x 3 x trunk forward. This is what the
+             pixels-vs-latents study compares (training compute only)
+  sampling   sample_gflops = network calls (the eval's sampler) x trunk forward + VAE decoder forward: recorded for reference,
+             not part of the study's comparison
   params     pipeline_params = trunk + VAE encoder + decoder
 Both: label dropout 0.1, EMA 0.9999 / 0.9996 (with train_jit.py's warm-up), noise scale 1 (the scaled latents have about
 unit variance), batch 1024.
@@ -81,7 +83,14 @@ epochs = 20
 batch_size = 1024
 gradient_accumulation_steps = 1 # the batch is split into this many micro-batches (same effective batch / lr; for large models)
 # run length by updates or by compute (the scaling study), as train_jit.py; each overrides epochs
+keep_ckpt_at_eval = True # keep ckpt_{iter}.pt (EMA1) and a post-hoc EMA snapshot at every eval
 max_updates = 0
+converge_tol = 0.0 # > 0: stop once training has converged by the run's own curve (jit_common.converged): in-loop FID improved by
+                   # less than this (relative) over the last converge_window of training at converge_patience consecutive evals.
+                   # epochs / max_updates / budget_pflops then only cap the run
+converge_window = 0.3333
+converge_patience = 2
+converge_min_epochs = 20.0 # never stop before this many epochs
 budget_pflops = 0.0 # trunk training compute: updates x batch x 3 x measured forward FLOPs (tokenizer costs are accounted separately)
 budget_keep = '' # milestones as fractions of the run ('1/16,1/8,1/4,1/2,1'): an eval, a kept ckpt_{iter}.pt and a post-hoc EMA snapshot each
 train_frac = 1.0 # nested class-stratified training subset (subsets.py), shared with train_jit.py
@@ -118,7 +127,11 @@ attn_gate = 'none' # as train_jit.py: 'head' / 'elem' gated attention
 kv_prefix_len = 0 # as train_jit.py: class + learned K/V-only prefix tokens
 kv_prefix_class_tokens = False # as train_jit.py: the prefix is a learned table of kv_prefix_len tokens per class (+ null label)
 kv_prefix_start = -1 # -1: block 4 (JiT-B/16's in_context_start, as the pixel runs)
-in_context_start = 4 # only the KV prefix's default start (no in-context tokens here)
+in_context_len = 0 # JiT's in-context class tokens (prepended at in_context_start), as train_jit.py
+prediction = 'v' # 'v': the network outputs the velocity (SiT); 'x': the clean latent (JiT's x-prediction, same v-loss, v = (x_hat - z_t) / (1 - t))
+t_eps = 0.05 # x-prediction: the (1 - t) clamp, as JiT
+dropout = 0.0 # attention + projection dropout in the middle half of the blocks (JiT's placement), the regularized alternative
+in_context_start = 4 # the in-context tokens' block, and the KV prefix's default start
 loss_t_weight = 'none' # as train_jit.py: 'learned' = EDM2-style learned per-noise-level weight (loss L / e^u(t) + u(t))
 loss_weight_normalize = False
 loss_weight_lr_mult = 50.0
@@ -141,6 +154,8 @@ eval_at = -1 # the step for eval_phema (-1: the latest snapshot step)
 cfg_search = 0 # with --init_from=resume: a fixed budget of guidance scales instead of eval_cfgs (jit_common.cfg_search, as eval_jit.py)
 cfg_search_min = 1.0
 cfg_search_max = 5.0
+eval_final_images = 0 # > 0: the best scale re-scored with this many fresh samples (seed + 1), as eval_jit.py
+eval_out_dir = '' # write the evaluation to {eval_out_dir}/eval_search.json (eval_jit.py's layout)
 fid_interval_min = 0.1
 fid_interval_max = 1.0
 num_sampling_steps = 50
@@ -175,8 +190,8 @@ for k, v in RECIPES[recipe].items(): # the recipe fills what wasn't set explicit
 config = {k: globals()[k] for k in config_keys}
 assert data_dir, 'pass --data_dir (the prepared pixel dataset; latents from prepare_latents.py)'
 assert t_sampling in ('logit_normal', 'uniform') and optimizer_type in ('muon', 'adamw')
-from latent_vae import load_vae, SHORT as VAE_SHORT
-latent_dir = latent_dir or os.path.join(data_dir, 'latents_' + VAE_SHORT[vae])
+from latent_vae import load_vae, short_of
+latent_dir = latent_dir or os.path.join(data_dir, 'latents_' + short_of(vae))
 lmeta = json.load(open(os.path.join(latent_dir, 'meta.json')))
 assert lmeta['vae'] == vae, f'{latent_dir} holds {lmeta["vae"]} latents, but vae = {vae}'
 C, H, W = lmeta['latent_shape']
@@ -185,11 +200,11 @@ if not out_dir: # pixel runs' naming (jit_common's short tokens); size in the mo
     from jit_common import _name_token
     ARCH = {'depth': ('d', 12), 'hidden_size': ('w', 768), 'num_heads': ('h', 12), 'patch_size': ('p', 2)}
     model_dir = 'latent-b2' + ''.join(f'_{a}{config[k]}' for k, (a, d) in ARCH.items() if config[k] != d) \
-                + ('' if vae == _defaults['vae'] else '_' + VAE_SHORT[vae])
+                + ('' if vae == _defaults['vae'] else '_' + short_of(vae))
     changed = [_name_token(k, v) for k, v in config.items()
                if k not in tuple(ARCH) + ('vae', 'data_dir', 'latent_dir', 'runs_root', 'out_dir', 'init_from', 'recipe', 'epochs', 'eval_every_epochs',
                             'save_every_epochs', 'log_interval', 'device', 'dtype', 'compile', 'decode', 'attn_res_chunk', 'gen_batch_size',
-                            'fid_num_images', 'fid_cfg', 'fd_dino', 'eval_cfgs', 'eval_ckpt', 'eval_phema', 'eval_at', 'cfg_search', 'cfg_search_min', 'cfg_search_max', 'keep_ckpt_every_epochs', 'gradient_accumulation_steps', 'max_updates', 'budget_pflops', 'budget_keep', 'phema_stds', 'phema_dtype', 'fid_interval_min', 'fid_interval_max', 'num_sampling_steps', 'probe_blocks',
+                            'fid_num_images', 'fid_cfg', 'fd_dino', 'eval_cfgs', 'eval_ckpt', 'eval_phema', 'eval_at', 'cfg_search', 'cfg_search_min', 'cfg_search_max', 'eval_final_images', 'eval_out_dir', 'keep_ckpt_every_epochs', 'gradient_accumulation_steps', 'max_updates', 'budget_pflops', 'budget_keep', 'phema_stds', 'phema_dtype', 'keep_ckpt_at_eval', 'converge_tol', 'converge_window', 'converge_patience', 'converge_min_epochs', 'fid_interval_min', 'fid_interval_max', 'num_sampling_steps', 'probe_blocks',
                             'probe_ts', 'probe_train_images', 'probe_val_images', 'eval_loss_images', 'seed') # (evaluation / system settings)
                and v != dict(_defaults, **RECIPES[recipe])[k]] # settings that differ from the recipe's (or the script's) values
     out_dir = os.path.join(runs_root, dataset, model_dir, '_'.join([recipe] + changed))
@@ -242,13 +257,22 @@ print(f"recipe {recipe}: {optimizer_type}, lr {lr:.2e}, betas ({beta1}, {beta2})
 
 # network: v-prediction (the output is the velocity)
 net = JiT(input_size=H, patch_size=patch_size, in_channels=C, hidden_size=hidden_size, depth=depth, num_heads=num_heads,
-          num_classes=num_classes, bottleneck_dim=bottleneck_dim, in_context_len=0, in_context_start=in_context_start, attn_res=attn_res,
+          num_classes=num_classes, bottleneck_dim=bottleneck_dim, in_context_len=in_context_len, in_context_start=in_context_start, attn_res=attn_res,
+          attn_drop=dropout, proj_drop=dropout,
           adaln_single=adaln_single, attn_gate=attn_gate, kv_prefix_len=kv_prefix_len, kv_prefix_start=kv_prefix_start,
           kv_prefix_class_tokens=kv_prefix_class_tokens).to(device)
 net.attn_res_chunk = attn_res_chunk
 print(f"network: JiT blocks, {depth} x {hidden_size}, {(H // patch_size) * (W // patch_size)} tokens of {patch_size}x{patch_size}x{C} latent patches, "
       f"{sum(p.numel() for p in net.parameters()) / 1e6:.1f}M params")
 loss_weighter = LossWeighting(noise_scale, t_weight='learned', normalize_learned=loss_weight_normalize).to(device) if loss_t_weight == 'learned' else None
+assert prediction in ('v', 'x'), f"prediction must be 'v' or 'x', got {prediction}"
+def net_v(zt, t, y):
+    # the velocity the sampler integrates and the v-loss compares: the output itself (v-prediction) or, for x-prediction,
+    # (x_hat - z_t) / (1 - t) with JiT's clamp (t = 1 is clean)
+    out = net(zt, t, y)
+    if prediction == 'v':
+        return out
+    return (out.float() - zt.float()) / (1 - t.view(-1, 1, 1, 1)).clamp_min(t_eps)
 assert loss_t_weight in ('none', 'learned'), f"loss_t_weight must be 'none' or 'learned', got {loss_t_weight}"
 
 # pipeline cost, recorded in config.json like train_jit.py's (FLOP counter on one sample; FLOPs = 2 x multiply-adds)
@@ -278,12 +302,12 @@ img_size_px = lmeta.get('img_size', pix.img_size)
 if vae_model is not None:
     _x = torch.randn(1, 3, img_size_px, img_size_px, device=device)
     vae_cost = dict(vae_encoder_params=sum(p.numel() for n, p in vae_model.named_parameters() if n.startswith(('encoder', 'quant_conv'))),
-                    vae_decoder_params=sum(p.numel() for n, p in vae_model.named_parameters() if n.startswith(('decoder', 'post_quant_conv'))),
+                    vae_decoder_params=sum(p.numel() for n, p in vae_model.named_parameters() if n.startswith(('decoder', 'post_quant_conv', 'renderer'))),
                     vae_encode_gflops=_flops(lambda: vae_model.encode_mean(_x)),
                     vae_decode_gflops=_flops(lambda: vae_model.decode_img(torch.randn(1, C, H, W, device=device))))
 else:
     vae_cost = dict(vae_encoder_params=0, vae_decoder_params=0, vae_encode_gflops=0.0, vae_decode_gflops=0.0)
-n_encoded = (len(train_data) + len(val_data)) * 2 # prepare_latents.py encodes both flips of train and val
+n_encoded = n_train * 2 # the training images this run uses, both flips (prepare_latents.py encodes both); held-out encodings are evaluation, not training
 trunk_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
 vae_train = vae_training_cost(vae_model, vae, device) if vae_model is not None else None
 assert vae_train is not None or vae_model is None, f"no training record for {lmeta['vae']} in vae_cost.VAE_TRAINING: add its stages (model card / paper)"
@@ -296,7 +320,7 @@ config['resolved'] = dict(model_name=f'latent-{depth}x{hidden_size}/{patch_size}
                           effective_batch_size=batch_size, iters_per_epoch=iters_per_epoch, max_iters=max_iters, keep_at=sorted(keep_at), train_images=n_train,
                           lr=lr, params=trunk_params, fwd_gflops=fwd_gflops, **vae_cost,
                           pipeline_params=trunk_params + vae_cost['vae_encoder_params'] + vae_cost['vae_decoder_params'],
-                          train_pflops_offset=vae_train['vae_train_pflops'], **vae_train,
+                          train_pflops_offset=vae_train['vae_train_pflops'] + n_encoded * vae_cost['vae_encode_gflops'] / 1e6, **vae_train, # tokenizer training + the one-off dataset encoding
                           cached_encoding_pflops=n_encoded * vae_cost['vae_encode_gflops'] / 1e6,
                           sample_nfe=sample_nfe, sample_gflops=sample_nfe * fwd_gflops + vae_cost['vae_decode_gflops'],
                           latent_shape=[C, H, W], vae=lmeta['vae'], latent_dir=latent_dir)
@@ -311,8 +335,8 @@ for st in vae_train['vae_train_stages']:
     total = 'not counted' if st['pflops'] is None else f"{st['pflops']:,.0f} PFLOPs"
     print(f"  VAE training: {st['name']}: {steps} steps x {st['batch']} at {st['res']}px, {st['trains']}, "
           f"{st['gflops_per_image']:.0f} GFLOPs/image = {total} ({st['note']})")
-print(f"  training compute: VAE {vae_train['vae_train_pflops']:,.0f}{'' if vae_train['vae_train_complete'] else ' (incomplete)'} + trunk {_trunk_pf:,.0f} PFLOPs over this run "
-      f"(cached dataset encoding {config['resolved']['cached_encoding_pflops']:,.0f} PFLOPs, not counted)")
+print(f"  training compute: VAE {vae_train['vae_train_pflops']:,.0f}{'' if vae_train['vae_train_complete'] else ' (incomplete)'} + dataset encoding "
+      f"{config['resolved']['cached_encoding_pflops']:,.0f} + trunk {_trunk_pf:,.0f} PFLOPs over this run (sampling / decoding: not counted)")
 
 disp_captures = []
 if disp_weight > 0:
@@ -446,8 +470,8 @@ class LatentSampler:
         tt = torch.full((len(z),), float(t), device=z.device)
         low, high = self.cfg_interval
         if self.cfg_scale == 1.0 or not (t < high and (low == 0 or t > low)):
-            return net(z, tt, labels).float()
-        both = net(torch.cat([z, z]), torch.cat([tt, tt]), torch.cat([labels, torch.full_like(labels, num_classes)])).float()
+            return net_v(z, tt, labels).float()
+        both = net_v(torch.cat([z, z]), torch.cat([tt, tt]), torch.cat([labels, torch.full_like(labels, num_classes)])).float()
         vc, vu = both.chunk(2)
         return vu + self.cfg_scale * (vc - vu)
 
@@ -516,7 +540,7 @@ def val_loss():
         e = torch.randn(x.shape, generator=g, device=device) * noise_scale
         tt = t.view(-1, 1, 1, 1)
         with ctx:
-            v_hat = net(tt * x + (1 - tt) * e, t, y).float()
+            v_hat = net_v(tt * x + (1 - tt) * e, t, y).float()
         tot += (x - e - v_hat).pow(2).mean().item() * len(x)
     net.train()
     return tot / len(z_np)
@@ -569,7 +593,8 @@ def save_checkpoint():
                 'optimizer': optimizer.state_dict(), 'loss_weighting': loss_weighter.state_dict() if loss_weighter is not None else None, 'iter_num': iter_num, 'best_fid': best_fid, 'train_seconds': train_seconds,
                 'phema': phema.state() if phema is not None else None, 'config': config}, os.path.join(out_dir, 'ckpt.pt.tmp'))
     os.replace(os.path.join(out_dir, 'ckpt.pt.tmp'), os.path.join(out_dir, 'ckpt.pt'))
-    if (keep_ckpt_every_epochs and iter_num % (keep_ckpt_every_epochs * iters_per_epoch) == 0) or iter_num in keep_at: # EMA1 only, for --eval_ckpt
+    if (keep_ckpt_every_epochs and iter_num % (keep_ckpt_every_epochs * iters_per_epoch) == 0) or iter_num in keep_at \
+            or (keep_ckpt_at_eval and (iter_num % eval_iters == 0 or iter_num == max_iters)): # EMA1 only, for --eval_ckpt
         torch.save({'ema1': dict(zip(names, [e.cpu() for e in ema1])), 'iter_num': iter_num, 'config': config},
                    os.path.join(out_dir, f'ckpt_{iter_num}.pt'))
 
@@ -578,7 +603,7 @@ if eval_cfgs or cfg_search: # evaluation only: a guided sweep / search of the re
     res = {'iter': iter_num, 'epoch': iter_num / iters_per_epoch, 'interval': [fid_interval_min, fid_interval_max], 'fid': {}, 'is': {},
            'weights': f'phema {eval_phema}' if eval_phema else (eval_ckpt or 'ema1')}
     def score(cg):
-        o = generate_and_score(sampler_model, metrics, ref_stats, fid_num_images, num_classes, device, ctx, cfg=cg,
+        o = generate_and_score(sampler_model, metrics, ref_stats, fid_num_images, num_classes, device, ctx, cfg=cg, seed=seed,
                                interval=(fid_interval_min, fid_interval_max), steps=num_sampling_steps, method='heun', batch_size=gen_batch_size)
         res['fid'][str(cg)], res['is'][str(cg)] = o['fid'], o['is']
         print(f"cfg {cg:g}: FID-{fid_num_images / 1000:g}k {o['fid']:.3f}, IS {o['is']:.1f}")
@@ -592,8 +617,20 @@ if eval_cfgs or cfg_search: # evaluation only: a guided sweep / search of the re
             for cg in (float(v) for v in eval_cfgs.split(',') if v.strip()):
                 score(cg)
     cfgs = [float(c) for c in res['fid']]
+    best_c = float(min(res['fid'], key=res['fid'].get))
+    res['best_fid_cfg'] = best_c
+    if eval_final_images > 0: # the reported number: samples the search never saw
+        with ema_weights(1):
+            o = generate_and_score(sampler_model, metrics, ref_stats, eval_final_images, num_classes, device, ctx, cfg=best_c, seed=seed + 1,
+                                   interval=(fid_interval_min, fid_interval_max), steps=num_sampling_steps, method='heun', batch_size=gen_batch_size)
+        res['final'] = {'num_images': eval_final_images, 'seed': seed + 1, str(best_c): {'fid': o['fid'], 'is': o['is']}}
+        print(f"re-scored: cfg {best_c:g}: FID-{eval_final_images / 1000:g}k {o['fid']:.3f}, IS {o['is']:.1f} (fresh samples)")
     best = min(res['fid'], key=res['fid'].get)
     print(f"iter {iter_num} (epoch {res['epoch']:.1f}): best FID {res['fid'][best]:.3f} at cfg {best}")
+    if eval_out_dir:
+        os.makedirs(eval_out_dir, exist_ok=True)
+        with open(os.path.join(eval_out_dir, 'eval_search.json'), 'w') as f:
+            json.dump(res, f, indent=1)
     path = os.path.join(out_dir, f"eval_cfgs_{iter_num}" + (f'_phema{eval_phema:g}' if eval_phema else '')
                         + (f'_search{cfg_search}' if cfg_search else f"_cfg{'_'.join(f'{c:g}' for c in cfgs)}") + '.json')
     with open(path, 'w') as f:
@@ -609,15 +646,28 @@ pool = ThreadPoolExecutor(1) # reads the next batch while the GPU trains on this
 fetch = lambda: train_data.get(sampler.next(), flip=True, rng=rng)
 pending = pool.submit(fetch)
 eval_iters, save_iters = eval_every_epochs * iters_per_epoch, save_every_epochs * iters_per_epoch
+from jit_common import fid_history, converged
+fid_hist = [h for h in fid_history(out_dir) if h[0] <= iter_num] if converge_tol > 0 else [] # the evals so far (resume)
 params = list(net.parameters())
 t_last = time.time()
 while True:
     if iter_num > 0 and (iter_num % eval_iters == 0 or iter_num == max_iters or iter_num in keep_at):
-        best_fid = min(best_fid, evaluate(iter_num))
+        _fid = evaluate(iter_num)
+        best_fid = min(best_fid, _fid)
+        if converge_tol > 0:
+            fid_hist.append((iter_num, float(_fid)))
+            _conv, _detail = converged(fid_hist, converge_tol, converge_window, converge_patience, converge_min_epochs * iters_per_epoch)
+            if _detail:
+                print(f"convergence check: {_detail}" + (" -> converged, stopping" if _conv else ""))
+            if _conv and iter_num < max_iters:
+                max_iters = iter_num # this step's checkpoint, snapshots and the loop's exit follow as for the planned end
+                with open(os.path.join(out_dir, 'converged.json'), 'w') as _f:
+                    json.dump({'iter': iter_num, 'epoch': iter_num / iters_per_epoch, 'detail': _detail, 'tol': converge_tol,
+                               'window': converge_window, 'patience': converge_patience}, _f, indent=1)
         t_last = time.time()
-    if phema is not None and iter_num > 0 and (iter_num % iters_per_epoch == 0 or iter_num == max_iters or iter_num in keep_at):
+    if phema is not None and iter_num > 0 and (iter_num % iters_per_epoch == 0 or iter_num == max_iters or iter_num in keep_at or iter_num % eval_iters == 0):
         save_phema_snapshots()
-    if iter_num > 0 and (iter_num % save_iters == 0 or iter_num == max_iters or iter_num in keep_at):
+    if iter_num > 0 and (iter_num % save_iters == 0 or iter_num == max_iters or iter_num in keep_at or iter_num % eval_iters == 0):
         save_checkpoint()
     if iter_num >= max_iters:
         break
@@ -632,7 +682,7 @@ while True:
         t = sample_t(len(x)).view(-1, 1, 1, 1)
         e = torch.randn_like(x) * noise_scale
         with ctx:
-            v_hat = net(t * x + (1 - t) * e, t.flatten(), y)
+            v_hat = net_v(t * x + (1 - t) * e, t.flatten(), y)
             if loss_weighter is not None: # learned per-level weight on the per-sample v-loss (train_jit.py's residual is the same v - v_hat)
                 loss = loss_weighter(x - e - v_hat.float(), t.flatten())
             else:

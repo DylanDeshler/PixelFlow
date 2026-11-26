@@ -33,8 +33,8 @@ parser.add_argument('--batch_size', type=int, default=250)
 parser.add_argument('--device', type=str, default='cuda')
 args = parser.parse_args()
 
-from latent_vae import SHORT
-latent_dir = args.latent_dir or os.path.join(args.data_dir, 'latents_' + SHORT[args.vae])
+from latent_vae import short_of
+latent_dir = args.latent_dir or os.path.join(args.data_dir, 'latents_' + short_of(args.vae))
 lmeta = json.load(open(os.path.join(latent_dir, 'meta.json')))
 val = MemmapImages(os.path.join(args.data_dir, 'val'))
 z_all = np.load(os.path.join(latent_dir, 'val', 'latents.npy'), mmap_mode='r') # [N, 2 flips, C, H, W]

@@ -4,6 +4,7 @@ EMA weight swapping, and FID evaluation of generated samples.
 """
 
 import os
+import json
 from types import SimpleNamespace
 from contextlib import contextmanager
 
@@ -435,6 +436,38 @@ def generate_and_score(model, metrics, ref_stats, num_images, num_classes, devic
     fid, isc = metrics.compute(feats, torch.cat(logits), ref_stats)
     return {'fid': fid, 'is': isc, 'features': feats}
 
+def fid_history(out_dir):
+    """[(iter, in-loop FID)] from a run's diagnostics/diag_*.json (both trainers write them), sorted; for resuming the
+    convergence rule."""
+    import glob
+    h = []
+    for f in glob.glob(os.path.join(out_dir, 'diagnostics', 'diag_*.json')):
+        r = json.load(open(f))
+        if r.get('scalars', {}).get('val/fid') is not None:
+            h.append((int(r['iter']), float(r['scalars']['val/fid'])))
+    return sorted(h)
+
+def converged(history, tol, window=1 / 3, patience=2, min_iter=0):
+    """
+    Scale-free convergence rule for constant-lr runs, so every configuration (tiny or large, any data size) trains until its
+    own curve flattens rather than for a fixed number of epochs: an eval counts as flat when FID improved by less than tol
+    (relative) over the last `window` of training (vs the latest eval at or before (1 - window) x its step); the run has
+    converged after `patience` consecutive flat evals at steps >= min_iter. A power law F ~ t^-a improves by 1 - (2/3)^a over
+    the last third (11% at a = 0.3), so tol = 0.02 means the curve has flattened to a < ~0.05. Returns (converged, detail).
+    """
+    flat = 0
+    detail = ''
+    for k, (it, f) in enumerate(history):
+        prev = [(i, g) for i, g in history[:k] if i <= (1 - window) * it]
+        if it < min_iter or not prev:
+            flat = 0
+            continue
+        i0, f0 = prev[-1]
+        gain = 1 - f / f0
+        flat = flat + 1 if gain < tol else 0
+        detail = f'FID {f0:.2f} at {i0} -> {f:.2f} at {it} ({gain:+.1%} over the last {1 - i0 / it:.0%} of training)'
+    return flat >= patience, detail
+
 def cfg_search(score, budget, lo=1.0, hi=5.0):
     """
     Fixed-budget guidance search (every model gets the same number of evaluations): a uniform start over [lo, hi] (3 points,
@@ -632,7 +665,7 @@ _NAME_EXCLUDE = {
     'out_dir', 'runs_root', 'run_name', 'data_root', 'data_dir', 'dataset', 'model', 'depth', 'hidden_size', 'num_heads',
     'patch_size', 'bottleneck_dim', 'in_context_len', 'in_context_start', 'mlp_ratio', 'pixel_depth', 'pixel_dim',
     'epochs', 'batch_size', 'gradient_accumulation_steps', 'eval_every_epochs', 'save_every_epochs', 'keep_ckpt_every_epochs', 'log_interval',
-    'eval_only', 'init_from', 'wandb_log', 'wandb_project', 'wandb_run_name', 'fid_num_images', 'fid_cfg', 'fd_dino', 'max_updates', 'budget_pflops', 'budget_keep',
+    'eval_only', 'init_from', 'wandb_log', 'wandb_project', 'wandb_run_name', 'fid_num_images', 'fid_cfg', 'fd_dino', 'max_updates', 'budget_pflops', 'budget_keep', 'keep_ckpt_at_eval', 'converge_tol', 'converge_window', 'converge_patience', 'converge_min_epochs',
     'fid_interval_min', 'fid_interval_max', 'sample_cfg', 'sample_interval_min', 'sample_interval_max',
     'sampling_method', 'sampling_eta', 'num_sampling_steps', 'time_schedule', 'gen_batch_size', 'eval_loss_images',
     'device', 'dtype', 'compile', 'compile_mode', 'attn_res_fused', 'phase_timing', 'profile_steps', 'attn_res_kernel', 'act_memory_budget', 'attn_res_chunk', 'tail_checkpoint', 'tail_chunks', 'attn_impl', 'phema_stds', 'phema_every_epochs', 'phema_dtype', 'alloc_eval', 'alloc_eval_conditions', 'alloc_eval_images', 'alloc_eval_loss_images', 'alloc_eval_ts', 'alloc_eval_show', 'trend_plots', 'progress_gif', 'data_workers', 'data_prefetch', 'quad_route_baseline', 'quad_route_every',
