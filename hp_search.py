@@ -51,7 +51,7 @@ def score(v):
         return None
     done = os.path.exists(os.path.join(d, 'settled.json')) or os.path.islink(d) or cid(v) in alias.values()
     pts = predict_fid.history(d, 'val/guided_fid', a.max_epochs)
-    return predict_fid.predict(pts, a.target_epochs) if (done and len(pts) >= 3) else None
+    return predict_fid.predict(pts, a.target_epochs, predict_fid.floor_of(d)) if (done and len(pts) >= 3) else None
 
 
 seq = json.load(open(seq_path)) if os.path.exists(seq_path) else []

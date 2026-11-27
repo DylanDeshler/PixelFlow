@@ -31,7 +31,26 @@ parser.add_argument('--latent_dir', type=str, default='', help='default: {data_d
 parser.add_argument('--num_images', type=int, default=10000)
 parser.add_argument('--batch_size', type=int, default=250)
 parser.add_argument('--device', type=str, default='cuda')
+parser.add_argument('--real_only', action='store_true', help='only the real held-out images\' FID (the floor every model shares): {data_dir}/fid_real_{n}k.json')
 args = parser.parse_args()
+tag = '' if args.num_images == 10000 else f'_{args.num_images // 1000}k' # rfid.json (10K) or rfid_2k.json etc.
+
+if args.real_only: # the shared floor at this sample count: balanced held-out images vs the training reference stats, no tokenizer
+    val = MemmapImages(os.path.join(args.data_dir, 'val'))
+    labels = np.asarray(val.labels); classes = int(labels.max()) + 1; per = args.num_images // classes
+    idx = np.sort(np.concatenate([np.flatnonzero(labels == c)[:per] for c in range(classes)]))
+    ref_path = os.path.join(args.data_dir, 'fid_stats_jit.npz')
+    ref_stats = load_ref_stats(ref_path if os.path.exists(ref_path) else os.path.join(args.data_dir, 'fid_stats.npz'))
+    metrics = InceptionMetrics(args.device)
+    feats = []
+    for s in bar(range(0, len(idx), args.batch_size), f'real held-out features ({len(idx)} images)'):
+        x_u8, _ = val.get(idx[s:s + args.batch_size])
+        feats.append(metrics.features(torch.from_numpy(x_u8).to(args.device).permute(0, 3, 1, 2))[0])
+    fid = frechet_distance(torch.cat(feats), ref_stats, args.device)
+    path = os.path.join(args.data_dir, f'fid_real_{args.num_images // 1000}k.json')
+    json.dump({'num_images': len(idx), 'fid_real': fid, 'ref_stats': ref_path}, open(path, 'w'), indent=2)
+    print(f'FID-{len(idx) / 1000:g}k of real held-out images: {fid:.2f}; wrote {path}')
+    raise SystemExit
 
 from latent_vae import short_of
 latent_dir = args.latent_dir or os.path.join(args.data_dir, 'latents_' + short_of(args.vae))
@@ -72,7 +91,7 @@ for s in bar(range(0, len(idx), args.batch_size), f'real + reconstructed feature
 res = {k: frechet_distance(torch.cat(v), ref_stats, args.device) for k, v in feats.items()}
 psnr = 10 * np.log10(4.0 / (mse / len(idx))) # images in [-1, 1]: peak-to-peak 2
 out = {'num_images': len(idx), 'ref_stats': ref_path, 'vae': lmeta['vae'], 'fid_real': res['real'], 'rfid': res['recon'], 'psnr': psnr}
-with open(os.path.join(latent_dir, 'rfid.json'), 'w') as f:
+with open(os.path.join(latent_dir, f'rfid{tag}.json'), 'w') as f:
     json.dump(out, f, indent=2)
 print(f"FID-{len(idx) / 1000:g}k vs {os.path.basename(ref_path)}: real held-out images {res['real']:.2f} (the shared floor), "
-      f"VAE reconstructions {res['recon']:.2f} (the latent floor); reconstruction PSNR {psnr:.2f} dB\nwrote {os.path.join(latent_dir, 'rfid.json')}")
+      f"VAE reconstructions {res['recon']:.2f} (the latent floor); reconstruction PSNR {psnr:.2f} dB\nwrote {os.path.join(latent_dir, f'rfid{tag}.json')}")

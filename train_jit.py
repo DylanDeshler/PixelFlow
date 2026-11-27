@@ -62,8 +62,8 @@ keep_ckpt_every_epochs = 0 # also keep ckpt_{iter}.pt (EMA1 weights only, ~0.5 G
 keep_ckpt_at_eval = True # keep ckpt_{iter}.pt (EMA1 + what rebuilds the model) and a post-hoc EMA snapshot at every eval
 max_updates = 0 # > 0: exactly this many optimizer updates
 # in-loop guided FID (the study's predictions): at every eval, guided FID of the post-hoc EMA guided_eval_std (one of the tracked
-# phema_stds, used directly: no reconstruction) with a small CFG search: 6 scales the first time (jit_common.cfg_search over
-# [1, 5]), then the previous best and its neighbours +- 0.5; logged as val/guided_fid and val/guided_cfg
+# phema_stds, used directly: no reconstruction) with a small CFG search: 6 scales the first time (jit_common.cfg_search from
+# g = 3, in log strength), then the previous best's strength (g - 1) x 0.8 / 1 / 1.25; logged as val/guided_fid and val/guided_cfg
 guided_eval = False
 guided_eval_images = 2000
 guided_eval_std = 0.10
@@ -346,6 +346,7 @@ diag_memorization = False # 7: nearest training image of each sample (Inception 
                          # (train_inception.npy: ~5 GB on ImageNet, read from disk if not cached) per eval
 diag_opt_stats = True # 4: grad norms and update/weight ratios per block, every log_interval
 # system
+seed = 0
 device = 'cuda'
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float32'
 compile = True # torch.compile the whole network; False disables dynamo entirely
@@ -555,7 +556,7 @@ if init_from == 'scratch':
         print(f"{out_dir} already had a run (init_from='scratch'): moved {', '.join(old)} to {prev}")
 samples_dir = os.path.join(out_dir, 'samples') # every generated sample grid
 os.makedirs(samples_dir, exist_ok=True)
-torch.manual_seed(1337)
+torch.manual_seed(1337 + seed)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
@@ -585,7 +586,7 @@ if train_frac < 1:
     _sub = subset_rows(data_dir, data.labels, train_frac)
     train_rows = _sub if train_rows is None else np.intersect1d(train_rows, _sub)
     print(f"training subset: {train_frac:g} of the data, {len(train_rows):,} images (nested, class-stratified: {data_dir}/subsets/)")
-sampler = EpochSampler(len(data), batch_size, indices=train_rows)
+sampler = EpochSampler(len(data), batch_size, seed=seed, indices=train_rows)
 effective_batch_size = batch_size * gradient_accumulation_steps
 iters_per_epoch = sampler.n // effective_batch_size
 assert iters_per_epoch > 0, f'effective batch {effective_batch_size} is larger than the dataset ({len(data):,} images); lower batch_size / gradient_accumulation_steps'
@@ -1062,6 +1063,15 @@ eval_timer = EvalTimer()
 import predict_fid
 FULL_TRAIN = predict_fid.FULL_TRAIN
 hist_fid, hist_gfid = [], [] # (full-data epochs, FID) of the evals so far (refilled from the diagnostics on resume)
+_pred_floor = None
+def pred_floor():
+    # the guided FID's floor at the in-loop sample count (predict_fid.floor_of: real held-out images for pixels, the tokenizer's
+    # reconstructions for latents); predictions are F = floor + A x^-a
+    global _pred_floor
+    if _pred_floor is None:
+        _pred_floor = predict_fid.floor_of(out_dir, int(round(guided_eval_images / 1000)))
+        print(f"prediction floor (guided FID-{guided_eval_images / 1000:g}k): {_pred_floor:.2f}")
+    return _pred_floor
 guided_cfg_prev = None
 
 @torch.no_grad()
@@ -1082,9 +1092,9 @@ def guided_eval_log(step):
     try:
         if guided_cfg_prev is None:
             from jit_common import cfg_search
-            cfg_search(score, 6, 1.0, 5.0)
+            cfg_search(score, 6, 3.0)
         else:
-            for c in sorted({max(1.0, guided_cfg_prev - 0.5), guided_cfg_prev, guided_cfg_prev + 0.5}): # (no upper cap)
+            for c in sorted({float(f'{1 + (guided_cfg_prev - 1) * m:.4g}') for m in (0.8, 1.0, 1.25)}): # the previous best's strength x 0.8 / 1 / 1.25
                 score(float(c))
     finally:
         for p, b in zip(params, backup):
@@ -1150,8 +1160,8 @@ def evaluate(step):
     hist_fid.append((step * effective_batch_size / FULL_TRAIN, out['fid']))
     if 'val/guided_fid' in log:
         hist_gfid.append((step * effective_batch_size / FULL_TRAIN, log['val/guided_fid']))
-    for key, h in (('pred/fid_at_target', hist_fid), ('pred/guided_at_target', hist_gfid)):
-        v = predict_fid.predict(h, settle_target_epochs)
+    for key, h, fl in (('pred/fid_at_target', hist_fid, 0.0), ('pred/guided_at_target', hist_gfid, pred_floor())):
+        v = predict_fid.predict(h, settle_target_epochs, fl)
         if v is not None:
             log[key] = v
     if fd_dino:
@@ -1521,7 +1531,7 @@ if iter_num > 0 and os.path.isdir(os.path.join(out_dir, 'diagnostics')): # the p
     hist_gfid[:] = [h for h in predict_fid.history(out_dir, 'val/guided_fid') if h[0] <= _cut]
     _cfgs = [h for h in predict_fid.history(out_dir, 'val/guided_cfg') if h[0] <= _cut]
     guided_cfg_prev = _cfgs[-1][1] if _cfgs else None
-settle_preds = [p for p in (predict_fid.predict(hist_gfid[:i], settle_target_epochs) for i in range(1, len(hist_gfid) + 1))]
+settle_preds = [p for p in (predict_fid.predict(hist_gfid[:i], settle_target_epochs, pred_floor()) for i in range(1, len(hist_gfid) + 1))]
 save_iters = max(1, save_every_epochs * iters_per_epoch)
 keep_iters = keep_ckpt_every_epochs * iters_per_epoch
 

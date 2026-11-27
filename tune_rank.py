@@ -33,7 +33,7 @@ rows = []
 for i in a.ids:
     d = os.path.join(a.study, 'runs', i)
     pts = predict_fid.history(d, 'val/guided_fid', a.max_epochs) # the in-loop guided curve (up to the candidates' length)
-    proj = predict_fid.predict(pts, a.target_epochs)
+    proj = predict_fid.predict(pts, a.target_epochs, predict_fid.floor_of(d))
     assert proj is not None, f'{i}: {len(pts)} guided evals, need >= 3'
     uproj = predict_fid.predict(predict_fid.history(d, 'val/fid', a.max_epochs), a.target_epochs)
     E, F = (np.array(pts).T if pts else ([], []))

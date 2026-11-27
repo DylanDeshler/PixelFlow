@@ -198,6 +198,7 @@ print(json.dumps(rec))" "$1" "$2" "$3" "$4" "$5" "$(rdir "$1")" >> "$m"
 
 # ---- 0. subsets, preflight ---------------------------------------------------------------------------------------------------
 step study_subsets python subsets.py --data_dir=$DATA --fracs=1,0.5,0.25,0.125
+step study_real_floor python latent_rfid.py --data_dir=$DATA --real_only --num_images=2000 # the pixel runs' prediction floor (FID-2K of real images)
 if [ "${PREFLIGHT:-1}" = 1 ]; then # every new code path for a few minutes, so a crash shows now rather than days in (runs/study/preflight)
     P=$STUDY/preflight
     step pre_pixel python train_jit.py $PIX_BASE $(width_flags 192) --kv_prefix_len=32 --kv_prefix_class_tokens=True --aux_lr_mult=0.5 \
@@ -240,7 +241,7 @@ best = None
 for i in sys.argv[2:]:
     d = os.path.join(sys.argv[1], 'runs', i)
     if not os.path.exists(os.path.join(d, 'config.json')): continue
-    p = predict_fid.predict(predict_fid.history(d, 'val/guided_fid', $CAND_MAX), $CAP)
+    p = predict_fid.predict(predict_fid.history(d, 'val/guided_fid', $CAND_MAX), $CAP, predict_fid.floor_of(d))
     if p is not None and (best is None or p < best): best = p
 print(best * $KILL if best else 0)" "$STUDY" "$@"
 }
@@ -265,6 +266,27 @@ if g and s.get('pred_guided'):
     json.dump({'predicted': s['pred_guided'], 'measured': m, 'stopped_at_epochs': s['epochs']}, open(d + '/prediction_check.json', 'w'))" "$dir" "$id"
     return 0
 }
+backfill_guided() { # id: a pixel run trained without the in-loop guided FID: score its kept checkpoints up to $CAND_MAX epochs the way
+                   # the in-loop eval does (post-hoc EMA 0.10 at that step, 2K samples; the 6-scale search at the first checkpoint, then
+                   # the previous best's strength x 0.8 / 1 / 1.25) and write val/guided_fid / val/guided_cfg into its diagnostics
+    local id=$1 dir it prev=""; dir=$(rdir "$id")
+    for it in $(python -c "
+import glob, re, sys
+its = sorted(int(re.search(r'ckpt_(\d+)\.pt$', f).group(1)) for f in glob.glob(sys.argv[1] + '/ckpt_*.pt'))
+print(' '.join(str(i) for i in its if i * 1024 / 1281167 <= $CAND_MAX + 1e-6))" "$dir"); do
+        if python -c "import json, sys; sys.exit(0 if 'val/guided_fid' in json.load(open(sys.argv[1]))['scalars'] else 1)" "$dir/diagnostics/diag_$it.json"; then
+            prev=$(python -c "import json, sys; print(json.load(open(sys.argv[1]))['scalars']['val/guided_cfg'])" "$dir/diagnostics/diag_$it.json"); continue
+        fi
+        local search; [ -z "$prev" ] && search="--cfg_search=6" || search="--cfgs=$(python -c "print(','.join(sorted({f'{1 + ($prev - 1) * m:.4g}' for m in (0.8, 1.0, 1.25)}, key=float)))")"
+        eval_one "${id}_bg$it" "$id" pixel "$it" 0.10 2000 2000 "$dir/eval_backfill_$it" "$search"
+        done_ok "${id}_bg$it" || return 1
+        prev=$(python -c "
+import json, glob, sys
+r = json.load(open(glob.glob(sys.argv[1] + '/eval_*.json')[0])); c = min(r['fid'], key=r['fid'].get)
+d = json.load(open(sys.argv[2])); d['scalars'].update({'val/guided_fid': r['fid'][c], 'val/guided_cfg': float(c), 'val/guided_backfilled': True})
+json.dump(d, open(sys.argv[2], 'w')); print(float(c))" "$dir/eval_backfill_$it" "$dir/diagnostics/diag_$it.json")
+    done
+}
 scale_lr() { python -c "print(f'{float(\"$1\") * float(\"$2\"):g}')"; } # lr factor
 lr_of() { grep -o -- '--blr=[^ ]*' "$STUDY/args/$1.txt" | tail -1 | cut -d= -f2; }
 LR_BUDGET=4 # candidates per learning-rate search (x2 until bracketed, then log bisection toward the better neighbour)
@@ -281,7 +303,7 @@ lr_search() { # name family frac start budget prefix alias(value=id or -) fixed-
         v=$(python hp_search.py next $hs) || return 1
         case $v in done) break ;; wait) echo "=== $name: a candidate has not finished; stopping" >&2; return 1 ;; esac
         if [ "$al" != - ] && python -c "import sys; sys.exit(0 if abs(float('$v') - float('${al%%=*}')) < 1e-12 else 1)"; then
-            : # the alias run (a finished full run at this value) is the candidate
+            backfill_guided "${al#*=}" >&2 || return 1 # the alias run (a finished full run at this value) is the candidate; its guided curve if missing
         else
             short "$prefix$v" "$fam" "$frac" "$(kill_at $(python hp_search.py ids $hs))" "$@" --blr=$v >&2
         fi
@@ -351,6 +373,8 @@ echo "=== conditioning: $ARM; pixel noise scale $NOISE"
 AL=-; [ "$ARM" = kvtable ] && [ "$NOISE" = 1.0 ] && AL=1e-4=cond_kvtable
 [ "$ARM" = incontext ] && [ "$NOISE" = 1.0 ] && AL=1e-4=cond_incontext
 [ "$ARM" = incontext ] && [ "$NOISE" = 0.5 ] && AL=1e-4=cond_incontext_n05
+# (conditioning.sh's in-context runs predate the in-loop guided FID: lr_search rebuilds an alias run's guided curve from its kept
+#  checkpoints when the search proposes its value)
 LW1=$(lr_search pixel_lr pixel 1 2e-4 $LR_BUDGET tune_pix_lr $AL $(width_flags 192) $COND --noise_scale=$NOISE) || exit 1
 PIX_LR=$(lr_of "$LW1")
 PW=$(wd_search pixel_wd pixel 1 $PIX_LR "$LW1" tune_pix_wd $(width_flags 192) $COND --noise_scale=$NOISE) || exit 1
@@ -382,6 +406,7 @@ latents() { # tokenizer checkpoint: encode the dataset (both flips) and its rFID
     [ -e "$ck" ] || { echo "=== tokenizer checkpoint $ck does not exist: stopping"; exit 1; }
     step "lat_$tag" python prepare_latents.py --data_dir=$DATA --vae=dito:$ck
     step "rfid_$tag" python latent_rfid.py --data_dir=$DATA --vae=dito:$ck
+    step "rfid2k_$tag" python latent_rfid.py --data_dir=$DATA --vae=dito:$ck --num_images=2000 # the latent runs' prediction floor
 }
 study_tokenizer() { # frac: the study's tokenizer for this data size (its own subset, the chosen lr) to T100; T25 / T100 latents
     local id; id=$(tok_id $1 $TOK_LR)
@@ -411,6 +436,26 @@ done
 TW=$(rank tok_lr $(python hp_search.py ids $TS)) || exit 1
 TOK_LR=${TW##*_lr}
 study_tokenizer 1 # the winning candidate resumes to T100
+# headroom check: the tokenizer's reconstruction FID-10K (the latent family's floor) against the best pixel final FID-10K so far
+# (W192 and S, tuned); a floor above TOK_FLOOR_RATIO of it means latents may be bottlenecked by reconstruction at larger widths
+if [ ! -e "$D/tok_floor.txt" ]; then
+    rf=$(python -c "
+import json, os, sys
+ck = os.path.abspath(sys.argv[2]) # latent_vae.short_of for a DiTo checkpoint: {size dir}-{run dir}-{update}
+short = '-'.join([os.path.basename(os.path.dirname(os.path.dirname(ck))), os.path.basename(os.path.dirname(ck)),
+                  os.path.splitext(os.path.basename(ck))[0].replace('ckpt_', '')])
+print(json.load(open(os.path.join(sys.argv[1], 'latents_' + short, 'rfid.json')))['rfid'])" "$DATA" "$(tok_full 1)" 2>/dev/null)
+    bp=$(for i in $PW $SW; do eval_fid "$(rdir $i)/eval_final"; done | sort -g | head -1)
+    if [ -z "$rf" ] || [ -z "$bp" ]; then echo "=== tokenizer floor check: missing rFID ('$rf') or pixel FID ('$bp'); stopping"; exit 1; fi
+    ratio=$(python -c "print(float('$rf') / float('$bp'))")
+    echo ">>> tokenizer floor: DiTo-$TOK_SIZE T100 rFID-10K $rf vs best pixel FID-10K so far $bp (ratio $ratio; limit ${TOK_FLOOR_RATIO:-0.5})"
+    if python -c "import sys; sys.exit(0 if float('$ratio') > float('${TOK_FLOOR_RATIO:-0.5}') else 1)" && [ "${ACCEPT_TOK_FLOOR:-0}" != 1 ]; then
+        echo "=== the tokenizer's floor leaves little headroom below pixel FID: rerun with TOK_SIZE=B (a larger tokenizer; decisions under"
+        echo "    runs/study/decisions/tok_* and the tokenizer runs would be redone), or ACCEPT_TOK_FLOOR=1 to continue with DiTo-$TOK_SIZE"
+        exit 1
+    fi
+    echo "$rf $bp $ratio" > "$D/tok_floor.txt"
+fi
 echo "=== tokenizer: DiTo-$TOK_SIZE at lr $TOK_LR"
 
 # ---- 5. latent lr (D8) and weight decay (D9), W192, full data, T_full -------------------------------------------------------------------

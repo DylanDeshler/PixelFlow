@@ -468,35 +468,36 @@ def converged(history, tol, window=1 / 3, patience=2, min_iter=0):
         detail = f'FID {f0:.2f} at {i0} -> {f:.2f} at {it} ({gain:+.1%} over the last {1 - i0 / it:.0%} of training)'
     return flat >= patience, detail
 
-def cfg_search(score, budget, lo=1.0, hi=5.0):
+def cfg_search(score, budget, start=3.0, ratio=1.1):
     """
-    Fixed-budget guidance search (every model gets the same number of evaluations): a uniform start over [lo, hi] (3 points,
-    or the budget if smaller); then, while the best scale is the largest tried, the next is one start-spacing above it (the
-    optimum can lie past hi: small or under-trained models want strong guidance); once the best has a larger neighbour, each
-    further scale bisects the gap between the best and its better neighbour (the minimum of a unimodal FID-vs-scale curve lies
-    on that side). Stops at the budget or when the gap is < 0.02. lo is a floor (scales below 1 are not guidance).
-    score(cfg) -> FID. Returns {cfg: FID} in evaluation order.
+    Fixed-budget guidance search (every model gets the same number of evaluations), in log space of the guidance strength
+    w = g - 1 (g = 1 is no guidance; optima vary by multiples across models: small or under-trained models want w ~ 8+, strong
+    ones w ~ 0.5): start at g = `start`; the next is w x 2; while the best is the largest (smallest) w tried, double (halve)
+    past it; once bracketed, each further scale is the geometric midpoint (in w) between the best and its better neighbour.
+    Stops at the budget or when that bracket is narrower than `ratio`. score(cfg) -> FID; returns {cfg: FID} in order.
     """
     res = {}
-    m = min(budget, 3)
-    start = [lo] if m == 1 else [float(round(v, 4)) for v in np.linspace(lo, hi, m)]
-    step = (hi - lo) / max(1, m - 1)
-    for c in start:
-        res[c] = score(c)
+    def g_of(w):
+        return float(f'{1 + w:.4g}')
+    w0 = start - 1
+    res[g_of(w0)] = score(g_of(w0))
     while len(res) < budget:
-        pts = sorted(res)
-        i = min(range(len(pts)), key=lambda j: res[pts[j]])
-        if i == len(pts) - 1: # best at the top: extend
-            c = float(round(pts[-1] + step, 4))
+        ws = sorted(g - 1 for g in res)
+        i = min(range(len(ws)), key=lambda j: res[g_of(ws[j])])
+        if len(ws) == 1 or i == len(ws) - 1:
+            w = ws[-1] * 2 # best at the top (or only one point): stronger guidance
+        elif i == 0:
+            w = ws[0] / 2 # best at the bottom: weaker
         else:
-            gaps = [(res[pts[n]], pts[j + 1] - pts[j], j) for j, n in ((i - 1, i - 1), (i, i + 1)) if 0 <= j < len(pts) - 1]
-            _, width, j = min(gaps)
-            c = float(round((pts[j] + pts[j + 1]) / 2, 4))
-            if width < 0.02:
+            lo, hi = ws[i - 1], ws[i + 1]
+            nb = lo if res[g_of(lo)] < res[g_of(hi)] else hi
+            if max(nb, ws[i]) / min(nb, ws[i]) < ratio:
                 break
-        if c in res:
+            w = (nb * ws[i]) ** 0.5
+        g = g_of(w)
+        if g in res:
             break
-        res[c] = score(c)
+        res[g] = score(g)
     return res
 
 def save_labeled_grid(x, names, path, nrow=8):
@@ -674,7 +675,7 @@ _NAME_EXCLUDE = {
     'eval_only', 'init_from', 'wandb_log', 'wandb_project', 'wandb_run_name', 'fid_num_images', 'fid_cfg', 'fd_dino', 'max_updates', 'budget_pflops', 'budget_keep', 'keep_ckpt_at_eval', 'converge_tol', 'converge_window', 'converge_patience', 'converge_min_epochs', 'guided_eval', 'guided_eval_images', 'guided_eval_std', 'settle_target_epochs', 'settle_tol', 'settle_patience', 'settle_min_epochs', 'settle_max_epochs', 'settle_kill',
     'fid_interval_min', 'fid_interval_max', 'sample_cfg', 'sample_interval_min', 'sample_interval_max',
     'sampling_method', 'sampling_eta', 'num_sampling_steps', 'time_schedule', 'gen_batch_size', 'eval_loss_images',
-    'device', 'dtype', 'compile', 'compile_mode', 'attn_res_fused', 'phase_timing', 'profile_steps', 'attn_res_kernel', 'act_memory_budget', 'attn_res_chunk', 'tail_checkpoint', 'tail_chunks', 'attn_impl', 'phema_stds', 'phema_every_epochs', 'phema_dtype', 'alloc_eval', 'alloc_eval_conditions', 'alloc_eval_images', 'alloc_eval_loss_images', 'alloc_eval_ts', 'alloc_eval_show', 'trend_plots', 'progress_gif', 'data_workers', 'data_prefetch', 'quad_route_baseline', 'quad_route_every',
+    'device', 'dtype', 'seed', 'compile', 'compile_mode', 'attn_res_fused', 'phase_timing', 'profile_steps', 'attn_res_kernel', 'act_memory_budget', 'attn_res_chunk', 'tail_checkpoint', 'tail_chunks', 'attn_impl', 'phema_stds', 'phema_every_epochs', 'phema_dtype', 'alloc_eval', 'alloc_eval_conditions', 'alloc_eval_images', 'alloc_eval_loss_images', 'alloc_eval_ts', 'alloc_eval_show', 'trend_plots', 'progress_gif', 'data_workers', 'data_prefetch', 'quad_route_baseline', 'quad_route_every',
 }
 _ARCH_SHORT = {'depth': 'd', 'hidden_size': 'w', 'num_heads': 'h', 'patch_size': 'p', 'bottleneck_dim': 'bn',
                'in_context_len': 'icl', 'in_context_start': 'ics', 'mlp_ratio': 'mlp', 'pixel_depth': 'pd', 'pixel_dim': 'pdim'}

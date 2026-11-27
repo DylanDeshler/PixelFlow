@@ -41,7 +41,7 @@ for i in a.ids:
         continue
     famf = os.path.join(a.study, 'args', i + '.fam') # the study records each cell's family; else: latent runs record their VAE
     fam = open(famf).read().strip() if os.path.exists(famf) else ('latent' if 'vae' in r else 'pixel')
-    runs.append({'id': i, 'family': fam, 'off': off, 'per_epoch': per_epoch, 'hist': h, 'measured_to': h[-1][0]})
+    runs.append({'id': i, 'family': fam, 'off': off, 'per_epoch': per_epoch, 'hist': h, 'measured_to': h[-1][0], 'floor': predict_fid.floor_of(d)})
 
 
 def value(run, C):
@@ -51,7 +51,7 @@ def value(run, C):
         return None, e
     if e <= run['measured_to']:
         return min(f for x, f in run['hist'] if x <= e), e
-    return predict_fid.predict(run['hist'], e), e
+    return predict_fid.predict(run['hist'], e, run['floor']), e
 
 
 Cs = [r['off'] + r['per_epoch'] * x for r in runs for x in (r['hist'][0][0], a.full_epochs)]

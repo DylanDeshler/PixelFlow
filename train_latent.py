@@ -163,8 +163,7 @@ eval_ckpt = '' # with eval_cfgs: score this kept ckpt_{iter}.pt instead of ckpt.
 eval_phema = 0.0 # with eval_cfgs: score the post-hoc EMA with this sigma_rel, rebuilt from the snapshots at step eval_at (<= that step only)
 eval_at = -1 # the step for eval_phema (-1: the latest snapshot step)
 cfg_search = 0 # with --init_from=resume: a fixed budget of guidance scales instead of eval_cfgs (jit_common.cfg_search, as eval_jit.py)
-cfg_search_min = 1.0
-cfg_search_max = 5.0
+cfg_search_start = 3.0 # the guidance search's first scale (jit_common.cfg_search: log-strength doubling / halving, then bisection)
 eval_final_images = 0 # > 0: the best scale re-scored with this many fresh samples (seed + 1), as eval_jit.py
 eval_out_dir = '' # write the evaluation to {eval_out_dir}/eval_search.json (eval_jit.py's layout)
 fid_interval_min = 0.1
@@ -215,7 +214,7 @@ if not out_dir: # pixel runs' naming (jit_common's short tokens); size in the mo
     changed = [_name_token(k, v) for k, v in config.items()
                if k not in tuple(ARCH) + ('vae', 'data_dir', 'latent_dir', 'runs_root', 'out_dir', 'init_from', 'recipe', 'epochs', 'eval_every_epochs',
                             'save_every_epochs', 'log_interval', 'device', 'dtype', 'compile', 'decode', 'attn_res_chunk', 'gen_batch_size',
-                            'fid_num_images', 'fid_cfg', 'fd_dino', 'eval_cfgs', 'eval_ckpt', 'eval_phema', 'eval_at', 'cfg_search', 'cfg_search_min', 'cfg_search_max', 'eval_final_images', 'eval_out_dir', 'keep_ckpt_every_epochs', 'gradient_accumulation_steps', 'max_updates', 'budget_pflops', 'budget_keep', 'phema_stds', 'phema_dtype', 'keep_ckpt_at_eval', 'converge_tol', 'converge_window', 'converge_patience', 'converge_min_epochs', 'guided_eval', 'guided_eval_images', 'guided_eval_std', 'settle_target_epochs', 'settle_tol', 'settle_patience', 'settle_min_epochs', 'settle_max_epochs', 'settle_kill', 'fid_interval_min', 'fid_interval_max', 'num_sampling_steps', 'probe_blocks',
+                            'fid_num_images', 'fid_cfg', 'fd_dino', 'eval_cfgs', 'eval_ckpt', 'eval_phema', 'eval_at', 'cfg_search', 'cfg_search_start', 'eval_final_images', 'eval_out_dir', 'keep_ckpt_every_epochs', 'gradient_accumulation_steps', 'max_updates', 'budget_pflops', 'budget_keep', 'phema_stds', 'phema_dtype', 'keep_ckpt_at_eval', 'converge_tol', 'converge_window', 'converge_patience', 'converge_min_epochs', 'guided_eval', 'guided_eval_images', 'guided_eval_std', 'settle_target_epochs', 'settle_tol', 'settle_patience', 'settle_min_epochs', 'settle_max_epochs', 'settle_kill', 'fid_interval_min', 'fid_interval_max', 'num_sampling_steps', 'probe_blocks',
                             'probe_ts', 'probe_train_images', 'probe_val_images', 'eval_loss_images', 'seed') # (evaluation / system settings)
                and v != dict(_defaults, **RECIPES[recipe])[k]] # settings that differ from the recipe's (or the script's) values
     out_dir = os.path.join(runs_root, dataset, model_dir, '_'.join([recipe] + changed))
@@ -559,6 +558,15 @@ def val_loss():
 import predict_fid
 FULL_TRAIN = predict_fid.FULL_TRAIN
 hist_fid, hist_gfid = [], []
+_pred_floor = None
+def pred_floor():
+    # the guided FID's floor at the in-loop sample count (predict_fid.floor_of: real held-out images for pixels, the tokenizer's
+    # reconstructions for latents); predictions are F = floor + A x^-a
+    global _pred_floor
+    if _pred_floor is None:
+        _pred_floor = predict_fid.floor_of(out_dir, int(round(guided_eval_images / 1000)))
+        print(f"prediction floor (guided FID-{guided_eval_images / 1000:g}k): {_pred_floor:.2f}")
+    return _pred_floor
 guided_cfg_prev = None
 last_log = {}
 
@@ -580,9 +588,9 @@ def guided_eval_log(step):
     try:
         if guided_cfg_prev is None:
             from jit_common import cfg_search as _cs
-            _cs(score, 6, 1.0, 5.0)
+            _cs(score, 6, 3.0)
         else:
-            for c in sorted({max(1.0, guided_cfg_prev - 0.5), guided_cfg_prev, guided_cfg_prev + 0.5}): # (no upper cap)
+            for c in sorted({float(f'{1 + (guided_cfg_prev - 1) * m:.4g}') for m in (0.8, 1.0, 1.25)}): # the previous best's strength x 0.8 / 1 / 1.25
                 score(float(c))
     finally:
         for p, b in zip(params, backup):
@@ -612,8 +620,8 @@ def evaluate(step):
     hist_fid.append((step * batch_size / FULL_TRAIN, out['fid']))
     if 'val/guided_fid' in log:
         hist_gfid.append((step * batch_size / FULL_TRAIN, log['val/guided_fid']))
-    for key, h in (('pred/fid_at_target', hist_fid), ('pred/guided_at_target', hist_gfid)):
-        v = predict_fid.predict(h, settle_target_epochs)
+    for key, h, fl in (('pred/fid_at_target', hist_fid, 0.0), ('pred/guided_at_target', hist_gfid, pred_floor())):
+        v = predict_fid.predict(h, settle_target_epochs, fl)
         if v is not None:
             log[key] = v
     last_log = log
@@ -670,8 +678,8 @@ if eval_cfgs or cfg_search: # evaluation only: a guided sweep / search of the re
     with ema_weights(1):
         if cfg_search:
             from jit_common import cfg_search as cfg_search_fn
-            cfg_search_fn(score, cfg_search, cfg_search_min, cfg_search_max)
-            res['cfg_search'] = {'budget': cfg_search, 'range': [cfg_search_min, cfg_search_max]}
+            cfg_search_fn(score, cfg_search, cfg_search_start)
+            res['cfg_search'] = {'budget': cfg_search, 'start': cfg_search_start}
         else:
             for cg in (float(v) for v in eval_cfgs.split(',') if v.strip()):
                 score(cg)
@@ -713,7 +721,7 @@ if iter_num > 0 and os.path.isdir(os.path.join(out_dir, 'diagnostics')): # the p
     hist_gfid[:] = [h for h in predict_fid.history(out_dir, 'val/guided_fid') if h[0] <= _cut]
     _cfgs = [h for h in predict_fid.history(out_dir, 'val/guided_cfg') if h[0] <= _cut]
     guided_cfg_prev = _cfgs[-1][1] if _cfgs else None
-settle_preds = [predict_fid.predict(hist_gfid[:i], settle_target_epochs) for i in range(1, len(hist_gfid) + 1)]
+settle_preds = [predict_fid.predict(hist_gfid[:i], settle_target_epochs, pred_floor()) for i in range(1, len(hist_gfid) + 1)]
 params = list(net.parameters())
 t_last = time.time()
 while True:

@@ -229,7 +229,14 @@ ledger = []
 for r in runs:
     last = max(r['points'], key=lambda p: p['it']) if r['points'] else None
     gen_pf = last['gen_pflops'] if last else None
+    import predict_fid
+    vl = [v for _, v in predict_fid.history(r['run'], 'eval/val_loss')] # held-out loss: rising from its minimum = memorization
+    vmin, vfin = (min(vl), vl[-1]) if vl else (None, None)
+    rise = (vfin / vmin - 1) if vl else None
+    if rise is not None and rise > 0.02:
+        print(f"warning: {r['id']} (data {r['data_frac']:g}): held-out loss {vfin:.4f} is {rise:.1%} above its minimum {vmin:.4f} (memorization?)")
     ledger.append({'id': r['id'], 'family': r['family'], 'width': r['width'], 'data_frac': r['data_frac'], 'params': r['params'],
+                   'val_loss_min': vmin, 'val_loss_final': vfin, 'val_loss_rise': rise,
                    'updates': last['it'] if last else None, 'generator_pflops': gen_pf, 'tokenizer_pflops': r.get('tokenizer_pflops', 0),
                    'encode_pflops': r.get('encode_pflops', 0), 'total_training_pflops': (r['offset_pflops'] + gen_pf) if gen_pf else None,
                    'train_hours': r['hours'], 'final_fid': r['final_fid']})
