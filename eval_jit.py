@@ -14,7 +14,7 @@ sweep). A single scale is scored with --final_num_images directly.
 $ python eval_jit.py --ckpt=runs/in100_128/<model>/<run> --data_dir=/data/in100_128 --cfgs=1.0:4.0:0.25   # sweep at 10k, picks at 50k
 $ python eval_jit.py --ckpt=... --data_dir=/data/in100_128 --cfgs=1.0:4.0:0.25 --sweep_num_images=0      # sweep at 50k, no re-scoring
 $ python eval_jit.py --ckpt=... --data_dir=... --cfg_search=6 --sweep_num_images=8000 --final_num_images=50000  # fixed budget of 6
-  (scales 1, 3, 5, then bisection beside the best; the picks re-scored at 50k with fresh samples)
+  (scales 1, 3, 5, then up by 2 while 5+ keeps winning, then bisection; the picks re-scored at 50k with fresh samples)
 --ckpt takes a checkpoint file (ckpt.pt, a milestone ckpt_{iter}.pt, or a released JiT .pth) or a run directory (its ckpt.pt).
 Every network call uses --gen_batch_size samples (it must be even), so the compiled model is built once per run: CFG 1
 generates gen_batch_size images per batch, CFG > 1 gen_batch_size / 2 (conditional + unconditional together), and the
@@ -139,9 +139,9 @@ out_dir = '' # defaults to the checkpoint's dir
 sweep_num_images = 10000 # images per scale during a CFG sweep; 0 (or >= final_num_images) sweeps at final_num_images, no re-scoring
 final_num_images = 50000 # final count: the best-FID and trade-off scales (or the single scale) are scored with this many
 cfgs = '1.0' # guidance scales: comma list (1.0,2.0,3.0) or inclusive range start:stop:step (1.0:4.0:0.25)
-cfg_search = 0 # > 0: a fixed budget of this many scales instead of --cfgs: a uniform start over [cfg_search_min, cfg_search_max]
-               # (3 points, or the budget if smaller), then each further scale bisects the gap between the current best FID
-               # and its better neighbour, until the budget is spent (every model gets the same number of searches)
+cfg_search = 0 # > 0: a fixed budget of this many scales instead of --cfgs (jit_common.cfg_search): a uniform start over
+               # [cfg_search_min, cfg_search_max] (3 points), extended upward while the best is the largest scale tried, then
+               # bisection toward the best's better neighbour, until the budget is spent (every model gets the same number)
 cfg_search_min = 1.0
 cfg_search_max = 5.0
 fid_tolerance = 0.05 # trade-off pick: highest IS among scales with FID <= (1 + tol) * best FID

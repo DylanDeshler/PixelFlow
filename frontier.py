@@ -5,10 +5,10 @@ backtests and the frozen forecasts for B.
 Input: {study}/manifest.jsonl, one line per generator run: {"id", "family" ('pixel' or 'latent-<tokenizer level>'),
 "width", "data_frac", "run" (run directory), "tokenizer" (checkpoint or null), "tokenizer_pflops", "encode_pflops"}. For every
 run it reads config.json (measured forward FLOPs, batch, trunk params, training images; latent runs' train_pflops_offset =
-tokenizer training + dataset encoding) and its guided evaluations at the anchor checkpoints ({run}/eval_anchor_{iter}/
-eval_*.json: post-hoc EMA, fixed-budget CFG search, the pick re-scored on fresh samples; and {run}/eval_joint/ for the final
-checkpoint's joint EMA x CFG search). A point = (family, trunk params N, presentations T, training images D, total training
-compute C = offset + T x 3 x forward FLOPs, guided FID).
+tokenizer training + dataset encoding) and its in-loop guided FID at every eval (val/guided_fid: post-hoc EMA 0.10 with a
+small CFG search, the same sample count everywhere; {run}/eval_final holds the finished run's final evaluation, reported in the
+ledger). A point = (family, trunk params N, presentations T, training images D, total training compute C = offset + T x 3 x
+forward FLOPs, guided FID).
 
 Model, per family (fitted in log-FID, least squares, positive coefficients):
     F(N, T, D) = E + A N^-a + B T^-b + G D^-g
@@ -71,11 +71,9 @@ for line in open(os.path.join(args.study, 'manifest.jsonl')):
         rows = [json.loads(l) for l in open(log)]
         hours = max((r.get('train_hours', 0) for r in rows), default=0.0)
     run = dict(m, fwd_gflops=fwd, batch=batch, offset_pflops=offset, params=N, train_images=D, hours=hours, points=[])
-    for d in sorted(glob.glob(os.path.join(m['run'], 'eval_anchor_*'))):
-        it = int(re.search(r'eval_anchor_(\d+)', d).group(1))
-        fid = load_eval(d)
-        if fid is None:
-            continue
+    import predict_fid
+    for e, fid in predict_fid.history(m['run'], 'val/guided_fid'): # the in-loop guided curve (post-hoc EMA 0.10, small CFG search)
+        it = int(round(e * predict_fid.FULL_TRAIN / batch))
         p = dict(run=m['id'], family=m['family'], width=m['width'], data_frac=m['data_frac'], N=N, T=it * batch, D=D, it=it,
                  gen_pflops=it * batch * 3 * fwd / 1e6, C=offset + it * batch * 3 * fwd / 1e6, fid=fid)
         run['points'].append(p)
@@ -84,8 +82,7 @@ for line in open(os.path.join(args.study, 'manifest.jsonl')):
         last = max(run['points'], key=lambda p: p['it'])
         for p in run['points']:
             p['late'] = p['it'] > 0.5 * last['it']
-    j = load_eval(os.path.join(m['run'], 'eval_joint'))
-    run['final_fid_joint'] = j
+    run['final_fid'] = load_eval(os.path.join(m['run'], 'eval_final'))
     runs.append(run)
 assert points, 'no anchor evaluations yet'
 families = sorted({p['family'] for p in points})
@@ -235,7 +232,7 @@ for r in runs:
     ledger.append({'id': r['id'], 'family': r['family'], 'width': r['width'], 'data_frac': r['data_frac'], 'params': r['params'],
                    'updates': last['it'] if last else None, 'generator_pflops': gen_pf, 'tokenizer_pflops': r.get('tokenizer_pflops', 0),
                    'encode_pflops': r.get('encode_pflops', 0), 'total_training_pflops': (r['offset_pflops'] + gen_pf) if gen_pf else None,
-                   'train_hours': r['hours'], 'final_fid_joint': r['final_fid_joint']})
+                   'train_hours': r['hours'], 'final_fid': r['final_fid']})
 with open(os.path.join(args.study, 'ledger.csv'), 'w') as f:
     keys = list(ledger[0])
     f.write(','.join(keys) + '\n')

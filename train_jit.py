@@ -61,6 +61,22 @@ keep_ckpt_every_epochs = 0 # also keep ckpt_{iter}.pt (EMA1 weights only, ~0.5 G
 # run length by updates or by compute (the scaling study); each overrides epochs
 keep_ckpt_at_eval = True # keep ckpt_{iter}.pt (EMA1 + what rebuilds the model) and a post-hoc EMA snapshot at every eval
 max_updates = 0 # > 0: exactly this many optimizer updates
+# in-loop guided FID (the study's predictions): at every eval, guided FID of the post-hoc EMA guided_eval_std (one of the tracked
+# phema_stds, used directly: no reconstruction) with a small CFG search: 6 scales the first time (jit_common.cfg_search over
+# [1, 5]), then the previous best and its neighbours +- 0.5; logged as val/guided_fid and val/guided_cfg
+guided_eval = False
+guided_eval_images = 2000
+guided_eval_std = 0.10
+# predictions and the tuning candidates' stopping rule (predict_fid.py): every eval logs pred/fid_at_target and
+# pred/guided_at_target (the curves so far, fitted, at settle_target_epochs full-data epochs). With settle_tol > 0 (a tuning
+# candidate) the run stops once its guided prediction changed < settle_tol between consecutive evals settle_patience times
+# (after settle_min_epochs), or when it is above settle_kill (worse than the search's best), or at settle_max_epochs
+settle_target_epochs = 100.0
+settle_tol = 0.0
+settle_patience = 2
+settle_min_epochs = 20.0
+settle_max_epochs = 50.0
+settle_kill = 0.0
 converge_tol = 0.0 # > 0: stop once training has converged by the run's own curve (jit_common.converged): in-loop FID improved by
                    # less than this (relative) over the last converge_window of training at converge_patience consecutive evals.
                    # epochs / max_updates / budget_pflops then only cap the run
@@ -1043,6 +1059,42 @@ class EvalTimer:
 
 eval_timer = EvalTimer()
 
+import predict_fid
+FULL_TRAIN = predict_fid.FULL_TRAIN
+hist_fid, hist_gfid = [], [] # (full-data epochs, FID) of the evals so far (refilled from the diagnostics on resume)
+guided_cfg_prev = None
+
+@torch.no_grad()
+def guided_eval_log(step):
+    # guided FID-{guided_eval_images} of the post-hoc EMA guided_eval_std, with a small CFG search
+    global guided_cfg_prev
+    k = min(range(len(phema.stds)), key=lambda i: abs(phema.stds[i] - guided_eval_std))
+    params = list(denoiser.parameters())
+    backup = [p.detach().clone() for p in params]
+    for p, e in zip(params, phema.emas[k]):
+        p.copy_(e)
+    res = {}
+    def score(c):
+        res[c] = generate_and_score(denoiser, metrics, ref_stats, guided_eval_images, num_classes, device, ctx, cfg=c,
+                                    interval=(fid_interval_min, fid_interval_max), steps=num_sampling_steps, method=sampling_method,
+                                    batch_size=gen_batch_size, eta=sampling_eta, desc=f'guided FID (cfg {c:g})')['fid']
+        return res[c]
+    try:
+        if guided_cfg_prev is None:
+            from jit_common import cfg_search
+            cfg_search(score, 6, 1.0, 5.0)
+        else:
+            for c in sorted({max(1.0, guided_cfg_prev - 0.5), guided_cfg_prev, guided_cfg_prev + 0.5}): # (no upper cap)
+                score(float(c))
+    finally:
+        for p, b in zip(params, backup):
+            p.copy_(b)
+    best = min(res, key=res.get)
+    guided_cfg_prev = best
+    print(f"guided FID-{guided_eval_images / 1000:g}k (post-hoc EMA {phema.stds[k]:g}): " + ', '.join(f'cfg {c:g} {v:.2f}' for c, v in sorted(res.items()))
+          + f" -> {res[best]:.2f} at cfg {best:g}")
+    return {'val/guided_fid': res[best], 'val/guided_cfg': best}
+
 @torch.no_grad()
 def evaluate(step):
     """
@@ -1092,6 +1144,16 @@ def evaluate(step):
             probes = diag_lib.run_probes(tr, probe_train_y, va, probe_val_y, num_classes)
             timer.lap('probe fits')
     log['val/fid'], log['val/is'] = out['fid'], out['is']
+    if guided_eval and phema is not None:
+        log.update(guided_eval_log(step))
+        timer.lap('guided FID')
+    hist_fid.append((step * effective_batch_size / FULL_TRAIN, out['fid']))
+    if 'val/guided_fid' in log:
+        hist_gfid.append((step * effective_batch_size / FULL_TRAIN, log['val/guided_fid']))
+    for key, h in (('pred/fid_at_target', hist_fid), ('pred/guided_at_target', hist_gfid)):
+        v = predict_fid.predict(h, settle_target_epochs)
+        if v is not None:
+            log[key] = v
     if fd_dino:
         log['val/fd_dino'] = dino.distance(torch.cat(dino_feats), dino_ref)
     if token_sizes and denoiser.net.alloc.ready():
@@ -1453,6 +1515,13 @@ if wandb_log:
 eval_iters = eval_every_epochs * iters_per_epoch
 from jit_common import fid_history, converged
 fid_hist = [h for h in fid_history(out_dir) if h[0] <= iter_num] if converge_tol > 0 else [] # the evals so far (resume)
+if iter_num > 0 and os.path.isdir(os.path.join(out_dir, 'diagnostics')): # the prediction histories and the last guided scale
+    _cut = iter_num * effective_batch_size / FULL_TRAIN + 1e-9
+    hist_fid[:] = [h for h in predict_fid.history(out_dir, 'val/fid') if h[0] <= _cut]
+    hist_gfid[:] = [h for h in predict_fid.history(out_dir, 'val/guided_fid') if h[0] <= _cut]
+    _cfgs = [h for h in predict_fid.history(out_dir, 'val/guided_cfg') if h[0] <= _cut]
+    guided_cfg_prev = _cfgs[-1][1] if _cfgs else None
+settle_preds = [p for p in (predict_fid.predict(hist_gfid[:i], settle_target_epochs) for i in range(1, len(hist_gfid) + 1))]
 save_iters = max(1, save_every_epochs * iters_per_epoch)
 keep_iters = keep_ckpt_every_epochs * iters_per_epoch
 
@@ -1493,6 +1562,23 @@ while True:
         eval_log.update({f"eval_minutes/{k.replace(' / ', '_').replace(' ', '_')}": v for k, v in eval_timer.times.items()})
         print(eval_timer.summary())
         best_fid = min(best_fid, fid)
+        if settle_tol > 0:
+            settle_preds.append(eval_log.get('pred/guided_at_target'))
+            _ep = iter_num * effective_batch_size / FULL_TRAIN
+            _p = settle_preds[-1]
+            _why = None
+            if _ep >= settle_max_epochs - 1e-6:
+                _why = f'reached {settle_max_epochs:g} epochs'
+            elif _ep >= settle_min_epochs - 1e-6 and predict_fid.settled(settle_preds, settle_tol, settle_patience):
+                _why = f'guided prediction settled ({_p:.2f})'
+            elif _ep >= settle_min_epochs - 1e-6 and settle_kill > 0 and _p is not None and _p > settle_kill:
+                _why = f'guided prediction {_p:.2f} above the search best x margin ({settle_kill:.2f})'
+            print(f"settle check: predicted guided FID at epoch {settle_target_epochs:g}: {_p}" + (f" -> stopping: {_why}" if _why else ""))
+            if _why: # (the candidate's end, whether by the rule or at its cap: the search reads settled.json)
+                max_iters = min(max_iters, iter_num)
+                with open(os.path.join(out_dir, 'settled.json'), 'w') as _f:
+                    json.dump({'iter': iter_num, 'epochs': _ep, 'reason': _why, 'pred_guided': _p, 'pred_fid': eval_log.get('pred/fid_at_target'),
+                               'preds': settle_preds}, _f, indent=1)
         if converge_tol > 0:
             fid_hist.append((iter_num, float(fid)))
             _conv, _detail = converged(fid_hist, converge_tol, converge_window, converge_patience, converge_min_epochs * iters_per_epoch)

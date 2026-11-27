@@ -471,24 +471,30 @@ def converged(history, tol, window=1 / 3, patience=2, min_iter=0):
 def cfg_search(score, budget, lo=1.0, hi=5.0):
     """
     Fixed-budget guidance search (every model gets the same number of evaluations): a uniform start over [lo, hi] (3 points,
-    or the budget if smaller), then each further scale bisects the gap between the current best and its better neighbour
-    (the minimum of a unimodal FID-vs-scale curve lies on that side), until the budget is spent or the gap is < 0.02.
-    score(cfg) -> FID. Returns {cfg: FID} in evaluation order. On synthetic curves, a budget of 6 lands within 0.25 of the
-    optimum anywhere in [1, 5].
+    or the budget if smaller); then, while the best scale is the largest tried, the next is one start-spacing above it (the
+    optimum can lie past hi: small or under-trained models want strong guidance); once the best has a larger neighbour, each
+    further scale bisects the gap between the best and its better neighbour (the minimum of a unimodal FID-vs-scale curve lies
+    on that side). Stops at the budget or when the gap is < 0.02. lo is a floor (scales below 1 are not guidance).
+    score(cfg) -> FID. Returns {cfg: FID} in evaluation order.
     """
     res = {}
     m = min(budget, 3)
-    for c in ([lo] if m == 1 else [float(round(v, 4)) for v in np.linspace(lo, hi, m)]):
+    start = [lo] if m == 1 else [float(round(v, 4)) for v in np.linspace(lo, hi, m)]
+    step = (hi - lo) / max(1, m - 1)
+    for c in start:
         res[c] = score(c)
     while len(res) < budget:
         pts = sorted(res)
         i = min(range(len(pts)), key=lambda j: res[pts[j]])
-        gaps = [(res[pts[n]], pts[j + 1] - pts[j], j) for j, n in ((i - 1, i - 1), (i, i + 1)) if 0 <= j < len(pts) - 1]
-        if not gaps:
-            break
-        _, width, j = min(gaps)
-        c = float(round((pts[j] + pts[j + 1]) / 2, 4))
-        if width < 0.02 or c in res:
+        if i == len(pts) - 1: # best at the top: extend
+            c = float(round(pts[-1] + step, 4))
+        else:
+            gaps = [(res[pts[n]], pts[j + 1] - pts[j], j) for j, n in ((i - 1, i - 1), (i, i + 1)) if 0 <= j < len(pts) - 1]
+            _, width, j = min(gaps)
+            c = float(round((pts[j] + pts[j + 1]) / 2, 4))
+            if width < 0.02:
+                break
+        if c in res:
             break
         res[c] = score(c)
     return res
@@ -665,7 +671,7 @@ _NAME_EXCLUDE = {
     'out_dir', 'runs_root', 'run_name', 'data_root', 'data_dir', 'dataset', 'model', 'depth', 'hidden_size', 'num_heads',
     'patch_size', 'bottleneck_dim', 'in_context_len', 'in_context_start', 'mlp_ratio', 'pixel_depth', 'pixel_dim',
     'epochs', 'batch_size', 'gradient_accumulation_steps', 'eval_every_epochs', 'save_every_epochs', 'keep_ckpt_every_epochs', 'log_interval',
-    'eval_only', 'init_from', 'wandb_log', 'wandb_project', 'wandb_run_name', 'fid_num_images', 'fid_cfg', 'fd_dino', 'max_updates', 'budget_pflops', 'budget_keep', 'keep_ckpt_at_eval', 'converge_tol', 'converge_window', 'converge_patience', 'converge_min_epochs',
+    'eval_only', 'init_from', 'wandb_log', 'wandb_project', 'wandb_run_name', 'fid_num_images', 'fid_cfg', 'fd_dino', 'max_updates', 'budget_pflops', 'budget_keep', 'keep_ckpt_at_eval', 'converge_tol', 'converge_window', 'converge_patience', 'converge_min_epochs', 'guided_eval', 'guided_eval_images', 'guided_eval_std', 'settle_target_epochs', 'settle_tol', 'settle_patience', 'settle_min_epochs', 'settle_max_epochs', 'settle_kill',
     'fid_interval_min', 'fid_interval_max', 'sample_cfg', 'sample_interval_min', 'sample_interval_max',
     'sampling_method', 'sampling_eta', 'num_sampling_steps', 'time_schedule', 'gen_batch_size', 'eval_loss_images',
     'device', 'dtype', 'compile', 'compile_mode', 'attn_res_fused', 'phase_timing', 'profile_steps', 'attn_res_kernel', 'act_memory_budget', 'attn_res_chunk', 'tail_checkpoint', 'tail_chunks', 'attn_impl', 'phema_stds', 'phema_every_epochs', 'phema_dtype', 'alloc_eval', 'alloc_eval_conditions', 'alloc_eval_images', 'alloc_eval_loss_images', 'alloc_eval_ts', 'alloc_eval_show', 'trend_plots', 'progress_gif', 'data_workers', 'data_prefetch', 'quad_route_baseline', 'quad_route_every',

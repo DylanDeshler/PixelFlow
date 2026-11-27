@@ -65,6 +65,12 @@ decode_steps = 50 # the paper's Euler steps
 converge_tol = 0.0 # > 0: stop when rFID improved by < this over the last third of training (jit_common.converged), as the generators
 converge_patience = 2
 converge_min_updates = 20000
+settle_tol = 0.0 # > 0 (an lr candidate): stop once the predicted rFID at settle_target_updates (predict_fid on the rFID curve)
+                 # changed < settle_tol between consecutive evals settle_patience times, after settle_min_updates; or at settle_max_updates
+settle_target_updates = 300000
+settle_patience = 2
+settle_min_updates = 30000
+settle_max_updates = 100000
 log_interval = 100
 seed = 0
 device = 'cuda'
@@ -224,6 +230,16 @@ while True:
               f"training {pf:,.1f} PFLOPs, {train_seconds / 3600:.2f} h")
         with open(os.path.join(out_dir, 'eval_log.jsonl'), 'a') as f:
             f.write(json.dumps({'iter': iter_num, 'train_pflops': pf, 'train_hours': train_seconds / 3600, **r}) + '\n')
+        if settle_tol > 0:
+            import predict_fid
+            preds = [predict_fid.predict(fid_hist[:i], settle_target_updates) for i in range(1, len(fid_hist) + 1)]
+            why = 'reached settle_max_updates' if iter_num >= settle_max_updates else \
+                  ('rFID prediction settled' if iter_num >= settle_min_updates and predict_fid.settled(preds, settle_tol, settle_patience) else None)
+            print(f"settle check: predicted rFID at {settle_target_updates:,} updates: {preds[-1]}" + (f" -> stopping: {why}" if why else ""))
+            if why:
+                max_updates = iter_num
+                with open(os.path.join(out_dir, 'settled.json'), 'w') as f:
+                    json.dump({'iter': iter_num, 'reason': why, 'pred_rfid': preds[-1], 'preds': preds}, f, indent=1)
         if converge_tol > 0:
             conv, detail = converged(fid_hist, converge_tol, patience=converge_patience, min_iter=converge_min_updates)
             if detail:
