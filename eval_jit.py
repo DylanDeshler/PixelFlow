@@ -143,6 +143,7 @@ cfg_search = 0 # > 0: a fixed budget of this many scales instead of --cfgs (jit_
                # log space of the strength w = g - 1: doubling / halving until the best is bracketed, then geometric bisection
                # toward the best's better neighbour, until the budget is spent (every model gets the same number)
 cfg_search_start = 3.0 # the search's first scale
+cfg_track = 0.0 # > 0: the in-loop tracking rule from this previous best scale (jit_common.cfg_track) instead of --cfgs
 fid_tolerance = 0.05 # trade-off pick: highest IS among scales with FID <= (1 + tol) * best FID
 plot = True # save the CFG sweep plot (needs >= 2 scales)
 interval_min = 0.0
@@ -252,7 +253,7 @@ def parse_cfgs(spec):
 cfg_list = parse_cfgs(cfgs)
 sampler = f"{sampling_method}{num_sampling_steps}" + (f'_eta{sampling_eta:g}' if sampling_method == 'ancestral' else '') \
           + (f'_routeevery{quad_route_every}' if is_quadtree and quad_route_every > 1 else '') # for file names
-sweeping = len(cfg_list) > 1 or cfg_search > 1
+sweeping = len(cfg_list) > 1 or cfg_search > 1 or cfg_track > 0
 sweep_n = sweep_num_images if sweeping and 0 < sweep_num_images < final_num_images else final_num_images
 rescore = sweeping and sweep_n < final_num_images
 real_feats = real_features(sweep_n)
@@ -322,7 +323,11 @@ def score(cfg):
     for k, v in r.items():
         results[k][str(cfg)] = v
 
-if cfg_search > 0:
+if cfg_track > 0: # the in-loop rule (backfilling a run trained without the in-loop guided FID)
+    from jit_common import cfg_track as cfg_track_fn
+    cfg_track_fn(lambda c: (score(c), results['fid'][str(c)])[1], cfg_track)
+    cfg_list = sorted(float(c) for c in results['fid'])
+elif cfg_search > 0:
     # fixed-budget search: uniform start, then bisect toward the best's better neighbour (FID is ~unimodal in the scale)
     print(f"CFG search: {cfg_search} scales at {sweep_n:,} images each from cfg {cfg_search_start:g} (jit_common.cfg_search)"
           + (f"; the picks are re-scored at {final_num_images:,} with fresh samples" if rescore else ''))

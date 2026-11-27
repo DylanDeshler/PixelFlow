@@ -590,8 +590,8 @@ def guided_eval_log(step):
             from jit_common import cfg_search as _cs
             _cs(score, 6, 3.0)
         else:
-            for c in sorted({float(f'{1 + (guided_cfg_prev - 1) * m:.4g}') for m in (0.8, 1.0, 1.25)}): # the previous best's strength x 0.8 / 1 / 1.25
-                score(float(c))
+            from jit_common import cfg_track
+            cfg_track(score, guided_cfg_prev) # the previous best's strength x 0.8 / 1 / 1.25, extended while the best is at an end
     finally:
         for p, b in zip(params, backup):
             p.copy_(b)

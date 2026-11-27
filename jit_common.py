@@ -500,6 +500,32 @@ def cfg_search(score, budget, start=3.0, ratio=1.1):
         res[g] = score(g)
     return res
 
+def cfg_track(score, prev, factor=1.25, budget=6):
+    """
+    In-loop guidance tracking between evals (the best scale moves during training): the previous best and its strength
+    (w = g - 1) x 1 / factor and x factor; while the best is at either end, step further that way (x factor per step) until it is
+    bracketed, up to `budget` scales. score(cfg) -> FID; returns {cfg: FID}.
+    """
+    res = {}
+    def g_of(w):
+        return float(f'{1 + w:.4g}')
+    w0 = prev - 1
+    for w in (w0 / factor, w0, w0 * factor):
+        res[g_of(w)] = score(g_of(w))
+    while len(res) < budget:
+        gs = sorted(res)
+        best = min(gs, key=res.get)
+        if best == gs[-1]:
+            g = g_of((gs[-1] - 1) * factor)
+        elif best == gs[0]:
+            g = g_of((gs[0] - 1) / factor)
+        else:
+            break
+        if g in res:
+            break
+        res[g] = score(g)
+    return res
+
 def save_labeled_grid(x, names, path, nrow=8):
     """
     Saves a grid of images ([B, 3, H, W] in [-1, 1]) with each image's class name written underneath.

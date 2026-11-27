@@ -63,7 +63,8 @@ keep_ckpt_at_eval = True # keep ckpt_{iter}.pt (EMA1 + what rebuilds the model) 
 max_updates = 0 # > 0: exactly this many optimizer updates
 # in-loop guided FID (the study's predictions): at every eval, guided FID of the post-hoc EMA guided_eval_std (one of the tracked
 # phema_stds, used directly: no reconstruction) with a small CFG search: 6 scales the first time (jit_common.cfg_search from
-# g = 3, in log strength), then the previous best's strength (g - 1) x 0.8 / 1 / 1.25; logged as val/guided_fid and val/guided_cfg
+# g = 3, in log strength), then jit_common.cfg_track: the previous best's strength (g - 1) x 0.8 / 1 / 1.25, stepping further while the best is
+# at an end (up to 6 scales), so the moving optimum stays bracketed; logged as val/guided_fid and val/guided_cfg
 guided_eval = False
 guided_eval_images = 2000
 guided_eval_std = 0.10
@@ -1094,8 +1095,8 @@ def guided_eval_log(step):
             from jit_common import cfg_search
             cfg_search(score, 6, 3.0)
         else:
-            for c in sorted({float(f'{1 + (guided_cfg_prev - 1) * m:.4g}') for m in (0.8, 1.0, 1.25)}): # the previous best's strength x 0.8 / 1 / 1.25
-                score(float(c))
+            from jit_common import cfg_track
+            cfg_track(score, guided_cfg_prev) # the previous best's strength x 0.8 / 1 / 1.25, extended while the best is at an end
     finally:
         for p, b in zip(params, backup):
             p.copy_(b)

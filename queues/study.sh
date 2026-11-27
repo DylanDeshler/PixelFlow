@@ -268,7 +268,7 @@ if g and s.get('pred_guided'):
 }
 backfill_guided() { # id: a pixel run trained without the in-loop guided FID: score its kept checkpoints up to $CAND_MAX epochs the way
                    # the in-loop eval does (post-hoc EMA 0.10 at that step, 2K samples; the 6-scale search at the first checkpoint, then
-                   # the previous best's strength x 0.8 / 1 / 1.25) and write val/guided_fid / val/guided_cfg into its diagnostics
+                   # jit_common.cfg_track from the previous best) and write val/guided_fid / val/guided_cfg into its diagnostics
     local id=$1 dir it prev=""; dir=$(rdir "$id")
     for it in $(python -c "
 import glob, re, sys
@@ -277,7 +277,7 @@ print(' '.join(str(i) for i in its if i * 1024 / 1281167 <= $CAND_MAX + 1e-6))" 
         if python -c "import json, sys; sys.exit(0 if 'val/guided_fid' in json.load(open(sys.argv[1]))['scalars'] else 1)" "$dir/diagnostics/diag_$it.json"; then
             prev=$(python -c "import json, sys; print(json.load(open(sys.argv[1]))['scalars']['val/guided_cfg'])" "$dir/diagnostics/diag_$it.json"); continue
         fi
-        local search; [ -z "$prev" ] && search="--cfg_search=6" || search="--cfgs=$(python -c "print(','.join(sorted({f'{1 + ($prev - 1) * m:.4g}' for m in (0.8, 1.0, 1.25)}, key=float)))")"
+        local search; [ -z "$prev" ] && search="--cfg_search=6" || search="--cfg_track=$prev"
         eval_one "${id}_bg$it" "$id" pixel "$it" 0.10 2000 2000 "$dir/eval_backfill_$it" "$search"
         done_ok "${id}_bg$it" || return 1
         prev=$(python -c "
